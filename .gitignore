@@ -1,0 +1,7 @@
+# Compiled binary and generated icon (produced by build.ps1)
+TunGuard.exe
+TunGuard.ico
+*.exe
+*.ico
+*.pdb
+*.lnk
