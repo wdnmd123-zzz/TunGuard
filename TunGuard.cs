@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -21,15 +22,15 @@ namespace TunGuard
         [STAThread]
         private static void Main()
         {
-            bool createdNew;
-            using (Mutex mutex = new Mutex(true, MutexName, out createdNew))
+            Mutex mutex;
+            if (!TryAcquireSingleInstanceMutex(out mutex))
             {
-                if (!createdNew)
-                {
-                    SignalExistingInstance();
-                    return;
-                }
+                SignalExistingInstance();
+                return;
+            }
 
+            using (mutex)
+            {
                 try
                 {
                     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
@@ -46,6 +47,54 @@ namespace TunGuard
                 {
                     Application.Run(app);
                 }
+            }
+        }
+
+        private static bool TryAcquireSingleInstanceMutex(out Mutex mutex)
+        {
+            mutex = null;
+            bool createdNew;
+            try
+            {
+                try
+                {
+                    MutexSecurity sec = new MutexSecurity();
+                    SecurityIdentifier user = WindowsIdentity.GetCurrent().User;
+                    if (user != null)
+                    {
+                        sec.AddAccessRule(new MutexAccessRule(
+                            user,
+                            MutexRights.FullControl,
+                            AccessControlType.Allow));
+                    }
+                    mutex = new Mutex(true, MutexName, out createdNew, sec);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    return false;
+                }
+                catch
+                {
+                    mutex = new Mutex(true, MutexName, out createdNew);
+                }
+
+                if (!createdNew)
+                {
+                    mutex.Dispose();
+                    mutex = null;
+                    return false;
+                }
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Existing instance likely runs at a higher integrity level
+                if (mutex != null)
+                {
+                    mutex.Dispose();
+                    mutex = null;
+                }
+                return false;
             }
         }
 
@@ -80,14 +129,17 @@ namespace TunGuard
     internal struct KillResult
     {
         public int KilledCount;
-        public double ElapsedMs;
+        public int AccessDeniedCount;
+        public double FirstPassMs;
+        public double TotalElapsedMs;
     }
 
-    internal static class AntigravityKiller
+    internal sealed class AntigravityKiller
     {
         private const uint TH32CS_SNAPPROCESS = 0x00000002;
         private const uint PROCESS_TERMINATE = 0x0001;
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const int ERROR_ACCESS_DENIED = 5;
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct PROCESSENTRY32W
@@ -115,6 +167,12 @@ namespace TunGuard
         private static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool K32EnumProcesses(
+            [Out] uint[] lpidProcess,
+            uint cb,
+            out uint lpcbNeeded);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -132,33 +190,150 @@ namespace TunGuard
 
         private static readonly uint SelfPid = (uint)Process.GetCurrentProcess().Id;
 
-        public static KillResult KillAllNow()
+        // Reusable buffers (used exclusively by the single TunMonitor evaluation thread)
+        private readonly StringBuilder _pathBuf = new StringBuilder(2048);
+        private readonly List<uint> _langServerCandidates = new List<uint>(16);
+        private uint[] _pidBuffer = new uint[1024];
+        private HashSet<uint> _prevBenignPids = new HashSet<uint>();
+        private HashSet<uint> _nextBenignPids = new HashSet<uint>();
+        private bool _benignCacheValid;
+
+        public void InvalidateCache()
+        {
+            _benignCacheValid = false;
+            _prevBenignPids.Clear();
+            _nextBenignPids.Clear();
+        }
+
+        public KillResult KillAllNow()
         {
             Stopwatch sw = Stopwatch.StartNew();
-            int totalKilled = KillPass();
+            int accessDenied;
+            int totalKilled = KillFullPass(true, out accessDenied);
+            double firstPassMs = sw.Elapsed.TotalMilliseconds;
 
             // If processes were killed, do one rapid sweep 5ms later to catch any racing child spawn.
             if (totalKilled > 0)
             {
                 Thread.Sleep(5);
-                totalKilled += KillPass();
+                int followUpDenied;
+                totalKilled += KillFullPass(true, out followUpDenied);
+                accessDenied += followUpDenied;
             }
 
             sw.Stop();
             return new KillResult
             {
                 KilledCount = totalKilled,
-                ElapsedMs = sw.Elapsed.TotalMilliseconds
+                AccessDeniedCount = accessDenied,
+                FirstPassMs = firstPassMs,
+                TotalElapsedMs = sw.Elapsed.TotalMilliseconds
             };
         }
 
-        private static int KillPass()
+        public KillResult KillNewProcesses()
+        {
+            if (!_benignCacheValid)
+            {
+                return KillAllNow();
+            }
+
+            Stopwatch sw = Stopwatch.StartNew();
+            int pidCount;
+            if (!EnumerateProcessIds(out pidCount))
+            {
+                // Fallback to full snapshot if K32EnumProcesses fails
+                return KillAllNow();
+            }
+
+            int killed = 0;
+            int accessDenied = 0;
+            _nextBenignPids.Clear();
+
+            for (int i = 0; i < pidCount; i++)
+            {
+                uint pid = _pidBuffer[i];
+                if (pid == 0 || pid == SelfPid)
+                {
+                    continue;
+                }
+
+                if (_prevBenignPids.Contains(pid))
+                {
+                    _nextBenignPids.Add(pid);
+                    continue;
+                }
+
+                bool isBenign;
+                InspectAndKillPid(pid, false, true, ref killed, ref accessDenied, out isBenign);
+                if (isBenign)
+                {
+                    _nextBenignPids.Add(pid);
+                }
+            }
+
+            HashSet<uint> swap = _prevBenignPids;
+            _prevBenignPids = _nextBenignPids;
+            _nextBenignPids = swap;
+
+            double firstPassMs = sw.Elapsed.TotalMilliseconds;
+
+            // If any new target process was killed, do a full follow-up sweep 5ms later for racing children.
+            if (killed > 0)
+            {
+                Thread.Sleep(5);
+                int followUpDenied;
+                killed += KillFullPass(true, out followUpDenied);
+                accessDenied += followUpDenied;
+            }
+
+            sw.Stop();
+            return new KillResult
+            {
+                KilledCount = killed,
+                AccessDeniedCount = accessDenied,
+                FirstPassMs = firstPassMs,
+                TotalElapsedMs = sw.Elapsed.TotalMilliseconds
+            };
+        }
+
+        private bool EnumerateProcessIds(out int count)
+        {
+            count = 0;
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                uint cb = (uint)(_pidBuffer.Length * sizeof(uint));
+                uint needed;
+                if (!K32EnumProcesses(_pidBuffer, cb, out needed))
+                {
+                    return false;
+                }
+
+                if (needed < cb || _pidBuffer.Length >= 65536)
+                {
+                    count = (int)(needed / sizeof(uint));
+                    return true;
+                }
+
+                _pidBuffer = new uint[Math.Min(_pidBuffer.Length * 2, 65536)];
+            }
+            return false;
+        }
+
+        private int KillFullPass(bool updateBenignCache, out int accessDenied)
         {
             int killed = 0;
+            accessDenied = 0;
             IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
             {
                 return 0;
+            }
+
+            _langServerCandidates.Clear();
+            if (updateBenignCache)
+            {
+                _nextBenignPids.Clear();
             }
 
             try
@@ -171,8 +346,7 @@ namespace TunGuard
                     return 0;
                 }
 
-                StringBuilder pathBuf = new StringBuilder(512);
-
+                // Pass 1: terminate Antigravity.exe immediately (parent/main before child language servers)
                 do
                 {
                     uint pid = pe.th32ProcessID;
@@ -189,49 +363,15 @@ namespace TunGuard
 
                     if (string.Equals(exe, "Antigravity.exe", StringComparison.OrdinalIgnoreCase))
                     {
-                        IntPtr hProc = OpenProcess(PROCESS_TERMINATE, false, pid);
-                        if (hProc != IntPtr.Zero)
-                        {
-                            try
-                            {
-                                if (TerminateProcess(hProc, 1))
-                                {
-                                    killed++;
-                                }
-                            }
-                            finally
-                            {
-                                CloseHandle(hProc);
-                            }
-                        }
+                        TryTerminateKnownTarget(pid, ref killed, ref accessDenied);
                     }
-                    else if (exe.StartsWith("language_server", StringComparison.OrdinalIgnoreCase) &&
-                             exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    else if (IsLanguageServerExeName(exe))
                     {
-                        IntPtr hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-                        if (hProc != IntPtr.Zero)
-                        {
-                            try
-                            {
-                                pathBuf.Clear();
-                                uint size = (uint)pathBuf.Capacity;
-                                if (QueryFullProcessImageNameW(hProc, 0, pathBuf, ref size))
-                                {
-                                    string fullPath = pathBuf.ToString();
-                                    if (fullPath.IndexOf("\\antigravity\\", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    {
-                                        if (TerminateProcess(hProc, 1))
-                                        {
-                                            killed++;
-                                        }
-                                    }
-                                }
-                            }
-                            finally
-                            {
-                                CloseHandle(hProc);
-                            }
-                        }
+                        _langServerCandidates.Add(pid);
+                    }
+                    else if (updateBenignCache)
+                    {
+                        _nextBenignPids.Add(pid);
                     }
                 }
                 while (Process32NextW(snapshot, ref pe));
@@ -241,7 +381,167 @@ namespace TunGuard
                 CloseHandle(snapshot);
             }
 
+            // Pass 2: verify and terminate language_server*.exe belonging to Antigravity
+            for (int i = 0; i < _langServerCandidates.Count; i++)
+            {
+                uint pid = _langServerCandidates[i];
+                bool isBenign;
+                InspectAndKillPid(pid, true, false, ref killed, ref accessDenied, out isBenign);
+                if (updateBenignCache && isBenign)
+                {
+                    _nextBenignPids.Add(pid);
+                }
+            }
+
+            if (updateBenignCache)
+            {
+                HashSet<uint> swap = _prevBenignPids;
+                _prevBenignPids = _nextBenignPids;
+                _nextBenignPids = swap;
+                _benignCacheValid = true;
+            }
+
             return killed;
+        }
+
+        private void TryTerminateKnownTarget(uint pid, ref int killed, ref int accessDenied)
+        {
+            IntPtr hProc = OpenProcess(PROCESS_TERMINATE, false, pid);
+            if (hProc == IntPtr.Zero)
+            {
+                if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    accessDenied++;
+                }
+                return;
+            }
+
+            try
+            {
+                if (TerminateProcess(hProc, 1))
+                {
+                    killed++;
+                }
+                else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    accessDenied++;
+                }
+            }
+            finally
+            {
+                CloseHandle(hProc);
+            }
+        }
+
+        private void InspectAndKillPid(
+            uint pid,
+            bool languageServerPathOnly,
+            bool markProtectedAsBenign,
+            ref int killed,
+            ref int accessDenied,
+            out bool isBenign)
+        {
+            isBenign = false;
+            IntPtr hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc != IntPtr.Zero)
+            {
+                try
+                {
+                    string fullPath = QueryImagePath(hProc);
+                    if (fullPath == null)
+                    {
+                        return;
+                    }
+
+                    bool isTarget = languageServerPathOnly ? IsAntigravityPath(fullPath) : IsTargetImagePath(fullPath);
+                    if (isTarget)
+                    {
+                        if (TerminateProcess(hProc, 1))
+                        {
+                            killed++;
+                        }
+                        else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                        {
+                            accessDenied++;
+                        }
+                    }
+                    else
+                    {
+                        isBenign = true;
+                    }
+                }
+                finally
+                {
+                    CloseHandle(hProc);
+                }
+                return;
+            }
+
+            if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+            {
+                IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hQuery != IntPtr.Zero)
+                {
+                    try
+                    {
+                        string fullPath = QueryImagePath(hQuery);
+                        if (fullPath != null)
+                        {
+                            bool isTarget = languageServerPathOnly ? IsAntigravityPath(fullPath) : IsTargetImagePath(fullPath);
+                            if (isTarget)
+                            {
+                                accessDenied++;
+                            }
+                            else
+                            {
+                                isBenign = true;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        CloseHandle(hQuery);
+                    }
+                }
+                else if (markProtectedAsBenign && Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    // System / PPL protected process; mark benign for fast-path (periodic full scan still checks exe name)
+                    isBenign = true;
+                }
+            }
+        }
+
+        private string QueryImagePath(IntPtr hProc)
+        {
+            _pathBuf.Clear();
+            uint size = (uint)_pathBuf.Capacity;
+            if (!QueryFullProcessImageNameW(hProc, 0, _pathBuf, ref size))
+            {
+                return null;
+            }
+            return _pathBuf.ToString();
+        }
+
+        private static bool IsLanguageServerExeName(string exe)
+        {
+            return exe.StartsWith("language_server", StringComparison.OrdinalIgnoreCase) &&
+                   exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsAntigravityPath(string fullPath)
+        {
+            return fullPath.IndexOf("\\antigravity\\", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsTargetImagePath(string fullPath)
+        {
+            int lastSlash = fullPath.LastIndexOf('\\');
+            string exe = lastSlash >= 0 ? fullPath.Substring(lastSlash + 1) : fullPath;
+            if (string.Equals(exe, "Antigravity.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            return IsLanguageServerExeName(exe) && IsAntigravityPath(fullPath);
         }
     }
 
@@ -258,6 +558,8 @@ namespace TunGuard
         private const int IF_ROW_ALIAS_OFFSET = 28;
         private const int IF_ROW_DESC_OFFSET = 542;
         private const int IF_ROW_FLAGS_OFFSET = 1152;
+        private const byte IF_ROW_FLAG_FILTER = 0x02;
+        private const byte IF_ROW_FLAG_PAUSED = 0x20;
         private const int IF_ROW_OPER_STATUS_OFFSET = 1156;
         private const int IF_ROW_MEDIA_STATE_OFFSET = 1164;
 
@@ -265,9 +567,20 @@ namespace TunGuard
         private const int FWD_TABLE_ENTRIES_OFFSET = 8;
         private const int FWD_ROW_SIZE = 104;
         private const int FWD_ROW_IFINDEX_OFFSET = 8;
+        private const int FWD_ROW_DEST_FAMILY_OFFSET = 12;
+        private const int FWD_ROW_DEST_ADDR_OFFSET = 16;
         private const int FWD_ROW_PREFIXLEN_OFFSET = 40;
 
-        private const int MIB_NOTIFICATION_DELETE = 2;
+        private const int ACTIVE_INTERVAL_MS = 100;
+        private const int INACTIVE_GUARD_INTERVAL_MS = 30;
+        private const int PAUSED_INTERVAL_MS = 500;
+        private const int CONFIG_STAT_INTERVAL_MS = 1000;
+        private const int INACTIVE_ADAPTER_POLL_MS = 500;
+        private const int INACTIVE_FULL_KILL_SCAN_MS = 1500;
+        private const int WATCHER_RETRY_INTERVAL_MS = 5000;
+
+        private static readonly byte[] ZeroIfRowTemplate = new byte[IF_ROW_SIZE];
+        private static readonly int[] FileRetryDelaysMs = new int[] { 1, 2, 3, 5, 5 };
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate void IpInterfaceChangeCallback(IntPtr callerContext, IntPtr row, int notificationType);
@@ -317,25 +630,47 @@ namespace TunGuard
         private IntPtr _routeNotifyHandle = IntPtr.Zero;
         private FileSystemWatcher _watcher;
 
-        private readonly object _evalLock = new object();
-        private volatile bool _evalPending;
-        private volatile bool _running;
-        private volatile bool _monitoringEnabled = true;
+        // Single-threaded monitor/killer resources owned by Start() -> _watchdogThread
+        private readonly AntigravityKiller _killer = new AntigravityKiller();
+        private IntPtr _ifRowBuffer;
 
-        // Cached parsed config values (guarded by _configLock)
-        private readonly object _configLock = new object();
+        // Lightweight signal state between callbacks and _watchdogThread (held for nanoseconds)
+        private readonly object _signalLock = new object();
+        private bool _pendingVergeReload;
+        private bool _pendingClashReload;
+        private bool _pendingAdapterRecheck;
+        private bool _pendingFullProcessScan;
+        private bool _watcherNeedsRestart;
+        private string _pendingTriggerSource;
+
+        // Cached parsed config values & file metadata (owned by _watchdogThread after Start())
         private bool? _vergeEnableTun;
         private bool _clashAutoRoute = true;
         private string _customTunDevice;
+        private bool _vergeStatValid;
+        private bool _vergeLastExists;
+        private long _vergeLastWriteTicks;
+        private long _vergeLastLength;
+        private bool _clashStatValid;
+        private bool _clashLastExists;
+        private long _clashLastWriteTicks;
+        private long _clashLastLength;
 
-        private volatile bool _isTunActive;
-        private uint _lastKnownTunIfIndex;
+        private readonly object _statusLock = new object();
         private TunStatus _currentStatus;
+        private volatile bool _running;
+        private volatile bool _disposed;
+        private volatile bool _monitoringEnabled = true;
+        private volatile bool _isTunActive;
+        private volatile uint _lastKnownTunIfIndex;
+
         private Thread _watchdogThread;
-        private ManualResetEventSlim _stopEvent = new ManualResetEventSlim(false);
+        private readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
+        private readonly AutoResetEvent _wakeEvent = new AutoResetEvent(false);
 
         public event Action<TunStatus> StatusChanged;
         public event Action<KillResult, string> AntigravityKilled;
+        public event Action<int, string> AccessDenied;
 
         public bool MonitoringEnabled
         {
@@ -345,7 +680,12 @@ namespace TunGuard
                 _monitoringEnabled = value;
                 if (value)
                 {
-                    TriggerImmediateCheck("恢复监控");
+                    SignalWake("恢复监控", true, true, true, true);
+                }
+                else
+                {
+                    // Wake watchdog so it can immediately switch to low-frequency paused cadence
+                    SignalWake(null, false, false, false, false);
                 }
             }
         }
@@ -354,7 +694,7 @@ namespace TunGuard
         {
             get
             {
-                lock (_evalLock)
+                lock (_statusLock)
                 {
                     return _currentStatus;
                 }
@@ -370,29 +710,32 @@ namespace TunGuard
 
             _ifaceCallback = OnIpInterfaceChanged;
             _routeCallback = OnRouteChanged;
+            _ifRowBuffer = Marshal.AllocHGlobal(IF_ROW_SIZE);
         }
 
         public void Start()
         {
-            if (_running)
+            if (_running || _disposed)
             {
                 return;
             }
             _running = true;
 
-            RefreshConfigFiles();
-            EvaluateAndEnforce("初始检查", true);
+            ReadVergeYamlSafe(true);
+            ReadClashYamlSafe(true);
+            bool unusedFullScan;
+            EvaluateAndEnforce("初始检查", true, true, true, out unusedFullScan);
 
-            // 1. Kernel IP interface change notification (< 1ms)
+            // 1. Kernel IP interface change notification (< 1ms; callback only signals wake event)
             NotifyIpInterfaceChange(AF_UNSPEC, _ifaceCallback, IntPtr.Zero, false, out _ifaceNotifyHandle);
 
-            // 2. Kernel IPv4 route change notification (< 1ms)
+            // 2. Kernel IPv4 route change notification (< 1ms; callback only signals wake event)
             NotifyRouteChange2(AF_INET, _routeCallback, IntPtr.Zero, false, out _routeNotifyHandle);
 
             // 3. Clash Verge config watcher (< 1ms on UI toggle, often BEFORE adapter teardown)
-            StartConfigWatcher();
+            EnsureConfigWatcher();
 
-            // 4. Dedicated high-priority watchdog thread (immune to UI/menu message loops)
+            // 4. Dedicated high-priority watchdog & event-processing thread (immune to UI loops & NSI deadlocks)
             _watchdogThread = new Thread(WatchdogLoop)
             {
                 Name = "TunWatchdog",
@@ -402,8 +745,10 @@ namespace TunGuard
             _watchdogThread.Start();
         }
 
-        private void StartConfigWatcher()
+        private void EnsureConfigWatcher()
         {
+            DisposeConfigWatcher();
+
             if (!Directory.Exists(_configDir))
             {
                 return;
@@ -411,15 +756,18 @@ namespace TunGuard
 
             try
             {
-                _watcher = new FileSystemWatcher(_configDir)
+                FileSystemWatcher watcher = new FileSystemWatcher(_configDir)
                 {
                     NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.CreationTime,
                     IncludeSubdirectories = false
                 };
-                _watcher.Changed += OnConfigFileEvent;
-                _watcher.Created += OnConfigFileEvent;
-                _watcher.Renamed += OnConfigFileRenamed;
-                _watcher.EnableRaisingEvents = true;
+                watcher.Changed += OnConfigFileEvent;
+                watcher.Created += OnConfigFileEvent;
+                watcher.Deleted += OnConfigFileEvent;
+                watcher.Renamed += OnConfigFileRenamed;
+                watcher.Error += OnConfigWatcherError;
+                watcher.EnableRaisingEvents = true;
+                _watcher = watcher;
             }
             catch
             {
@@ -427,22 +775,67 @@ namespace TunGuard
             }
         }
 
+        private void DisposeConfigWatcher()
+        {
+            FileSystemWatcher watcher = _watcher;
+            _watcher = null;
+            if (watcher != null)
+            {
+                try
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Changed -= OnConfigFileEvent;
+                    watcher.Created -= OnConfigFileEvent;
+                    watcher.Deleted -= OnConfigFileEvent;
+                    watcher.Renamed -= OnConfigFileRenamed;
+                    watcher.Error -= OnConfigWatcherError;
+                    watcher.Dispose();
+                }
+                catch
+                {
+                }
+            }
+        }
+
         private void OnConfigFileEvent(object sender, FileSystemEventArgs e)
         {
-            if (!IsRelevantConfigFile(e.Name))
+            if (!_running || !IsRelevantConfigFile(e.Name))
             {
                 return;
             }
-            HandleConfigFileChange(e.Name);
+            SignalConfigFileChange(e.Name);
         }
 
         private void OnConfigFileRenamed(object sender, RenamedEventArgs e)
         {
-            if (!IsRelevantConfigFile(e.Name))
+            if (!_running)
             {
                 return;
             }
-            HandleConfigFileChange(e.Name);
+            if (IsRelevantConfigFile(e.Name))
+            {
+                SignalConfigFileChange(e.Name);
+            }
+            else if (IsRelevantConfigFile(e.OldName))
+            {
+                SignalConfigFileChange(e.OldName);
+            }
+        }
+
+        private void OnConfigWatcherError(object sender, ErrorEventArgs e)
+        {
+            if (!_running)
+            {
+                return;
+            }
+            lock (_signalLock)
+            {
+                _watcherNeedsRestart = true;
+                _pendingVergeReload = true;
+                _pendingClashReload = true;
+                _pendingAdapterRecheck = true;
+            }
+            TrySetWakeEvent();
         }
 
         private static bool IsRelevantConfigFile(string name)
@@ -451,23 +844,10 @@ namespace TunGuard
                    string.Equals(name, "clash-verge.yaml", StringComparison.OrdinalIgnoreCase);
         }
 
-        private void HandleConfigFileChange(string fileName)
+        private void SignalConfigFileChange(string fileName)
         {
-            if (!_running)
-            {
-                return;
-            }
-
-            if (string.Equals(fileName, "verge.yaml", StringComparison.OrdinalIgnoreCase))
-            {
-                ReadVergeYamlSafe();
-            }
-            else
-            {
-                ReadClashYamlSafe();
-            }
-
-            TriggerImmediateCheck("配置变更: " + fileName);
+            bool isVerge = string.Equals(fileName, "verge.yaml", StringComparison.OrdinalIgnoreCase);
+            SignalWake("配置变更: " + fileName, isVerge, !isVerge, true, false);
         }
 
         private void OnIpInterfaceChanged(IntPtr callerContext, IntPtr row, int notificationType)
@@ -476,7 +856,8 @@ namespace TunGuard
             {
                 return;
             }
-            TriggerImmediateCheck("网卡状态变更");
+            // Never call IP Helper APIs or block inside NSI notification callbacks; wake watchdog instead.
+            SignalWake("网卡状态变更", false, false, true, false);
         }
 
         private void OnRouteChanged(IntPtr callerContext, IntPtr row, int notificationType)
@@ -486,132 +867,266 @@ namespace TunGuard
                 return;
             }
 
-            // Fast-path filter: only react immediately when the TUN route changes or when TUN is currently down
-            if (row != IntPtr.Zero && _isTunActive && _lastKnownTunIfIndex != 0)
+            // Fast-path filter: ignore non-default routes (> /1) and unrelated interfaces while TUN is active
+            if (row != IntPtr.Zero)
             {
-                uint ifIdx = (uint)Marshal.ReadInt32(row, FWD_ROW_IFINDEX_OFFSET);
                 byte prefixLen = Marshal.ReadByte(row, FWD_ROW_PREFIXLEN_OFFSET);
-                if (ifIdx != _lastKnownTunIfIndex)
+                if (prefixLen > 1)
                 {
                     return;
                 }
-                if (prefixLen > 1 && notificationType != MIB_NOTIFICATION_DELETE)
+
+                uint lastIf = _lastKnownTunIfIndex;
+                if (_isTunActive && lastIf != 0)
                 {
-                    return;
+                    uint ifIdx = (uint)Marshal.ReadInt32(row, FWD_ROW_IFINDEX_OFFSET);
+                    if (ifIdx != lastIf)
+                    {
+                        return;
+                    }
                 }
             }
 
-            TriggerImmediateCheck("路由表变更");
+            SignalWake("路由表变更", false, false, true, false);
         }
 
-        private void WatchdogLoop()
-        {
-            int configTick = 0;
-            while (_running)
-            {
-                bool active = _isTunActive;
-                // 100ms safety net when TUN is ON (~0.02% CPU); 30ms fast guard when TUN is OFF
-                int intervalMs = active ? 100 : 30;
-                if (_stopEvent.Wait(intervalMs))
-                {
-                    break;
-                }
-
-                // Periodically re-read config files (~1s) in case FileSystemWatcher missed a replace
-                configTick++;
-                if (configTick >= (active ? 10 : 30))
-                {
-                    configTick = 0;
-                    RefreshConfigFiles();
-                }
-
-                EvaluateAndEnforce("定时巡检", false);
-            }
-        }
-
-        private void TriggerImmediateCheck(string triggerSource)
+        private void SignalWake(
+            string triggerSource,
+            bool reloadVerge,
+            bool reloadClash,
+            bool recheckAdapter,
+            bool fullProcessScan)
         {
             if (!_running)
             {
                 return;
             }
-            EvaluateAndEnforce(triggerSource, false);
+
+            lock (_signalLock)
+            {
+                if (reloadVerge) _pendingVergeReload = true;
+                if (reloadClash) _pendingClashReload = true;
+                if (recheckAdapter) _pendingAdapterRecheck = true;
+                if (fullProcessScan) _pendingFullProcessScan = true;
+                if (!string.IsNullOrEmpty(triggerSource))
+                {
+                    _pendingTriggerSource = triggerSource;
+                }
+            }
+
+            TrySetWakeEvent();
         }
 
-        private void EvaluateAndEnforce(string triggerSource, bool forceNotify)
+        private void TrySetWakeEvent()
         {
-            if (!Monitor.TryEnter(_evalLock))
+            if (!_running || _disposed)
             {
-                _evalPending = true;
                 return;
             }
-
             try
             {
-                do
-                {
-                    _evalPending = false;
-                    TunStatus next = QueryTunStatus();
-
-                    if (next.AdapterUp && next.AdapterIndex != 0)
-                    {
-                        _lastKnownTunIfIndex = next.AdapterIndex;
-                    }
-
-                    // Enforce BEFORE firing UI events so zero milliseconds are wasted on UI updates
-                    KillResult killRes = default(KillResult);
-                    if (_monitoringEnabled && !next.IsTunActive)
-                    {
-                        killRes = AntigravityKiller.KillAllNow();
-                    }
-
-                    bool changed = forceNotify ||
-                                   next.IsTunActive != _currentStatus.IsTunActive ||
-                                   !string.Equals(next.AdapterAlias, _currentStatus.AdapterAlias, StringComparison.Ordinal) ||
-                                   !string.Equals(next.Reason, _currentStatus.Reason, StringComparison.Ordinal);
-
-                    _isTunActive = next.IsTunActive;
-                    _currentStatus = next;
-                    forceNotify = false;
-
-                    if (killRes.KilledCount > 0)
-                    {
-                        Action<KillResult, string> killedHandler = AntigravityKilled;
-                        if (killedHandler != null)
-                        {
-                            killedHandler(killRes, triggerSource);
-                        }
-                    }
-
-                    if (changed)
-                    {
-                        Action<TunStatus> statusHandler = StatusChanged;
-                        if (statusHandler != null)
-                        {
-                            statusHandler(next);
-                        }
-                    }
-                }
-                while (_evalPending && _running);
+                _wakeEvent.Set();
             }
-            finally
+            catch (ObjectDisposedException)
             {
-                Monitor.Exit(_evalLock);
             }
         }
 
-        private TunStatus QueryTunStatus()
+        private void WatchdogLoop()
         {
-            bool? vergeEnable;
-            bool autoRoute;
-            string customDevice;
+            WaitHandle[] waitHandles = new WaitHandle[] { _stopEvent, _wakeEvent };
+            Stopwatch clock = Stopwatch.StartNew();
+            long lastConfigStatMs = 0;
+            long lastAdapterCheckMs = 0;
+            long lastFullScanMs = 0;
+            long lastWatcherRetryMs = 0;
 
-            lock (_configLock)
+            while (_running)
             {
-                vergeEnable = _vergeEnableTun;
-                autoRoute = _clashAutoRoute;
-                customDevice = _customTunDevice;
+                bool monitoring = _monitoringEnabled;
+                bool active = _isTunActive;
+                int intervalMs = !monitoring
+                    ? PAUSED_INTERVAL_MS
+                    : (active ? ACTIVE_INTERVAL_MS : INACTIVE_GUARD_INTERVAL_MS);
+
+                int waited;
+                try
+                {
+                    waited = WaitHandle.WaitAny(waitHandles, intervalMs);
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+
+                if (waited == 0 || !_running)
+                {
+                    break;
+                }
+
+                long nowMs = clock.ElapsedMilliseconds;
+
+                bool reloadVerge;
+                bool reloadClash;
+                bool recheckAdapter;
+                bool forceFullScan;
+                bool restartWatcher;
+                string triggerSource;
+
+                lock (_signalLock)
+                {
+                    reloadVerge = _pendingVergeReload;
+                    reloadClash = _pendingClashReload;
+                    recheckAdapter = _pendingAdapterRecheck;
+                    forceFullScan = _pendingFullProcessScan;
+                    restartWatcher = _watcherNeedsRestart;
+                    triggerSource = _pendingTriggerSource;
+
+                    _pendingVergeReload = false;
+                    _pendingClashReload = false;
+                    _pendingAdapterRecheck = false;
+                    _pendingFullProcessScan = false;
+                    _watcherNeedsRestart = false;
+                    _pendingTriggerSource = null;
+                }
+
+                if (restartWatcher || (_watcher == null && (nowMs - lastWatcherRetryMs >= WATCHER_RETRY_INTERVAL_MS)))
+                {
+                    lastWatcherRetryMs = nowMs;
+                    EnsureConfigWatcher();
+                }
+
+                if (reloadVerge)
+                {
+                    ReadVergeYamlSafe(true);
+                    lastConfigStatMs = nowMs;
+                }
+                if (reloadClash)
+                {
+                    ReadClashYamlSafe(true);
+                    lastConfigStatMs = nowMs;
+                }
+                if (!reloadVerge && !reloadClash && (nowMs - lastConfigStatMs >= CONFIG_STAT_INTERVAL_MS))
+                {
+                    lastConfigStatMs = nowMs;
+                    bool vergeChanged = ReadVergeYamlSafe(false);
+                    bool clashChanged = ReadClashYamlSafe(false);
+                    if (vergeChanged || clashChanged)
+                    {
+                        recheckAdapter = true;
+                    }
+                }
+
+                bool shouldCheckAdapter =
+                    active ||
+                    recheckAdapter ||
+                    (nowMs - lastAdapterCheckMs >= INACTIVE_ADAPTER_POLL_MS);
+
+                bool shouldFullScan =
+                    forceFullScan ||
+                    (monitoring && !active && (nowMs - lastFullScanMs >= INACTIVE_FULL_KILL_SCAN_MS));
+
+                if (shouldCheckAdapter)
+                {
+                    lastAdapterCheckMs = nowMs;
+                }
+
+                string source = !string.IsNullOrEmpty(triggerSource) ? triggerSource : "定时巡检";
+                bool ranFullScan;
+                EvaluateAndEnforce(source, false, shouldCheckAdapter, shouldFullScan, out ranFullScan);
+                if (ranFullScan)
+                {
+                    lastFullScanMs = nowMs;
+                }
             }
+        }
+
+        private void EvaluateAndEnforce(
+            string triggerSource,
+            bool forceNotify,
+            bool checkAdapter,
+            bool fullProcessScan,
+            out bool ranFullScan)
+        {
+            ranFullScan = false;
+            TunStatus prev = _currentStatus;
+            bool wasActive = _isTunActive;
+
+            TunStatus next = QueryTunStatus(checkAdapter, prev);
+
+            if (!next.AdapterUp)
+            {
+                _lastKnownTunIfIndex = 0;
+            }
+            else if (next.AdapterIndex != 0)
+            {
+                _lastKnownTunIfIndex = next.AdapterIndex;
+            }
+
+            // Enforce BEFORE firing UI events so zero milliseconds are wasted on UI updates
+            KillResult killRes = default(KillResult);
+            if (_monitoringEnabled && !next.IsTunActive)
+            {
+                bool becameInactive = wasActive && !next.IsTunActive;
+                if (becameInactive || fullProcessScan)
+                {
+                    killRes = _killer.KillAllNow();
+                    ranFullScan = true;
+                }
+                else
+                {
+                    killRes = _killer.KillNewProcesses();
+                }
+            }
+            else if (next.IsTunActive && !wasActive)
+            {
+                _killer.InvalidateCache();
+            }
+
+            bool changed = forceNotify ||
+                           next.IsTunActive != prev.IsTunActive ||
+                           !string.Equals(next.AdapterAlias, prev.AdapterAlias, StringComparison.Ordinal) ||
+                           !string.Equals(next.Reason, prev.Reason, StringComparison.Ordinal);
+
+            _isTunActive = next.IsTunActive;
+            lock (_statusLock)
+            {
+                _currentStatus = next;
+            }
+
+            if (killRes.KilledCount > 0)
+            {
+                Action<KillResult, string> killedHandler = AntigravityKilled;
+                if (killedHandler != null)
+                {
+                    killedHandler(killRes, triggerSource);
+                }
+            }
+
+            if (killRes.AccessDeniedCount > 0)
+            {
+                Action<int, string> deniedHandler = AccessDenied;
+                if (deniedHandler != null)
+                {
+                    deniedHandler(killRes.AccessDeniedCount, triggerSource);
+                }
+            }
+
+            if (changed)
+            {
+                Action<TunStatus> statusHandler = StatusChanged;
+                if (statusHandler != null)
+                {
+                    statusHandler(next);
+                }
+            }
+        }
+
+        private TunStatus QueryTunStatus(bool checkAdapter, TunStatus previous)
+        {
+            bool? vergeEnable = _vergeEnableTun;
+            bool autoRoute = _clashAutoRoute;
+            string customDevice = _customTunDevice;
 
             // verge.yaml explicitly says enable_tun_mode: false -> short-circuit in <0.01ms to kill immediately
             bool configAllows = (vergeEnable != false);
@@ -630,6 +1145,12 @@ namespace TunGuard
                 };
             }
 
+            // While TUN is already inactive, skip redundant GetIfTable2Ex on 30ms process-guard ticks
+            if (!checkAdapter && !previous.IsTunActive && previous.ConfigEnabled)
+            {
+                return previous;
+            }
+
             uint tunIfIndex;
             string tunAlias;
             bool adapterUp = TryCheckCachedTunAdapter(_lastKnownTunIfIndex, customDevice, out tunIfIndex, out tunAlias) ||
@@ -641,15 +1162,11 @@ namespace TunGuard
                 hasRoute = HasDefaultRouteOnInterface(tunIfIndex);
             }
 
-            bool isActive = configAllows && adapterUp && (!autoRoute || hasRoute);
+            bool isActive = adapterUp && (!autoRoute || hasRoute);
             string reason;
             if (isActive)
             {
                 reason = "TUN 正常 (" + tunAlias + ")";
-            }
-            else if (!configAllows)
-            {
-                reason = "Clash Verge 配置已关闭 TUN";
             }
             else if (!adapterUp)
             {
@@ -663,7 +1180,7 @@ namespace TunGuard
             return new TunStatus
             {
                 IsTunActive = isActive,
-                ConfigEnabled = configAllows,
+                ConfigEnabled = true,
                 AdapterUp = adapterUp,
                 HasDefaultRoute = hasRoute,
                 AutoRouteRequired = autoRoute,
@@ -673,55 +1190,47 @@ namespace TunGuard
             };
         }
 
-        private static bool TryCheckCachedTunAdapter(uint cachedIfIndex, string customDevice, out uint ifIndex, out string alias)
+        private bool TryCheckCachedTunAdapter(uint cachedIfIndex, string customDevice, out uint ifIndex, out string alias)
         {
             ifIndex = 0;
             alias = string.Empty;
-            if (cachedIfIndex == 0)
+            if (cachedIfIndex == 0 || _ifRowBuffer == IntPtr.Zero)
             {
                 return false;
             }
 
-            IntPtr row = Marshal.AllocHGlobal(IF_ROW_SIZE);
-            try
+            // Zero reusable MIB_IF_ROW2 buffer (no heap alloc/free per check) and set InterfaceIndex
+            Marshal.Copy(ZeroIfRowTemplate, 0, _ifRowBuffer, IF_ROW_SIZE);
+            Marshal.WriteInt32(_ifRowBuffer, IF_ROW_INDEX_OFFSET, (int)cachedIfIndex);
+
+            if (GetIfEntry2(_ifRowBuffer) != 0)
             {
-                // Zero-initialize LUID (offset 0..7) and set InterfaceIndex (offset 8..11)
-                Marshal.WriteInt64(row, 0, 0L);
-                Marshal.WriteInt32(row, IF_ROW_INDEX_OFFSET, (int)cachedIfIndex);
-
-                if (GetIfEntry2(row) != 0)
-                {
-                    return false;
-                }
-
-                byte flags = Marshal.ReadByte(row, IF_ROW_FLAGS_OFFSET);
-                if ((flags & 0x02) != 0)
-                {
-                    return false;
-                }
-
-                int operStatus = Marshal.ReadInt32(row, IF_ROW_OPER_STATUS_OFFSET);
-                int mediaState = Marshal.ReadInt32(row, IF_ROW_MEDIA_STATE_OFFSET);
-                if (operStatus != 1 || mediaState != 1)
-                {
-                    return false;
-                }
-
-                string rowAlias = Marshal.PtrToStringUni(IntPtr.Add(row, IF_ROW_ALIAS_OFFSET)) ?? string.Empty;
-                string rowDesc = Marshal.PtrToStringUni(IntPtr.Add(row, IF_ROW_DESC_OFFSET)) ?? string.Empty;
-                if (!IsClashTunAdapter(rowAlias, rowDesc, customDevice))
-                {
-                    return false;
-                }
-
-                ifIndex = cachedIfIndex;
-                alias = rowAlias;
-                return true;
+                return false;
             }
-            finally
+
+            byte flags = Marshal.ReadByte(_ifRowBuffer, IF_ROW_FLAGS_OFFSET);
+            if ((flags & (IF_ROW_FLAG_FILTER | IF_ROW_FLAG_PAUSED)) != 0)
             {
-                Marshal.FreeHGlobal(row);
+                return false;
             }
+
+            int operStatus = Marshal.ReadInt32(_ifRowBuffer, IF_ROW_OPER_STATUS_OFFSET);
+            int mediaState = Marshal.ReadInt32(_ifRowBuffer, IF_ROW_MEDIA_STATE_OFFSET);
+            if (operStatus != 1 || mediaState != 1)
+            {
+                return false;
+            }
+
+            string rowAlias = Marshal.PtrToStringUni(IntPtr.Add(_ifRowBuffer, IF_ROW_ALIAS_OFFSET)) ?? string.Empty;
+            string rowDesc = Marshal.PtrToStringUni(IntPtr.Add(_ifRowBuffer, IF_ROW_DESC_OFFSET)) ?? string.Empty;
+            if (!IsClashTunAdapter(rowAlias, rowDesc, customDevice))
+            {
+                return false;
+            }
+
+            ifIndex = cachedIfIndex;
+            alias = rowAlias;
+            return true;
         }
 
         private static bool FindActiveTunAdapter(string customDevice, out uint ifIndex, out string alias)
@@ -744,9 +1253,9 @@ namespace TunGuard
                 {
                     IntPtr row = IntPtr.Add(rowBase, i * IF_ROW_SIZE);
 
-                    // Bit 1 (0x02) = FilterInterface; skip NDIS lightweight filter pseudo-interfaces
+                    // Skip NDIS lightweight filter pseudo-interfaces (0x02) and paused interfaces (0x20)
                     byte flags = Marshal.ReadByte(row, IF_ROW_FLAGS_OFFSET);
-                    if ((flags & 0x02) != 0)
+                    if ((flags & (IF_ROW_FLAG_FILTER | IF_ROW_FLAG_PAUSED)) != 0)
                     {
                         continue;
                     }
@@ -785,16 +1294,19 @@ namespace TunGuard
 
         private static bool IsClashTunAdapter(string alias, string desc, string customDevice)
         {
-            if (!string.IsNullOrEmpty(customDevice) &&
-                string.Equals(alias, customDevice, StringComparison.OrdinalIgnoreCase))
+            if (!string.IsNullOrEmpty(customDevice))
             {
-                return true;
+                if (MatchesAdapterName(alias, customDevice) ||
+                    desc.IndexOf(customDevice + " Tunnel", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
             }
 
-            if (string.Equals(alias, "Meta", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(alias, "Mihomo", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(alias, "Clash", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(alias, "Clash Verge", StringComparison.OrdinalIgnoreCase))
+            if (MatchesAdapterName(alias, "Meta") ||
+                MatchesAdapterName(alias, "Mihomo") ||
+                MatchesAdapterName(alias, "Clash") ||
+                MatchesAdapterName(alias, "Clash Verge"))
             {
                 return true;
             }
@@ -806,6 +1318,34 @@ namespace TunGuard
                 return true;
             }
 
+            return false;
+        }
+
+        private static bool MatchesAdapterName(string alias, string baseName)
+        {
+            if (string.IsNullOrEmpty(alias) || string.IsNullOrEmpty(baseName))
+            {
+                return false;
+            }
+            if (string.Equals(alias, baseName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            // Match Windows duplicate Wintun adapter naming such as "Mihomo 2", "Meta 3"
+            if (alias.Length > baseName.Length + 1 &&
+                alias.StartsWith(baseName, StringComparison.OrdinalIgnoreCase) &&
+                alias[baseName.Length] == ' ')
+            {
+                for (int i = baseName.Length + 1; i < alias.Length; i++)
+                {
+                    char c = alias[i];
+                    if (c < '0' || c > '9')
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
             return false;
         }
 
@@ -826,6 +1366,8 @@ namespace TunGuard
             {
                 uint count = (uint)Marshal.ReadInt32(pTable, 0);
                 IntPtr rowBase = IntPtr.Add(pTable, FWD_TABLE_ENTRIES_OFFSET);
+                bool hasLowerHalf = false;
+                bool hasUpperHalf = false;
 
                 for (int i = 0; i < count; i++)
                 {
@@ -836,11 +1378,36 @@ namespace TunGuard
                         continue;
                     }
 
-                    // PrefixLength 0 => 0.0.0.0/0, PrefixLength 1 => 0.0.0.0/1 or 128.0.0.0/1
-                    byte prefixLen = Marshal.ReadByte(row, FWD_ROW_PREFIXLEN_OFFSET);
-                    if (prefixLen <= 1)
+                    ushort family = (ushort)Marshal.ReadInt16(row, FWD_ROW_DEST_FAMILY_OFFSET);
+                    if (family != AF_INET)
                     {
-                        return true;
+                        continue;
+                    }
+
+                    byte prefixLen = Marshal.ReadByte(row, FWD_ROW_PREFIXLEN_OFFSET);
+                    if (prefixLen == 0)
+                    {
+                        if (Marshal.ReadInt32(row, FWD_ROW_DEST_ADDR_OFFSET) == 0)
+                        {
+                            return true; // 0.0.0.0/0 covers full IPv4 space
+                        }
+                    }
+                    else if (prefixLen == 1)
+                    {
+                        byte firstOctet = Marshal.ReadByte(row, FWD_ROW_DEST_ADDR_OFFSET);
+                        if (firstOctet == 0)
+                        {
+                            hasLowerHalf = true; // 0.0.0.0/1
+                        }
+                        else if (firstOctet == 128)
+                        {
+                            hasUpperHalf = true; // 128.0.0.0/1
+                        }
+
+                        if (hasLowerHalf && hasUpperHalf)
+                        {
+                            return true; // Both /1 halves present => full IPv4 space covered
+                        }
                     }
                 }
             }
@@ -852,62 +1419,115 @@ namespace TunGuard
             return false;
         }
 
-        private void RefreshConfigFiles()
+        private bool ReadVergeYamlSafe(bool force)
         {
-            ReadVergeYamlSafe();
-            ReadClashYamlSafe();
-        }
+            bool exists;
+            long writeTicks;
+            long length;
+            GetFileStat(_vergeYamlPath, out exists, out writeTicks, out length);
 
-        private void ReadVergeYamlSafe()
-        {
-            if (!File.Exists(_vergeYamlPath))
+            if (!force && _vergeStatValid &&
+                exists == _vergeLastExists &&
+                writeTicks == _vergeLastWriteTicks &&
+                length == _vergeLastLength)
             {
-                return;
+                return false;
+            }
+
+            if (!exists)
+            {
+                _vergeStatValid = true;
+                _vergeLastExists = false;
+                _vergeLastWriteTicks = 0;
+                _vergeLastLength = 0;
+                bool changed = _vergeEnableTun.HasValue;
+                _vergeEnableTun = null;
+                return changed;
             }
 
             string content = ReadAllTextRetry(_vergeYamlPath);
             if (string.IsNullOrEmpty(content))
             {
-                return; // Keep previous value during transient atomic write
+                return false; // Keep previous value & stat during transient atomic write
             }
 
+            // Re-stat after successful read so cache reflects the read file
+            GetFileStat(_vergeYamlPath, out exists, out writeTicks, out length);
+            _vergeStatValid = true;
+            _vergeLastExists = exists;
+            _vergeLastWriteTicks = writeTicks;
+            _vergeLastLength = length;
+
+            bool? foundEnable = null;
             using (StringReader sr = new StringReader(content))
             {
                 string line;
                 while ((line = sr.ReadLine()) != null)
                 {
+                    if (CountLeadingSpaces(line) != 0)
+                    {
+                        continue;
+                    }
                     string trimmed = line.Trim();
                     if (trimmed.StartsWith("enable_tun_mode:", StringComparison.OrdinalIgnoreCase))
                     {
-                        string val = StripYamlComment(trimmed.Substring("enable_tun_mode:".Length)).Trim();
+                        string val = StripYamlComment(trimmed.Substring("enable_tun_mode:".Length)).Trim().Trim('\'', '"');
                         bool parsed;
                         if (bool.TryParse(val, out parsed))
                         {
-                            lock (_configLock)
-                            {
-                                _vergeEnableTun = parsed;
-                            }
+                            foundEnable = parsed;
                         }
-                        return;
+                        break;
                     }
                 }
             }
+
+            bool valueChanged = (_vergeEnableTun != foundEnable);
+            _vergeEnableTun = foundEnable;
+            return valueChanged;
         }
 
-        private void ReadClashYamlSafe()
+        private bool ReadClashYamlSafe(bool force)
         {
-            if (!File.Exists(_clashYamlPath))
+            bool exists;
+            long writeTicks;
+            long length;
+            GetFileStat(_clashYamlPath, out exists, out writeTicks, out length);
+
+            if (!force && _clashStatValid &&
+                exists == _clashLastExists &&
+                writeTicks == _clashLastWriteTicks &&
+                length == _clashLastLength)
             {
-                return;
+                return false;
+            }
+
+            if (!exists)
+            {
+                _clashStatValid = true;
+                _clashLastExists = false;
+                _clashLastWriteTicks = 0;
+                _clashLastLength = 0;
+                bool changed = (!_clashAutoRoute || _customTunDevice != null);
+                _clashAutoRoute = true;
+                _customTunDevice = null;
+                return changed;
             }
 
             string content = ReadAllTextRetry(_clashYamlPath);
             if (string.IsNullOrEmpty(content))
             {
-                return;
+                return false;
             }
 
+            GetFileStat(_clashYamlPath, out exists, out writeTicks, out length);
+            _clashStatValid = true;
+            _clashLastExists = exists;
+            _clashLastWriteTicks = writeTicks;
+            _clashLastLength = length;
+
             bool inTun = false;
+            int tunChildIndent = -1;
             bool? autoRouteVal = null;
             string deviceVal = null;
 
@@ -934,7 +1554,8 @@ namespace TunGuard
                         {
                             break;
                         }
-                        if (string.Equals(trimmed, "tun:", StringComparison.OrdinalIgnoreCase))
+                        string topKey = StripYamlComment(trimmed).Trim();
+                        if (string.Equals(topKey, "tun:", StringComparison.OrdinalIgnoreCase))
                         {
                             inTun = true;
                         }
@@ -946,10 +1567,20 @@ namespace TunGuard
                         continue;
                     }
 
+                    if (tunChildIndent < 0)
+                    {
+                        tunChildIndent = indent;
+                    }
+                    else if (indent != tunChildIndent)
+                    {
+                        continue;
+                    }
+
                     if (trimmed.StartsWith("auto-route:", StringComparison.OrdinalIgnoreCase))
                     {
                         bool b;
-                        if (bool.TryParse(StripYamlComment(trimmed.Substring("auto-route:".Length)).Trim(), out b))
+                        string raw = StripYamlComment(trimmed.Substring("auto-route:".Length)).Trim().Trim('\'', '"');
+                        if (bool.TryParse(raw, out b))
                         {
                             autoRouteVal = b;
                         }
@@ -965,22 +1596,41 @@ namespace TunGuard
                 }
             }
 
-            if (inTun)
+            // Reset to Clash defaults if tun: section or individual keys were removed
+            bool nextAutoRoute = autoRouteVal.HasValue ? autoRouteVal.Value : true;
+            string nextDevice = deviceVal;
+
+            bool valueChanged = (_clashAutoRoute != nextAutoRoute) ||
+                                !string.Equals(_customTunDevice, nextDevice, StringComparison.Ordinal);
+            _clashAutoRoute = nextAutoRoute;
+            _customTunDevice = nextDevice;
+            return valueChanged;
+        }
+
+        private static void GetFileStat(string path, out bool exists, out long writeTicks, out long length)
+        {
+            try
             {
-                lock (_configLock)
+                FileInfo fi = new FileInfo(path);
+                if (fi.Exists)
                 {
-                    if (autoRouteVal.HasValue)
-                    {
-                        _clashAutoRoute = autoRouteVal.Value;
-                    }
-                    _customTunDevice = deviceVal;
+                    exists = true;
+                    writeTicks = fi.LastWriteTimeUtc.Ticks;
+                    length = fi.Length;
+                    return;
                 }
             }
+            catch
+            {
+            }
+            exists = false;
+            writeTicks = 0;
+            length = 0;
         }
 
         private static string ReadAllTextRetry(string path)
         {
-            for (int attempt = 0; attempt < 6; attempt++)
+            for (int attempt = 0; attempt <= FileRetryDelaysMs.Length; attempt++)
             {
                 try
                 {
@@ -998,7 +1648,11 @@ namespace TunGuard
                 {
                     // File might be mid-write by Clash Verge
                 }
-                Thread.Sleep(5);
+
+                if (attempt < FileRetryDelaysMs.Length)
+                {
+                    Thread.Sleep(FileRetryDelaysMs[attempt]);
+                }
             }
             return null;
         }
@@ -1015,21 +1669,38 @@ namespace TunGuard
 
         private static string StripYamlComment(string s)
         {
-            int idx = s.IndexOf('#');
-            return idx >= 0 ? s.Substring(0, idx) : s;
+            bool inSingle = false;
+            bool inDouble = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\'' && !inDouble)
+                {
+                    inSingle = !inSingle;
+                }
+                else if (c == '"' && !inSingle)
+                {
+                    inDouble = !inDouble;
+                }
+                else if (c == '#' && !inSingle && !inDouble && (i == 0 || char.IsWhiteSpace(s[i - 1])))
+                {
+                    return s.Substring(0, i);
+                }
+            }
+            return s;
         }
 
         public void Dispose()
         {
+            if (_disposed)
+            {
+                return;
+            }
+            _disposed = true;
             _running = false;
             _stopEvent.Set();
 
-            if (_watcher != null)
-            {
-                _watcher.EnableRaisingEvents = false;
-                _watcher.Dispose();
-                _watcher = null;
-            }
+            DisposeConfigWatcher();
 
             if (_ifaceNotifyHandle != IntPtr.Zero)
             {
@@ -1043,12 +1714,22 @@ namespace TunGuard
                 _routeNotifyHandle = IntPtr.Zero;
             }
 
+            bool watchdogExited = true;
             if (_watchdogThread != null && _watchdogThread.IsAlive)
             {
-                _watchdogThread.Join(300);
+                watchdogExited = _watchdogThread.Join(1500);
             }
 
-            _stopEvent.Dispose();
+            if (watchdogExited)
+            {
+                _stopEvent.Dispose();
+                _wakeEvent.Dispose();
+                if (_ifRowBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(_ifRowBuffer);
+                    _ifRowBuffer = IntPtr.Zero;
+                }
+            }
         }
     }
 
@@ -1058,7 +1739,27 @@ namespace TunGuard
 
         public static bool IsAutoStartEnabled()
         {
-            return RunSchtasks("/Query /TN \"" + TaskName + "\"") == 0;
+            string xml;
+            if (RunSchtasks("/Query /TN \"" + TaskName + "\" /XML", out xml) != 0 || string.IsNullOrEmpty(xml))
+            {
+                return false;
+            }
+
+            string command = ExtractXmlElementValue(xml, "Command");
+            if (string.IsNullOrEmpty(command))
+            {
+                return false;
+            }
+
+            string taskExe = NormalizePath(command.Trim().Trim('"'));
+            string currentExe = NormalizePath(Application.ExecutablePath);
+            return string.Equals(taskExe, currentExe, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TaskExists()
+        {
+            string unused;
+            return RunSchtasks("/Query /TN \"" + TaskName + "\"", out unused) == 0;
         }
 
         public static bool SetAutoStart(bool enable)
@@ -1118,7 +1819,8 @@ namespace TunGuard
                         System.Security.SecurityElement.Escape(workDir));
 
                     File.WriteAllText(xmlPath, xml, Encoding.Unicode);
-                    return RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + xmlPath + "\" /F") == 0;
+                    string unused;
+                    return RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + xmlPath + "\" /F", out unused) == 0;
                 }
                 finally
                 {
@@ -1136,13 +1838,55 @@ namespace TunGuard
             }
             else
             {
-                int rc = RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
-                return rc == 0 || !IsAutoStartEnabled();
+                string unused;
+                int rc = RunSchtasks("/Delete /TN \"" + TaskName + "\" /F", out unused);
+                return rc == 0 || !TaskExists();
             }
         }
 
-        private static int RunSchtasks(string arguments)
+        private static string ExtractXmlElementValue(string xml, string tagName)
         {
+            string openTag = "<" + tagName + ">";
+            string closeTag = "</" + tagName + ">";
+            int start = xml.IndexOf(openTag, StringComparison.OrdinalIgnoreCase);
+            if (start < 0)
+            {
+                return null;
+            }
+            start += openTag.Length;
+            int end = xml.IndexOf(closeTag, start, StringComparison.OrdinalIgnoreCase);
+            if (end < 0)
+            {
+                return null;
+            }
+            string raw = xml.Substring(start, end - start);
+            return raw
+                .Replace("&quot;", "\"")
+                .Replace("&apos;", "'")
+                .Replace("&lt;", "<")
+                .Replace("&gt;", ">")
+                .Replace("&amp;", "&");
+        }
+
+        private static string NormalizePath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return string.Empty;
+            }
+            try
+            {
+                return Path.GetFullPath(path).TrimEnd('\\');
+            }
+            catch
+            {
+                return path.Trim();
+            }
+        }
+
+        private static int RunSchtasks(string arguments, out string stdOut)
+        {
+            stdOut = string.Empty;
             try
             {
                 ProcessStartInfo psi = new ProcessStartInfo
@@ -1151,15 +1895,41 @@ namespace TunGuard
                     Arguments = arguments,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    RedirectStandardOutput = true
                 };
-                using (Process p = Process.Start(psi))
+                using (Process p = new Process { StartInfo = psi })
                 {
-                    if (p == null)
+                    StringBuilder output = new StringBuilder();
+                    p.OutputDataReceived += (sender, e) =>
+                    {
+                        if (e.Data != null)
+                        {
+                            output.AppendLine(e.Data);
+                        }
+                    };
+
+                    if (!p.Start())
                     {
                         return -1;
                     }
-                    p.WaitForExit(5000);
+                    p.BeginOutputReadLine();
+
+                    if (!p.WaitForExit(5000))
+                    {
+                        try
+                        {
+                            p.Kill();
+                        }
+                        catch
+                        {
+                        }
+                        return -1;
+                    }
+
+                    // Ensure asynchronous output callbacks have flushed completely
+                    p.WaitForExit();
+                    stdOut = output.ToString();
                     return p.ExitCode;
                 }
             }
@@ -1228,8 +1998,11 @@ namespace TunGuard
 
     internal sealed class TrayApplication : ApplicationContext
     {
+        private static readonly long AccessDeniedNotifyCooldownTicks = TimeSpan.FromSeconds(10).Ticks;
+
         private readonly SynchronizationContext _uiSync;
         private readonly TunMonitor _monitor;
+        private readonly ContextMenuStrip _menu;
         private readonly NotifyIcon _trayIcon;
         private readonly ToolStripMenuItem _statusItem;
         private readonly ToolStripMenuItem _lastKillItem;
@@ -1241,11 +2014,14 @@ namespace TunGuard
         private readonly Icon _iconPaused;
 
         private readonly EventWaitHandle _pingEvent;
-        private readonly ManualResetEventSlim _pingStop = new ManualResetEventSlim(false);
+        private readonly ManualResetEvent _pingStop = new ManualResetEvent(false);
         private readonly Thread _pingThread;
 
         private int _totalKills;
-        private bool _disposed;
+        private int _autoStartRefreshing;
+        private int _autoStartToggling;
+        private long _lastAccessDeniedNotifyTicks;
+        private volatile bool _disposed;
 
         public TrayApplication(string pingEventName)
         {
@@ -1266,29 +2042,41 @@ namespace TunGuard
             _toggleMonitorItem = new ToolStripMenuItem("启用实时监控") { Checked = true };
             _toggleMonitorItem.Click += OnToggleMonitorClick;
 
-            _autoStartItem = new ToolStripMenuItem("开机自动启动") { Checked = StartupManager.IsAutoStartEnabled() };
+            _autoStartItem = new ToolStripMenuItem("开机自动启动") { Checked = false };
             _autoStartItem.Click += OnToggleAutoStartClick;
 
             ToolStripMenuItem exitItem = new ToolStripMenuItem("退出");
             exitItem.Click += OnExitClick;
 
-            ContextMenuStrip menu = new ContextMenuStrip();
-            menu.Items.Add(_statusItem);
-            menu.Items.Add(_lastKillItem);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(_toggleMonitorItem);
-            menu.Items.Add(_autoStartItem);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(exitItem);
+            _menu = new ContextMenuStrip();
+            _menu.Items.Add(_statusItem);
+            _menu.Items.Add(_lastKillItem);
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(_toggleMonitorItem);
+            _menu.Items.Add(_autoStartItem);
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(exitItem);
+            _menu.Opening += OnMenuOpening;
 
+            // Keep tray icon hidden until initial TUN status is evaluated (avoids wrong-color flash)
             _trayIcon = new NotifyIcon
             {
-                Icon = _iconSafe,
+                Icon = _iconPaused,
                 Text = "Clash TUN 守护 | 初始化中...",
-                ContextMenuStrip = menu,
-                Visible = true
+                ContextMenuStrip = _menu,
+                Visible = false
             };
             _trayIcon.DoubleClick += OnTrayDoubleClick;
+
+            // Start monitoring immediately before any slow shell queries (e.g., schtasks.exe)
+            _monitor = new TunMonitor();
+            _monitor.StatusChanged += OnMonitorStatusChanged;
+            _monitor.AntigravityKilled += OnAntigravityKilled;
+            _monitor.AccessDenied += OnAccessDenied;
+            _monitor.Start();
+
+            UpdateTrayUi(_monitor.CurrentStatus);
+            _trayIcon.Visible = true;
 
             // Listen for duplicate-launch ping so clicking the desktop shortcut shows status
             _pingEvent = CreatePingEvent(pingEventName);
@@ -1297,10 +2085,8 @@ namespace TunGuard
 
             SystemEvents.SessionEnding += OnSessionEnding;
 
-            _monitor = new TunMonitor();
-            _monitor.StatusChanged += OnMonitorStatusChanged;
-            _monitor.AntigravityKilled += OnAntigravityKilled;
-            _monitor.Start();
+            // Query auto-start task asynchronously without delaying protection startup
+            RefreshAutoStartStatusAsync();
         }
 
         private static EventWaitHandle CreatePingEvent(string name)
@@ -1327,9 +2113,23 @@ namespace TunGuard
 
         private void PingListenerLoop()
         {
-            WaitHandle[] handles = new WaitHandle[] { _pingEvent, _pingStop.WaitHandle };
-            while (WaitHandle.WaitAny(handles) == 0)
+            WaitHandle[] handles = new WaitHandle[] { _pingEvent, _pingStop };
+            while (!_disposed)
             {
+                int idx;
+                try
+                {
+                    idx = WaitHandle.WaitAny(handles);
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+
+                if (idx != 0 || _disposed)
+                {
+                    break;
+                }
                 PostToUi(() => ShowStatusBalloon("Clash TUN 守护已在后台运行"));
             }
         }
@@ -1345,12 +2145,37 @@ namespace TunGuard
             string timeText = DateTime.Now.ToString("HH:mm:ss");
             PostToUi(() =>
             {
-                _lastKillItem.Text = string.Format("上次拦截: {0} ({1}进程, {2:F1}ms)", timeText, result.KilledCount, result.ElapsedMs);
+                _lastKillItem.Text = string.Format("上次拦截: {0} ({1}进程, {2:F2}ms)", timeText, result.KilledCount, result.FirstPassMs);
                 _trayIcon.ShowBalloonTip(
                     2500,
                     "TUN 已关闭 — 已终止 Antigravity",
-                    string.Format("触发源: {0}\n已终止 {1} 个进程，耗时 {2:F2} ms (累计拦截 {3} 次)", trigger, result.KilledCount, result.ElapsedMs, count),
+                    string.Format("触发源: {0}\n已终止 {1} 个进程，首轮耗时 {2:F2} ms (累计拦截 {3} 次)", trigger, result.KilledCount, result.FirstPassMs, count),
                     ToolTipIcon.Warning);
+            });
+        }
+
+        private void OnAccessDenied(int deniedCount, string trigger)
+        {
+            long nowTicks = DateTime.UtcNow.Ticks;
+            long prevTicks = Interlocked.Read(ref _lastAccessDeniedNotifyTicks);
+            if (nowTicks - prevTicks < AccessDeniedNotifyCooldownTicks)
+            {
+                return;
+            }
+            if (Interlocked.CompareExchange(ref _lastAccessDeniedNotifyTicks, nowTicks, prevTicks) != prevTicks)
+            {
+                return;
+            }
+
+            string timeText = DateTime.Now.ToString("HH:mm:ss");
+            PostToUi(() =>
+            {
+                _lastKillItem.Text = string.Format("权限不足: {0} ({1}进程无法终止)", timeText, deniedCount);
+                _trayIcon.ShowBalloonTip(
+                    3000,
+                    "权限不足 — 无法终止 Antigravity",
+                    string.Format("触发源: {0}\n检测到 {1} 个目标进程但无权终止，请以管理员身份运行 TunGuard。", trigger, deniedCount),
+                    ToolTipIcon.Error);
             });
         }
 
@@ -1389,6 +2214,38 @@ namespace TunGuard
             ShowStatusBalloon("Clash TUN 守护状态");
         }
 
+        private void OnMenuOpening(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            RefreshAutoStartStatusAsync();
+        }
+
+        private void RefreshAutoStartStatusAsync()
+        {
+            if (_disposed || Interlocked.CompareExchange(ref _autoStartRefreshing, 1, 0) != 0)
+            {
+                return;
+            }
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    bool enabled = StartupManager.IsAutoStartEnabled();
+                    PostToUi(() =>
+                    {
+                        if (Volatile.Read(ref _autoStartToggling) == 0)
+                        {
+                            _autoStartItem.Checked = enabled;
+                        }
+                    });
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _autoStartRefreshing, 0);
+                }
+            });
+        }
+
         private void ShowStatusBalloon(string title)
         {
             if (_disposed)
@@ -1411,18 +2268,47 @@ namespace TunGuard
 
         private void OnToggleAutoStartClick(object sender, EventArgs e)
         {
-            bool target = !_autoStartItem.Checked;
-            bool ok = StartupManager.SetAutoStart(target);
-            _autoStartItem.Checked = StartupManager.IsAutoStartEnabled();
-            if (!ok)
+            if (Interlocked.CompareExchange(ref _autoStartToggling, 1, 0) != 0)
             {
-                _trayIcon.ShowBalloonTip(2500, "开机自启设置失败", "请以管理员权限运行后重试。", ToolTipIcon.Error);
+                return;
             }
+
+            bool target = !_autoStartItem.Checked;
+            _autoStartItem.Enabled = false;
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    bool ok = StartupManager.SetAutoStart(target);
+                    bool actual = StartupManager.IsAutoStartEnabled();
+                    PostToUi(() =>
+                    {
+                        _autoStartItem.Checked = actual;
+                        _autoStartItem.Enabled = true;
+                        if (!ok)
+                        {
+                            _trayIcon.ShowBalloonTip(2500, "开机自启设置失败", "请以管理员权限运行后重试。", ToolTipIcon.Error);
+                        }
+                    });
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _autoStartToggling, 0);
+                }
+            });
         }
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
-            ExitCleanly();
+            if (SynchronizationContext.Current == _uiSync)
+            {
+                ExitCleanly();
+            }
+            else
+            {
+                PostToUi(ExitCleanly);
+            }
         }
 
         private void OnExitClick(object sender, EventArgs e)
@@ -1468,16 +2354,32 @@ namespace TunGuard
                     SystemEvents.SessionEnding -= OnSessionEnding;
                     _pingStop.Set();
                     _monitor.Dispose();
+
+                    bool pingExited = true;
+                    if (_pingThread != null && _pingThread.IsAlive)
+                    {
+                        pingExited = _pingThread.Join(500);
+                    }
+
                     if (_trayIcon != null)
                     {
                         _trayIcon.Visible = false;
                         _trayIcon.Dispose();
                     }
+                    if (_menu != null)
+                    {
+                        _menu.Opening -= OnMenuOpening;
+                        _menu.Dispose();
+                    }
                     _iconSafe.Dispose();
                     _iconAlert.Dispose();
                     _iconPaused.Dispose();
-                    _pingEvent.Dispose();
-                    _pingStop.Dispose();
+
+                    if (pingExited)
+                    {
+                        _pingEvent.Dispose();
+                        _pingStop.Dispose();
+                    }
                 }
             }
             base.Dispose(disposing);
