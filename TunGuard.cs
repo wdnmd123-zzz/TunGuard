@@ -13538,6 +13538,7 @@ namespace TunGuard
         private int _detectingApps;
         private bool _suppressFilterEvents;
         private bool _suppressAppToggleEvents;
+        private bool _suppressNodeToggleEvents;
         private string _draftLogDirectory = string.Empty;
 
         public NodeGuardConfig ResultConfig { get; private set; }
@@ -13901,14 +13902,17 @@ namespace TunGuard
             root.Controls.Add(alertLogPanel, 0, 2);
             UpdateLogDirectoryDisplay();
 
-            // Row 3: Enable node guard checkbox
+            // Row 3: Enable node guard checkbox (disabled & unchecked until at least 1 allowed node is selected)
+            bool hasInitialAllowedNodes = _selectedOrder.Count > 0;
             _chkEnabled = new CheckBox
             {
                 Text = "启用 Clash 节点守护（当 Clash 未使用右侧允许节点时，同样立即触发内核断网/拦截）",
                 AutoSize = true,
-                Checked = cfg.Enabled,
+                Enabled = hasInitialAllowedNodes,
+                Checked = hasInitialAllowedNodes && cfg.Enabled,
                 Margin = new Padding(0, 0, 0, 8)
             };
+            _toolTip.SetToolTip(_chkEnabled, "需先在下方右侧「已允许的节点 / 关键词」中选入至少 1 项；选入后将自动勾选，也可手动取消勾选");
             _chkEnabled.CheckedChanged += OnRuleInputChanged;
             root.Controls.Add(_chkEnabled, 0, 3);
 
@@ -14771,7 +14775,7 @@ namespace TunGuard
         public NodeGuardConfig BuildDraftConfig()
         {
             NodeGuardConfig draft = new NodeGuardConfig();
-            draft.Enabled = _chkEnabled.Checked;
+            draft.Enabled = _selectedOrder.Count > 0 && _chkEnabled.Checked;
             draft.GuardAntigravity = _chkGuardAntigravity.Checked;
             draft.GuardChatGPT = _chkGuardChatGPT.Checked;
             draft.GuardClaude = _chkGuardClaude.Checked;
@@ -14807,6 +14811,10 @@ namespace TunGuard
 
         private void OnRuleInputChanged(object sender, EventArgs e)
         {
+            if (_suppressNodeToggleEvents)
+            {
+                return;
+            }
             if (_lastSnapshot != null && _lastSnapshot.Connected)
             {
                 string prevActive = _lastActiveLeafNode;
@@ -15055,6 +15063,35 @@ namespace TunGuard
             _lblAvailableHeader.Text = string.Format("可选订阅节点 ({0})", leftItems.Count);
             _lblAllowedHeader.Text = string.Format("已允许的节点 / 关键词 ({0})", _selectedOrder.Count);
             UpdateTransferButtonStates();
+            UpdateNodeGuardEnableState();
+        }
+
+        private void UpdateNodeGuardEnableState()
+        {
+            bool hasNodes = _selectedOrder.Count > 0;
+            bool wasEnabled = _chkEnabled.Enabled;
+
+            _suppressNodeToggleEvents = true;
+            try
+            {
+                if (!hasNodes)
+                {
+                    _chkEnabled.Checked = false;
+                    _chkEnabled.Enabled = false;
+                }
+                else
+                {
+                    _chkEnabled.Enabled = true;
+                    if (!wasEnabled)
+                    {
+                        _chkEnabled.Checked = true;
+                    }
+                }
+            }
+            finally
+            {
+                _suppressNodeToggleEvents = false;
+            }
         }
 
         private static string BuildNodeMetaLabel(string type, string profileName)
