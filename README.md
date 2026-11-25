@@ -1,81 +1,166 @@
 # TunGuard
 
-轻量级 Windows (x64) 系统托盘守护工具，实时监控 **Clash Verge (Rev)** 的 **TUN 模式状态** 与可选的 **当前生效代理节点**，并结合 **Windows Filtering Platform (WFP) 内核级 Kill Switch** 与毫秒级进程守护，保护已勾选的桌面端受控应用（**Antigravity**、**ChatGPT 桌面端**、**Claude 桌面端 / Claude Code**），从内核层到应用层防止断流裸连或走错节点引发风控。
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](https://github.com/wdnmd123-zzz/TunGuard)
+[![Runtime](https://img.shields.io/badge/.NET%20Framework-4.x%20%28Built--in%29-512BD4?style=flat-square)](https://github.com/wdnmd123-zzz/TunGuard)
+[![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20External-16A34A?style=flat-square)](https://github.com/wdnmd123-zzz/TunGuard)
+[![Release](https://img.shields.io/github/v/release/wdnmd123-zzz/TunGuard?style=flat-square&label=Release)](https://github.com/wdnmd123-zzz/TunGuard/releases)
 
-- **零外部依赖**：纯 C# + Win32 P/Invoke（`iphlpapi.dll` / `fwpuclnt.dll` / `userenv.dll`），仅使用 Windows 内置 `.NET Framework 4.x`（`csc.exe`）编译为单个 ~146 KB 的原生 x64 可执行文件。
-- **内核级零漏包兜底（WFP）**：在 Windows 内核 `ALE_AUTH_CONNECT`（IPv4 + IPv6）层常驻受控应用出站规则——仅放行 TUN 虚拟网卡与 Loopback，TUN 掉线瞬间**零时间窗**丢弃所有物理网卡直连流量；支持**仅内核断网（保留进程不丢编辑内容）**或**内核断网 + 终止进程双重兜底**。
-- **免配置直连 Clash 内核**：自动探测并复用 Clash Verge 的 Windows Named Pipe（`\\.\pipe\verge-mihomo-*`），**无需开启外部 HTTP 控制器**即可读取实时节点状态。
-- **极低后台开销**：事件驱动 + HTTP/1.1 Keep-Alive 单组定向查询 + 零反射轻量解析，单次节点巡检 `< 0.5 ms`。
+轻量级 Windows (x64) 系统托盘守护工具，实时监控 **Clash Verge Rev** 的 **TUN 模式状态** 与可选的 **当前生效代理节点**，并结合 **Windows Filtering Platform (WFP) 内核级 Kill Switch**、毫秒级进程守护与屏幕置顶拦截提示，保护已勾选的桌面端 AI 应用（**Antigravity**、**ChatGPT 桌面端 / Codex**、**Claude 桌面端 / Claude Code**），从内核层到应用层防止断流裸连或走错节点引发账号风控。
+
+[核心亮点](#核心亮点) · [工作原理](#工作原理与防护模式) · [受控应用与条件](#受控应用与拦截触发条件) · [核心特性](#核心特性) · [快速开始](#快速开始) · [配置参考](#节点判定规则与配置说明) · [FAQ](#常见问题faq)
 
 ---
 
-## 拦截触发条件与受控应用
+## 核心亮点
 
-当 **实时监控** 开启时，以下任意条件不满足都会立即触发拦截（**WFP 内核层阻断出站**；若开启「拦截时同时终止进程」或 WFP 处于非管理员降级状态，则同步毫秒级终止已勾选的受控应用进程并在 `5 ms` 后补扫一次防止子进程竞态拉起）：
+- **零外部依赖 · 单文件 ~209 KB**：纯 C# + Win32 P/Invoke（`iphlpapi.dll` / `fwpuclnt.dll` / `userenv.dll`），直接利用 Windows 内置 `.NET Framework 4.x`（`csc.exe`）编译为单个原生 x64 可执行文件。
+- **内核级零漏包兜底（WFP）**：在 Windows 内核 `ALE_AUTH_CONNECT`（IPv4 + IPv6）层常驻受控应用出站规则——仅放行 TUN 虚拟网卡与 Loopback，TUN 掉线瞬间**零时间窗**丢弃物理网卡直连流量；支持**纯内核断网保留进程**或**内核断网 + 强杀双重兜底**。
+- **免配置直连 Clash 内核**：自动探测并复用 Clash Verge 的 Windows Named Pipe（`\\.\pipe\verge-mihomo-*`），**无需开启外部 HTTP 控制器**即可读取实时节点链路（支持自动回退 TCP 外部控制器）。
+- **极低后台开销**：事件驱动 + HTTP/1.1 Keep-Alive 单组定向查询 + 零反射轻量 JSON 提取，单次节点巡检 `< 0.5 ms`。
+- **开箱即用 · 完整可视化管理**：提供受控应用自动识别与自定义路径管理、全订阅节点左右穿梭框、屏幕置顶拦截提醒卡片、异步日志系统与分级日志查看器。
 
-| 受控应用（可在控制面板独立勾选） | 匹配规则（同时用于进程守护与 WFP 内核规则） |
+---
+
+## 工作原理与防护模式
+
+```mermaid
+flowchart LR
+    T["四重毫秒级监听 (配置文件 / 路由 / 网卡 / 守护线程)"] --> E["状态评估 (TUN 在线 + 节点合规)"]
+    E -->|合规| P["WFP 事务放行 TUN LUID + Loopback"]
+    E -->|违规或断流| B["WFP 单事务撤权并阻断非本地出站"]
+    B -->|勾选终止进程| K["毫秒级终止进程 + 5ms 补扫"]
+    B -->|仅内核断网| W["挂起断网不丢编辑内容 + 100ms 启动监测"]
+    K --> A["屏幕置顶拦截弹窗 + 异步日志落盘"]
+    W --> A
+```
+
+TunGuard 支持三种防护执行模式，可在控制面板随时切换：
+
+| 防护模式 | 触发配置 | 行为与适用场景 |
+| --- | --- | --- |
+| **WFP 内核断网 + 终止进程（默认）** | 管理员权限 + 勾选 `启用 WFP 内核断网保护` 与 `拦截时同时终止进程` | 最高安全级别：WFP 内核零窗口阻断 + `TerminateProcess` 强杀与 `5 ms` 子进程补扫（同时封堵未绑定源 IP 的 UDP/QUIC 残留）+ `30 ms` 防重启守卫 |
+| **纯 WFP 内核无损断网** | 管理员权限 + 取消勾选 `拦截时同时终止进程` | 无损编辑体验：断流或切错节点时仅在内核层切断出站连接，**保留应用进程与未保存编辑内容**，恢复合规后自动恢复联网；期间打开受控应用会触发 `100 ms` 监测并弹出置顶提示 |
+| **应用层进程守护（自动降级）** | 取消启用 WFP 或以非管理员权限运行 | 当 WFP 不可用时自动强制回退为进程强杀模式（即使之前取消了「拦截时同时终止进程」），避免出现保护真空 |
+
+---
+
+## 受控应用与拦截触发条件
+
+### 1. 受控应用支持（可在控制面板或托盘菜单独立勾选，默认全选）
+
+| 受控应用 | 自动识别与匹配规则（同时作用于 WFP 内核规则与进程守护） |
 | --- | --- |
-| **Antigravity** | `Antigravity.exe` 及路径包含 `\antigravity\` 的 `language_server*.exe` |
-| **ChatGPT 桌面端** | `ChatGPT.exe`、OpenAI Windows 桌面端组件及 MSIX/Store 包（`ALE_APP_ID` + `ALE_PACKAGE_ID` 双重保护，不影响独立命令行 CLI） |
-| **Claude 桌面端 (Claude Code)** | Claude Desktop `Claude.exe`（WindowsApps / AnthropicClaude / Claude 安装目录）及 MSIX/Store 包（`ALE_APP_ID` + `ALE_PACKAGE_ID` 双重保护，不影响 VS Code 插件或命令行 CLI） |
+| **Antigravity** | `Antigravity.exe` 及位于 `\antigravity\` 或受信任安装根目录下的 `language_server*.exe` |
+| **ChatGPT 桌面端 (Codex)** | `ChatGPT.exe`，`WindowsApps\OpenAI*` / `WindowsApps\ChatGPT*` / `\ChatGPT\` / `\OpenAI\ChatGPT\` / `\OpenAI\Codex\` 下的 `ChatGPT*.exe`、`Codex*.exe`、`OpenAI*.exe`，以及对应 MSIX/Store 包（`ALE_APP_ID` + `ALE_PACKAGE_ID` 双重保护） |
+| **Claude 桌面端 (Claude Code)** | `ClaudeDesktop.exe` / `Claude Desktop.exe` / `ClaudeCode.exe` / `Claude Code.exe`，以及 WindowsApps / `AnthropicClaude` / `Claude` / `Claude-3p` / `Claude-zh*` / `Claude Code` 等目录下的 `Claude*.exe`（含 `claude.exe`）、`Anthropic*.exe`、`cowork-svc.exe` 与对应 MSIX 包（不影响 VS Code 插件或无关目录进程） |
+
+> 支持通过控制面板 **「路径管理...」** 随时查看本机已生效目标，或手动添加便携版目录 / 自定义 `.exe`（与自动识别规则同步生效）。
+
+### 2. 放行与拦截判定条件
+
+当 **实时监控** 开启时，以下任意条件不满足都会立即触发拦截（WFP 内核断网 / 按策略终止进程）：
 
 | 检查维度 | 放行条件 | 触发拦截的场景 |
 | --- | --- | --- |
-| **TUN 模式**（始终启用） | `verge.yaml` 允许 TUN + 虚拟网卡在线 + IPv4 默认路由有效 | 关闭 TUN 开关、退出 Clash Verge、`verge-mihomo` 崩溃、虚拟网卡或默认路由断开 |
-| **Clash 节点**（可选启用） | Clash 实际出口节点命中允许列表中的任意一项 | 切换到未授权节点、切到其他订阅、`Direct` 直连模式、`Global` 模式指向非允许节点、代理组不存在或控制接口不可达（Fail-Closed） |
+| **TUN 模式**（始终启用） | `verge.yaml` 允许 TUN + 虚拟网卡在线 + IPv4 默认路由有效 | 关闭 TUN 开关、退出 Clash Verge、`verge-mihomo` 崩溃、虚拟网卡下线或默认路由断开 |
+| **Clash 节点**（可选启用，默认关闭） | 实际出口节点命中允许列表中的任意一项 | 切换到未授权节点、切到其他订阅、`Direct` 直连模式、`Global` 指向非允许节点、指定代理组不存在或控制接口不可达（Fail-Closed） |
 
 ---
 
 ## 核心特性
 
-### 1. WFP 内核级 Kill Switch（预防式零漏包断网）
-- **独立 Sublayer + 五级优先级规则（IPv4 & IPv6 双栈覆盖）**：在 TunGuard 专属 WFP Provider / Sublayer 内通过事务原子维护以下规则（数值越大优先级越高）：
-  1. 权重 `14`（仅拦截态生效）：阻断受控应用经 Loopback 访问 Clash 本地代理端口（`mixed-port` / `port` / `socks-port`），防止系统代理旁路绕过 TUN；
-  2. 权重 `12`（常驻）：放行 `IS_LOOPBACK`（`127.0.0.1` / `::1`），保障 Antigravity `language_server` 与 Electron 本地 IPC 正常通信；
-  3. 权重 `11`（仅开启全局 DNS 53 保护时）：放行 `verge-mihomo*.exe` 出站 53 端口，确保 Clash 上游节点域名解析不受阻断；
-  4. 权重 `10`（仅安全态且 TUN 在线）：按 `MIB_IF_ROW2` 直取的 TUN `InterfaceLuid` 放行出站（TUN 掉线瞬间自动失配；切错节点时单事务撤除触发 ALE Reauthorization 秒断网；网卡重建换 LUID 时单事务先加后删零断流）；
-  5. 权重 `1`（常驻兜底）：阻断受控应用所有非 Loopback、非 TUN 的 IPv4/IPv6 出站连接。
-- **双模式可选 + 自动安全降级**：
-  - 勾选 **拦截时同时终止进程**（默认）：WFP 内核零窗口阻断 + `TerminateProcess` 双重兜底；
-  - 取消勾选：进入**纯内核无损断网模式**，掉线或切错节点时受控应用仅断网挂起、**不丢失正在编辑的内容**，合规后自动恢复联网；
-  - 若以非管理员标准权限运行导致 WFP 降级，程序自动回退为强杀模式，杜绝保护真空。
-- **三层路径解析 + MSIX 版本升级免疫**：启动扫描注册表（`AppModel` / `AppxAllUserStore` / `Uninstall`）与常见安装目录 + 零分配运行时进程热发现 + 本地路径缓存；同时为 WindowsApps / MSIX 应用附加 `ALE_PACKAGE_ID`（AppContainer SID）规则，自动免疫商店静默升级换目录。
-- **可选全局防 DNS 泄漏（53 端口）**：勾选后阻断系统 `dnscache` (`svchost.exe`) 等所有进程经非 TUN 网卡发出的 UDP/TCP 53 端口查询（自动放行 Loopback、TUN 与 Mihomo 内核；建议仅在 Clash TUN 开启 DNS 劫持时启用）。
-- **防砖机安全生命周期**：采用 `FWPM_SESSION_FLAG_DYNAMIC` 动态会话，无论正常退出、异常崩溃还是暂停监控，Windows 内核（BFE）均自动清空全部规则，绝不锁死用户网络。
+### 1. WFP 内核级 Kill Switch（防漏包 + 防砖机）
 
-### 2. 四重联动毫秒级 TUN 检测
-- **配置文件实时监听（`FileSystemWatcher`）**：监听 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\` 下的 `verge.yaml`、`clash-verge.yaml`、`config.yaml` 与 `profiles.yaml`。在 Clash Verge 点击关闭 TUN 或切换节点时，`< 1 ms` 即可唤醒复核并短路判定。
-- **内核路由变更回调（`NotifyRouteChange2`）**：实时捕获 TUN 虚拟网卡 IPv4 默认路由（`0.0.0.0/0`、`0.0.0.0/1`、`128.0.0.0/1`）移除事件。
-- **内核网卡状态回调（`NotifyIpInterfaceChange`）**：捕获 Clash Verge 退出或内核异常崩溃导致的虚拟网卡下线，并直接从 `MIB_IF_ROW2` 偏移 `0` 读取 `InterfaceLuid` 同步给 WFP。
-- **高优先级后台守护线程**：安全状态下每 `250 ms` 低功耗兜底复核；强杀拦截状态下切换为 `30 ms` 高频进程守卫（零分配 PID 快照比对），并每 `2 s` 被动热发现新启动的受控应用路径纳入 WFP 保护。
+在独立的 TunGuard WFP Provider 与 Sublayer（`FWPM_LAYER_ALE_AUTH_CONNECT_V4` & `V6`）内，通过单事务原子维护五级优先级规则（数值越大越先命中）：
 
-### 3. 受控应用独立开关、可配置的 Clash 节点守护 & 全订阅穿梭框
-- **受控应用与 WFP 策略一站式配置**：双击托盘图标（或右键 **「打开控制面板...」**）可在控制面板顶部独立勾选受控应用、开关 WFP 内核断网保护、切换「拦截时同时终止进程」与「全局防 DNS 泄漏 (53 端口)」，并实时查看 WFP 内核状态与 TUN LUID；也可通过托盘右键菜单 **「受控应用」** 子菜单快速切换并立即生效。
-- **全订阅自动扫描**：控制面板自动解析 Clash Verge 的 `profiles.yaml` 与 `profiles\*.yaml`（兼容流式与多行块式 YAML）并合并 Mihomo 实时节点，带 `(mtime, size)` 文件缓存，二次打开 `< 1 ms`。
-- **左右穿梭框管理**：
-  - 左侧按订阅下拉筛选 + `80 ms` 防抖实时搜索，支持 `Ctrl` / `Shift` 多选与双击穿梭。
-  - 中间提供 `>`（移入选中）、`>>`（当前可见全部移入）、`<`（移出选中）、`<<`（清空右侧）快捷操作。
-  - 右侧支持 **一键移入当前正在使用的节点**，并支持手动添加关键词或其他订阅节点。
-  - 保存前提供实时命中预览；若保存后会立即触发拦截，弹出二次确认防止误断/误关正在使用的受控应用。
-- **HTTP/1.1 Keep-Alive 单组定向巡检**：通过 `WaitNamedPipeW` 定向探测命名管道（支持回退到 TCP `external-controller`），巡检热路径复用持久连接，仅请求目标代理组 `GET /proxies/{group}` 并使用零反射轻量 JSON 提取器，即使数百节点的大订阅也保持 `O(1)` 恒定低开销。
+| 权重 | 生效时机 | 匹配条件 | 动作 | 作用 |
+| --- | --- | --- | --- | --- |
+| `14` | 仅拦截态 | 受控应用 + Loopback 访问 Clash 本地代理端口（`mixed-port` / `port` / `socks-port`） | `BLOCK` | 防止关闭 TUN 后应用经系统代理端口旁路绕过拦截 |
+| `12` | 常驻 | 受控应用 + `IS_LOOPBACK`（`127.0.0.1` / `::1`） | `PERMIT` | 保障 `Antigravity.exe ↔ language_server` 及 Electron / MCP 本地 IPC 通信 |
+| `11` | 仅开启防 DNS 泄漏时 | `verge-mihomo*.exe` 访问远程端口 `53`（及 TUN / Loopback 放行） | `PERMIT` | 启用全局 53 端口拦截时豁免 Mihomo 上游域名解析 |
+| `10` | 仅安全态且 TUN 在线 | 受控应用 + `IP_LOCAL_INTERFACE == tunLuid`（取自 `MIB_IF_ROW2`） | `PERMIT` | TUN 掉线瞬间自动失配；切错节点时单事务撤除触发 ALE Reauthorization 秒断网；网卡重建换 LUID 时单事务先加后删零断流 |
+| `1` | 常驻兜底 | 受控应用所有连接（及开启 DNS 保护时非 TUN 的 `53` 端口） | `BLOCK` | 阻断受控应用所有非 Loopback、非 TUN 的 IPv4/IPv6 出站直连 |
 
-### 4. 系统托盘、单实例保护与原生开机自启
-- **动态盾牌状态图标与内核状态展示**：
+- **三层路径解析 + MSIX 升级免疫**：启动扫描 MSIX 注册表（`AppModel` / `AppxAllUserStore`）、`Uninstall` 注册表、常见安装目录（5 层递归）与桌面/开始菜单 `.lnk` 快捷方式；运行中每 `2 s` 热发现新进程、拦截时即时补录路径（消除新版首次启动空窗），并自动清理失效缓存。
+- **可选全局防 DNS 泄漏（53 端口）**：勾选后阻断系统 `dnscache`（`svchost.exe`）等所有进程经非 TUN 网卡发出的 UDP/TCP 53 端口查询（自动豁免 Loopback、TUN 与 Mihomo 内核；建议仅在 Clash TUN 开启 DNS 劫持时启用）。
+- **防砖机动态会话**：采用 `FWPM_SESSION_FLAG_DYNAMIC` 动态会话，无论正常退出、异常崩溃还是暂停监控，Windows Base Filtering Engine（BFE）都会自动清空全部规则，绝不锁死网络。
 
-| 图标颜色 | 当前状态 | 说明 |
+### 2. 四重联动毫秒级检测 & Mihomo 直连
+
+- **配置文件实时监听（`FileSystemWatcher`）**：监听 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\` 下的 `verge.yaml`、`clash-verge.yaml`、`config.yaml` 与 `profiles.yaml`，配置变动 `< 1 ms` 唤醒复核。
+- **内核路由回调（`NotifyRouteChange2`）**：即时捕获 TUN 虚拟网卡 IPv4 默认路由移除事件。
+- **内核网卡回调（`NotifyIpInterfaceChange`）**：即时捕获虚拟网卡下线并直读 `MIB_IF_ROW2` 偏移 `0` 的 `InterfaceLuid` 同步给 WFP。
+- **自适应守护线程**：安全态 `250 ms` 低功耗巡检；纯 WFP 拦截态 `100 ms` 监测新启动受控进程；强杀拦截态 `30 ms` 高频守卫（零分配 PID 快照比对）；配置热更新每 `1 s` 自动重载。
+- **Mihomo Keep-Alive 定向巡检**：通过 `WaitNamedPipeW` 优先直连 `\\.\pipe\verge-mihomo-*`（自动回退 TCP `external-controller`），复用 HTTP/1.1 持久连接仅查询目标代理组 `GET /proxies/{group}`，大订阅亦保持 `O(1)` 恒定开销。
+
+### 3. 控制面板、应用路径管理与全订阅穿梭框
+
+双击托盘图标或右键 **「打开控制面板...」** 打开统一管理界面：
+
+- **受控应用自动检测与路径管理**：打开控制面板自动扫描本机安装目录、MSIX 包、注册表、快捷方式与运行中进程，实时显示 **Antigravity / ChatGPT / Claude** 状态；支持一键 **「自动检测」** 与 **「路径管理...」**（查看只读已生效目标、手动添加绿色版目录或自定义 `.exe`）。
+- **全订阅自动扫描**：解析 `profiles.yaml` 与 `profiles\*.yaml`（兼容流式与块式 YAML）并合并 Mihomo 实时节点，内置 `(mtime, size)` 文件缓存，二次打开 `< 1 ms`。
+- **左右穿梭框节点管理**：左侧支持按订阅筛选 + `80 ms` 防抖搜索、`Ctrl` / `Shift` 多选与双击穿梭；支持 `>` / `>>` / `<` / `<<` 批量操作、**一键移入当前正在使用的节点**及手动添加关键词；保存前实时预览命中结果，若保存后会立即触发拦截则弹出二次确认。
+
+### 4. 屏幕置顶拦截弹窗、异步日志系统 & 系统托盘
+
+- **屏幕置顶拦截弹窗（`popupOnBlock`，默认开启）**：在 TUN 未开启或节点不匹配状态下，一旦打开受控应用或运行中被拦截，屏幕上方即刻弹出非阻塞置顶提醒卡片（支持拖拽与 `Esc` 关闭），清晰展示**拦截原因、当前出口链路、允许节点与执行动作**，并直达控制面板与日志查看器；`10 s` 倒计时自动收起（鼠标悬停暂停），恢复合规后自动关闭。
+- **异步日志系统 & 日志查看器**：独立后台线程无阻塞异步落盘，按天切分 `TunGuard-yyyy-MM-dd.log`（UTF-8 无 BOM）。右键托盘或控制面板点击 **「查看日志...」** 可按日期切换日志、按 `INFO / WARN / ERROR` 分级着色筛选、关键词搜索、自动滚动跟踪、复制与清空；支持自定义日志目录（写权限预检、一键恢复默认、打开目录，以及自动询问迁移历史日志）。
+- **动态盾牌托盘图标**：
+
+| 托盘图标颜色 | 当前状态 | 托盘状态与悬浮提示说明 |
 | --- | --- | --- |
-| 绿色 | 守护正常 | TUN 已开启（若启用节点守护则当前节点已命中允许列表），允许运行受控应用；启用 WFP 时悬浮提示带 `[WFP]` 标识 |
-| 红色 | 已拦截 | TUN 未开启或当前节点不匹配，已通过 WFP 内核阻断出站（及按配置终止受控应用进程） |
-| 灰色 | 已暂停 | 已临时暂停监控与拦截，自动清空 WFP 内核规则并跳过节点轮询 |
+| **绿色** | 守护正常 | TUN 已开启（若启用节点守护则当前节点命中允许列表），启用 WFP 时悬浮提示带 `[WFP]` 标识 |
+| **红色** | 已拦截 | TUN 未开启或当前节点不匹配，已通过 WFP 内核阻断出站（及按配置终止受控进程） |
+| **灰色** | 已暂停 | 已临时暂停监控与拦截，自动清空 WFP 内核规则并跳过节点轮询 |
 
-- **单实例保护**：内置单实例互斥锁，重复启动时不会多开进程，仅通过气泡提示当前守护与 WFP 内核状态。
-- **原生开机自启**：右键勾选 **开机自动启动**，通过 Windows 原生 **Task Scheduler 2.0 COM API (`Schedule.Service`)** 注册计划任务 `ClashTunGuard`（支持电池供电、无 72 小时超时限制、`<RunLevel>HighestAvailable</RunLevel>` 自动提权激活 WFP、不拉起隐藏 `schtasks.exe`）。
+### 5. 单实例保护 & 原生开机自启
+
+- **单实例互斥锁**：重复启动不会多开后台进程，而是唤醒已有实例通过托盘气泡展示当前守护与 WFP 内核状态。
+- **原生 Task Scheduler 2.0 COM 自启**：右键勾选 **「开机自动启动」**，直接通过 `Schedule.Service` COM API 注册计划任务 `ClashTunGuard`（`<RunLevel>HighestAvailable</RunLevel>` 自动提权激活 WFP、支持电池供电、无 72 小时超时限制、不拉起隐藏 `schtasks.exe`）。
 
 ---
 
-## 节点判定规则说明
+## 快速开始
 
-启用节点守护后，程序会递归展开嵌套代理组（如 `PROXY -> 自动选择 -> 节点A`，自动防循环引用），并始终以**最终实际出口节点**与允许列表比对（支持 **精确匹配（忽略大小写）** 或 **关键词包含匹配**）：
+### 环境要求
+
+- **系统**：Windows 10 / 11 (x64)
+- **运行时**：Windows 内置 `.NET Framework 4.x`（本地编译需 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`）
+- **代理客户端**：Clash Verge Rev（已开启或准备使用 TUN 模式）
+- **权限**：推荐管理员权限（用于启用 WFP 内核断网与注册高权限计划任务；标准权限下会自动降级为应用层强杀守护）
+
+### 1. 获取程序（下载 Release 或本地编译）
+
+- **方式一（推荐）**：直接前往 [GitHub Releases](https://github.com/wdnmd123-zzz/TunGuard/releases) 下载最新构建的 `TunGuard.exe`（或 `TunGuard-vX.Y.Z-win-x64.zip`）与 `SHA256SUMS.txt`；每次推送源码更新到 `main` 分支都会由 GitHub Actions 自动构建并发布新版本。
+- **方式二（本地编译）**：在项目根目录运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+脚本会自动生成盾牌图标 `TunGuard.ico` 并编译出独立的 `TunGuard.exe`。
+
+### 2. 启动与开机自启
+
+1. **以管理员权限运行** `TunGuard.exe`（清单已声明 `highestAvailable`），程序将以 `High` 优先级静默启动并在系统托盘显示盾牌图标。
+2. 右键托盘图标勾选 **「开机自动启动」** 即可完成高权限开机自启注册。
+3. 如需桌面快捷方式，可右键 `TunGuard.exe` → **发送到 → 桌面快捷方式**。
+
+### 3. 控制面板配置指南
+
+1. **双击托盘图标**（或右键 → **「打开控制面板...」**）打开控制面板。
+2. 确认顶部 **受控应用** 勾选范围（默认 **Antigravity / ChatGPT 桌面端 / Claude 桌面端** 均已勾选；如有便携版或特殊安装位置可点击 **「路径管理...」** 添加）。
+3. 在 **内核断网** 栏确认 **启用 WFP 内核断网保护 (零漏包)** 已勾选，按需选择：
+   - 保持勾选 **拦截时同时终止进程**（默认，内核断网 + 强杀双重保险），或取消勾选体验“仅断网保留编辑内容”；
+   - 若 Clash TUN 已开启 DNS 劫持且需封堵系统 `dnscache` DNS 泄漏，可勾选 **全局防 DNS 泄漏 (53 端口)**。
+4. 按需开关 **弹窗提示** 与自定义 **日志目录**。
+5. 如需限制出口节点：勾选 **启用 Clash 节点守护**，在左侧筛选或直接点击 **一键移入当前节点**，选择 **精确匹配节点名** 或 **关键词包含**，最后点击 **保存并生效**。
+
+---
+
+## 节点判定规则与配置说明
+
+启用节点守护后，TunGuard 会递归展开嵌套代理组（如 `PROXY -> 自动选择 -> 节点A`，内置防循环引用），并以**最终实际出口节点**比对允许列表：
 
 | Clash 模式 | 监控代理组设置 | 实际校验链路 |
 | --- | --- | --- |
@@ -84,49 +169,34 @@
 | `Global` | 任意 | 强制跟踪 `GLOBAL` 并递归至最终节点（防止切换 Global 模式绕过规则组） |
 | `Direct` | 任意 | 直接判定为未命中并触发拦截 |
 
----
+<details>
+<summary><b><code>TunGuard.config.json</code> 配置字段说明（点击展开，支持 1 秒内热重载）</b></summary>
 
-## 快速开始
+配置自动保存在程序同目录 `TunGuard.config.json`（已加入 `.gitignore`），手动修改后会在 1 秒内自动生效：
 
-### 环境要求
-- Windows 10 / 11 (x64)
-- Windows 内置 `.NET Framework 4.x`（`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`）
-- Clash Verge Rev
-- 管理员权限（用于启用 WFP 内核断网保护与注册开机计划任务；标准权限下会自动降级为应用层进程守护）
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enabled` | `false` | 是否启用 Clash 节点守护（关闭时仅监控 TUN 状态） |
+| `proxyGroup` | `""` | 监控代理组名称；留空表示自动跟踪 `MATCH` 默认出口组 |
+| `matchMode` | `"exact"` | 节点匹配模式：`exact`（精确匹配，忽略大小写）或 `contains`（关键词包含） |
+| `allowedNodes` | `[]` | 允许的出口节点名或关键词列表 |
+| `guardedApps` | `{"antigravity": true, "chatgpt": true, "claude": true}` | 三个受控应用的独立守护开关 |
+| `wfpEnabled` | `true` | 是否启用 WFP 内核级断网保护 |
+| `wfpKillOnBlock` | `true` | 拦截时是否同时终止受控应用进程（`false` 为纯内核无损断网模式） |
+| `wfpBlockNonTunDns` | `false` | 是否开启全局非 TUN 53 端口防 DNS 泄漏 |
+| `popupOnBlock` | `true` | 拦截或拦截态打开受控软件时是否显示屏幕置顶提示卡片 |
+| `logDirectory` | `""` | 自定义日志存放目录；留空时默认使用程序同目录 `logs\` |
+| `customAppPaths` | `{}`（可选） | 用户在「路径管理...」中添加的自定义目录或 `.exe` 路径映射 |
+| `discoveredAppPaths` | `{}`（可选） | 运行时自动发现的受控程序路径缓存（失效路径会自动清理） |
 
-### 1. 获取程序（下载 Release 或本地编译）
-推荐直接从本仓库的 **GitHub Releases** 页面下载最新编译好的 `TunGuard.exe`（或 `TunGuard-vX.Y.Z-win-x64.zip`）；每次推送代码到 `main` 分支都会通过 GitHub Actions 自动构建并发布新版本。
-
-如需本地编译，在项目根目录执行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
-```
-
-脚本会自动生成图标 `TunGuard.ico` 并编译出独立的 `TunGuard.exe`。
-
-### 2. 运行与开机自启
-1. **以管理员权限运行** `TunGuard.exe`（程序清单已声明 `highestAvailable`），将在后台以 `High` 优先级静默启动、自动激活 WFP 内核断网并在系统托盘显示盾牌图标。
-2. 如需开机自启，右键托盘图标勾选 **开机自动启动**（按需创建 `ClashTunGuard` 高权限计划任务）。
-3. 如需桌面入口，可右键 `TunGuard.exe` → **发送到 → 桌面快捷方式**。
-
-### 3. 配置受控应用、WFP 内核保护与允许节点
-1. **双击托盘图标**（或右键托盘图标 → **打开控制面板...**）打开控制面板。
-2. 在顶部 **受控应用** 栏勾选需要守护的应用（**Antigravity** / **ChatGPT 桌面端** / **Claude 桌面端 (Claude Code)**），也可以在托盘右键菜单 **受控应用** 子菜单中随时快速开关。
-3. 在 **内核断网** 栏确认 **启用 WFP 内核断网保护 (零漏包)** 已勾选，并按需调整：
-   - 保持勾选 **拦截时同时终止进程** 获得“内核断网 + 强杀”双重兜底，或取消勾选获得“仅断网保留进程”无损体验；
-   - 如 Clash TUN 已开启 DNS 劫持且需要彻底阻断系统 `dnscache` DNS 泄漏，可勾选 **全局防 DNS 泄漏 (53 端口)**。
-4. 如需限制出口节点，勾选 **启用 Clash 节点守护**，在左侧列表中按订阅或关键词筛选，将允许使用的节点移入右侧列表（或直接点击 **一键移入当前节点**）。
-5. 代理组保持默认 `(自动跟踪默认出口组)` 或按需指定代理组，选择 **精确匹配** / **关键词包含** 后点击 **保存并生效**。
-
-> 配置会自动保存在程序同目录的 `TunGuard.config.json`（已加入 `.gitignore`，不会随源码提交），包含受控应用、WFP 选项、允许节点及自动发现的可执行文件路径缓存，外部修改也会在 1 秒内自动热重载。
+</details>
 
 ---
 
 ## 常见问题（FAQ）
 
 <details>
-<summary><b>如何验证 WFP 内核规则确实生效，以及退出后不会残留？</b></summary>
+<summary><b>如何验证 WFP 内核规则确实生效，且退出后零残留？</b></summary>
 
 在管理员 PowerShell 中运行以下命令导出当前系统 WFP 过滤器并检索 TunGuard 规则：
 
@@ -135,26 +205,45 @@ netsh wfp show filters file=wfp_filters.xml
 Select-String -Path .\wfp_filters.xml -Pattern "TunGuard WFP Kill Switch"
 ```
 
-- TunGuard 正常运行且处于监控状态时，应能看到对应的 Provider、Sublayer 与 Filter 记录；
-- 暂停监控或退出 `TunGuard.exe` 后再次运行上述命令，结果应为空（DYNAMIC 会话由 Windows BFE 自动清空，零残留）。
+- TunGuard 正常运行且处于监控状态时，可检索到对应的 Provider、Sublayer 与 Filter 记录；
+- 暂停监控或退出 `TunGuard.exe` 后再次运行上述命令，结果应为空（`DYNAMIC` 会话由 Windows BFE 自动清空，绝不锁死网络）。
+
+</details>
+
+<details>
+<summary><b>如何做到“断网不丢编辑内容”？和默认强杀模式有什么区别？</b></summary>
+
+在控制面板中保持勾选 **启用 WFP 内核断网保护 (零漏包)**，并**取消勾选「拦截时同时终止进程」**即可进入纯内核无损断网模式：
+- TUN 掉线或切错节点时，WFP 会在内核层直接阻断受控应用的非本地出站流量，应用不会崩溃或被关闭，正在编辑的对话与代码完全保留；
+- 当 TUN 与代理节点恢复合规后，WFP 自动重新放行 TUN 流量，无需重启软件；
+- 如果你追求最高防护级别（彻底消除未绑定源 IP 的 UDP/QUIC 残留及派生子进程），建议保留默认勾选「拦截时同时终止进程」。
+
+</details>
+
+<details>
+<summary><b>便携版或自定义安装目录下的受控软件没有被识别怎么办？</b></summary>
+
+打开控制面板，点击受控应用栏右侧的 **「自动检测」** 或 **「路径管理...」**：
+- 可以查看当前已自动识别并生效的所有 `.exe` 与 MSIX 包；
+- 点击 **「+ 添加目录...」** 或 **「+ 添加程序 (.exe)...」** 加入便携版目录或自定义可执行文件，保存后立即同步到进程守护与 WFP 内核规则。
 
 </details>
 
 <details>
 <summary><b>为什么托盘菜单提示 <code>内核断网: 已降级 (需管理员权限)</code>？</b></summary>
 
-向 Windows Base Filtering Engine (BFE) 写入 WFP 过滤规则强制需要管理员权限。如果当前账户不是管理员、或拒绝了 UAC 提权，TunGuard 会优雅降级为应用层进程终止模式继续保护（即使取消勾选了「拦截时同时终止进程」也会自动回退强杀，确保安全）。右键 `TunGuard.exe` 选择 **以管理员身份运行** 即可激活 WFP。
+向 Windows Base Filtering Engine (BFE) 写入 WFP 过滤规则强制需要管理员权限。如果当前账户不是管理员或拒绝了 UAC 提权，TunGuard 会优雅降级为应用层进程终止模式继续保护（即使取消勾选了「拦截时同时终止进程」也会自动回退强杀，杜绝保护真空）。右键 `TunGuard.exe` 选择 **以管理员身份运行** 即可激活 WFP。
 
 </details>
 
 <details>
 <summary><b>Windows Defender 误报并隔离 <code>TunGuard.exe</code>（如 <code>Behavior:Win32/Persistence.A!ml</code>）怎么办？</b></summary>
 
-因为 `TunGuard.exe` 是**未签名的单文件可执行程序**，且包含 WFP 底层网络过滤（`fwpuclnt.dll`）、进程终止（`TerminateProcess`）与开机计划任务功能，在重新编译覆盖时容易触发 Windows Defender 机器学习启发式误报。
+因为 `TunGuard.exe` 是**未签名的单文件可执行程序**，且包含 WFP 底层网络过滤（`fwpuclnt.dll`）、进程终止（`TerminateProcess`）与计划任务注册能力，重新编译覆盖时容易触发 Windows Defender 机器学习启发式误报。
 
-推荐在编译/运行前将项目目录加入本地排除项：
-1. 打开 **Windows 安全中心** → **病毒和威胁防护** → **管理设置** → **排除项** → **添加排除项** → **文件夹**。
-2. 添加本机项目目录（例如 `D:\...\TunGuard`），然后重新运行 `.\build.ps1`。
+建议在编译或运行前将程序所在文件夹加入本地排除项：
+1. 打开 **Windows 安全中心** → **病毒和威胁防护** → **管理设置** → **排除项** → **添加排除项** → **文件夹**；
+2. 添加本机项目或运行目录（例如 `F:\Tools\TunGuard`），再运行 `.\build.ps1` 或启动 `TunGuard.exe`。
 
 </details>
 
@@ -168,7 +257,7 @@ Select-String -Path .\wfp_filters.xml -Pattern "TunGuard WFP Kill Switch"
 <details>
 <summary><b>如何只监控 TUN 模式、不限制节点？</b></summary>
 
-打开 **控制面板** 页面，取消勾选 **启用 Clash 节点守护** 并保存即可（默认即为关闭状态，关闭后后台零 Mihomo API 请求，TUN 检测与 WFP 内核断网保护仍正常生效）。
+打开 **控制面板**，取消勾选 **启用 Clash 节点守护** 并保存即可（默认即为关闭状态）。关闭后后台零 Mihomo API 请求，TUN 检测与 WFP 内核断网保护仍正常生效。
 
 </details>
 
@@ -176,11 +265,13 @@ Select-String -Path .\wfp_filters.xml -Pattern "TunGuard WFP Kill Switch"
 
 ## 项目结构
 
-| 文件 | 说明 |
+| 文件 / 目录 | 说明 |
 | --- | --- |
-| `TunGuard.cs` | 完整源代码（WFP 内核 Kill Switch、三层受控应用路径与 MSIX 包解析器、TUN 检测、Mihomo Keep-Alive IPC 客户端、全订阅解析器、Win32 毫秒级进程守护、Task Scheduler COM 自启管理、系统托盘与控制面板 UI） |
-| `app.manifest` | Windows 应用程序清单（`highestAvailable` 权限与 Per-Monitor V2 DPI 感知） |
-| `build.ps1` | 生成盾牌图标并调用 `csc.exe` 编译 `TunGuard.exe` 的构建脚本 |
-| `update.md` | WFP 内核级 Kill Switch 方案架构设计与 Windows x64 ABI 参考文档 |
-| `.gitignore` | 忽略编译产物（`*.exe`、`*.ico`）及本地节点配置文件（`TunGuard.config.json`） |
-| `TunGuard.config.json` | 本地守护配置与已发现路径缓存文件（运行时自动生成，不纳入版本控制） |
+| [`TunGuard.cs`](TunGuard.cs) | 完整单文件源码（WFP 内核 Kill Switch、三层应用路径与 MSIX 包解析器、四重 TUN 监测、Mihomo Keep-Alive IPC 客户端、全订阅解析器、Win32 毫秒级进程守护、置顶拦截弹窗、异步日志与查看器、Task Scheduler COM 自启管理、系统托盘与控制面板 UI） |
+| [`build.ps1`](build.ps1) | 生成盾牌图标 `TunGuard.ico` 并调用 `csc.exe` 编译 `TunGuard.exe` 的构建脚本 |
+| [`app.manifest`](app.manifest) | Windows 应用程序清单（`highestAvailable` 权限与 Per-Monitor V2 DPI 感知） |
+| [`.github/workflows/release.yml`](.github/workflows/release.yml) | GitHub Actions 自动构建、版本递增与 Release 发布工作流（附带 `SHA256SUMS.txt`） |
+| [`update.md`](update.md) | WFP 内核级 Kill Switch 方案架构设计与 Windows x64 ABI 参考文档 |
+| [`.gitignore`](.gitignore) | 忽略编译产物（`*.exe`、`*.ico`、`*.pdb`）、本地配置（`TunGuard.config.json`）与运行日志（`logs/`、`*.log`） |
+| `TunGuard.config.json` | 本地守护配置与已发现路径缓存（运行时自动生成，不纳入版本控制） |
+| `logs/` | 按天切分的运行日志目录 `TunGuard-yyyy-MM-dd.log`（运行时自动生成，不纳入版本控制） |
