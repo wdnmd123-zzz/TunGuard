@@ -70,8 +70,10 @@
 - Windows 内置 `.NET Framework 4.x`（`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`）
 - Clash Verge Rev
 
-### 1. 编译
-在项目根目录执行：
+### 1. 获取程序（下载 Release 或本地编译）
+推荐直接从本仓库的 **GitHub Releases** 页面下载最新编译好的 `TunGuard.exe`（或 `TunGuard-vX.Y.Z-win-x64.zip`）；每次推送代码到 `main` 分支都会通过 GitHub Actions 自动构建并发布新版本。
+
+如需本地编译，在项目根目录执行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1

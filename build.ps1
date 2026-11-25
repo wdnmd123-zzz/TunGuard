@@ -66,6 +66,7 @@ $bmp.Dispose()
     /target:winexe `
     /platform:x64 `
     /optimize+ `
+    /codepage:65001 `
     /utf8output `
     "/win32icon:$icoPath" `
     "/win32manifest:$manifestPath" `

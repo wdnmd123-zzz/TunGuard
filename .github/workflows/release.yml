@@ -1,0 +1,254 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional release version (e.g. 1.3.0 or v1.3.0; leave empty to auto-increment)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next release version
+        id: version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+          git fetch --tags --force
+
+          $manualInput = if ($null -ne $env:INPUT_VERSION) { $env:INPUT_VERSION.Trim() } else { "" }
+
+          $srcPath = (Resolve-Path "TunGuard.cs").Path
+          $src = [System.IO.File]::ReadAllText($srcPath, $utf8NoBom)
+
+          $baseMajor = 1; $baseMinor = 0; $basePatch = 0
+          if ($src -match '\[assembly:\s*AssemblyVersion\("(\d+)\.(\d+)\.(\d+)(?:\.\d+)?"\)\]') {
+              $baseMajor = [int]$Matches[1]
+              $baseMinor = [int]$Matches[2]
+              $basePatch = [int]$Matches[3]
+          }
+
+          $existingTags = @(git tag -l "v*" | Where-Object { $_ -match '^v(\d+)\.(\d+)\.(\d+)$' })
+          $hasLatest = $false
+          $maxMajor = 0; $maxMinor = 0; $maxPatch = 0
+          $prevTag = ""
+
+          foreach ($t in $existingTags) {
+              if ($t -match '^v(\d+)\.(\d+)\.(\d+)$') {
+                  $maj = [int]$Matches[1]; $min = [int]$Matches[2]; $pat = [int]$Matches[3]
+                  if (-not $hasLatest -or
+                      ($maj -gt $maxMajor) -or
+                      ($maj -eq $maxMajor -and $min -gt $maxMinor) -or
+                      ($maj -eq $maxMajor -and $min -eq $maxMinor -and $pat -gt $maxPatch)) {
+                      $hasLatest = $true
+                      $maxMajor = $maj; $maxMinor = $min; $maxPatch = $pat
+                      $prevTag = $t
+                  }
+              }
+          }
+
+          if ($manualInput) {
+              $clean = $manualInput.TrimStart('v', 'V')
+              if ($clean -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
+                  throw "Invalid version '$manualInput'. Expected format: X.Y.Z or vX.Y.Z"
+              }
+              $nextMajor = [int]$Matches[1]
+              $nextMinor = [int]$Matches[2]
+              $nextPatch = [int]$Matches[3]
+          }
+          elseif (-not $hasLatest) {
+              $nextMajor = $baseMajor
+              $nextMinor = $baseMinor
+              $nextPatch = $basePatch
+          }
+          else {
+              $codeIsHigher = ($baseMajor -gt $maxMajor) -or
+                  ($baseMajor -eq $maxMajor -and $baseMinor -gt $maxMinor) -or
+                  ($baseMajor -eq $maxMajor -and $baseMinor -eq $maxMinor -and $basePatch -gt $maxPatch)
+              if ($codeIsHigher) {
+                  $nextMajor = $baseMajor
+                  $nextMinor = $baseMinor
+                  $nextPatch = $basePatch
+              }
+              else {
+                  $nextMajor = $maxMajor
+                  $nextMinor = $maxMinor
+                  $nextPatch = $maxPatch + 1
+              }
+          }
+
+          $version = "$nextMajor.$nextMinor.$nextPatch"
+          $tag = "v$version"
+
+          $tagExists = @(git tag -l $tag)
+          if ($tagExists.Count -gt 0 -and $tagExists[0] -eq $tag) {
+              throw "Release tag '$tag' already exists."
+          }
+
+          Write-Host "Base version in TunGuard.cs : $baseMajor.$baseMinor.$basePatch"
+          Write-Host "Previous latest tag         : $(if ($prevTag) { $prevTag } else { '(none)' })"
+          Write-Host "Next release tag            : $tag"
+
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$version`n", $utf8NoBom)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "tag=$tag`n", $utf8NoBom)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "prev_tag=$prevTag`n", $utf8NoBom)
+
+      - name: Stamp version & build TunGuard.exe
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $ver4 = "$env:RELEASE_VERSION.0"
+
+          $srcPath = (Resolve-Path "TunGuard.cs").Path
+          $src = [System.IO.File]::ReadAllText($srcPath, $utf8NoBom)
+          $src = [regex]::Replace($src, '\[assembly:\s*AssemblyVersion\("[^"]+"\)\]', "[assembly: AssemblyVersion(`"$ver4`")]")
+          $src = [regex]::Replace($src, '\[assembly:\s*AssemblyFileVersion\("[^"]+"\)\]', "[assembly: AssemblyFileVersion(`"$ver4`")]")
+          [System.IO.File]::WriteAllText($srcPath, $src, $utf8NoBom)
+
+          try {
+              # Use Windows PowerShell 5.1 so System.Drawing (GDI+) and .NET Framework 4.x csc.exe work natively
+              powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+              if ($LASTEXITCODE -ne 0) {
+                  throw "build.ps1 failed with exit code $LASTEXITCODE"
+              }
+          }
+          finally {
+              git checkout -- TunGuard.cs
+          }
+
+          if (-not (Test-Path "TunGuard.exe")) {
+              throw "Build failed: TunGuard.exe not found."
+          }
+
+          $info = (Get-Item "TunGuard.exe").VersionInfo
+          Write-Host "Compiled TunGuard.exe - FileVersion: $($info.FileVersion), Size: $((Get-Item 'TunGuard.exe').Length) bytes"
+
+      - name: Package release assets
+        id: package
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $tag = $env:RELEASE_TAG
+
+          $distDir = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+
+          $exeOut = Join-Path $distDir "TunGuard.exe"
+          Copy-Item -Path "TunGuard.exe" -Destination $exeOut -Force
+
+          $stageDir = Join-Path $distDir "pkg"
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          Copy-Item -Path "TunGuard.exe" -Destination (Join-Path $stageDir "TunGuard.exe") -Force
+          Copy-Item -Path "README.md" -Destination (Join-Path $stageDir "README.md") -Force
+
+          $zipName = "TunGuard-$tag-win-x64.zip"
+          $zipOut = Join-Path $distDir $zipName
+          Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipOut -Force
+          Remove-Item -Path $stageDir -Recurse -Force
+
+          $exeHash = (Get-FileHash -Path $exeOut -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -Path $zipOut -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $checksumContent = "$exeHash  TunGuard.exe`n$zipHash  $zipName`n"
+          [System.IO.File]::WriteAllText((Join-Path $distDir "SHA256SUMS.txt"), $checksumContent, $utf8NoBom)
+
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "zip_name=$zipName`n", $utf8NoBom)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "exe_sha256=$exeHash`n", $utf8NoBom)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "zip_sha256=$zipHash`n", $utf8NoBom)
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PREV_TAG: ${{ steps.version.outputs.prev_tag }}
+          ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+          EXE_SHA256: ${{ steps.package.outputs.exe_sha256 }}
+          ZIP_SHA256: ${{ steps.package.outputs.zip_sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+          $tag = $env:RELEASE_TAG
+          $prevTag = $env:PREV_TAG
+          $zipName = $env:ZIP_NAME
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+
+          if ($prevTag) {
+              $commitLines = @(git -c i18n.logOutputEncoding=utf-8 log "$prevTag..HEAD" '--pretty=format:- %s (`%h`)')
+          }
+          else {
+              $commitLines = @(git -c i18n.logOutputEncoding=utf-8 log -n 20 '--pretty=format:- %s (`%h`)')
+          }
+
+          $changesBlock = if ($commitLines.Count -gt 0) { $commitLines -join "`n" } else { "- Release $tag ($shortSha)" }
+
+          $compareLine = ""
+          if ($prevTag) {
+              $compareLine = "`n**Full Changelog**: https://github.com/$env:GITHUB_REPOSITORY/compare/$prevTag...$tag`n"
+          }
+
+          $notes = @"
+          ## TunGuard $tag
+
+          Windows x64 独立可执行文件，下载 ``TunGuard.exe``（或 ``$zipName``）即可直接运行，无需安装额外运行时。
+
+          ### 变更内容
+          $changesBlock
+          $compareLine
+          ### 校验信息 (SHA-256)
+          | 文件 | SHA-256 |
+          | --- | --- |
+          | ``TunGuard.exe`` | ``$env:EXE_SHA256`` |
+          | ``$zipName`` | ``$env:ZIP_SHA256`` |
+
+          ---
+          - **Commit**: ``$shortSha``
+          - **Platform**: Windows 10/11 (x64, .NET Framework 4.x)
+          "@
+
+          $notesPath = Join-Path $PWD "dist\release-notes.md"
+          [System.IO.File]::WriteAllText($notesPath, $notes.Trim() + "`n", $utf8NoBom)
+
+          gh release create "$tag" `
+            "dist/TunGuard.exe" `
+            "dist/$zipName" `
+            "dist/SHA256SUMS.txt" `
+            --title "TunGuard $tag" `
+            --target "$env:GITHUB_SHA" `
+            --notes-file "$notesPath" `
+            --latest
+          if ($LASTEXITCODE -ne 0) {
+              throw "gh release create failed with exit code $LASTEXITCODE"
+          }
