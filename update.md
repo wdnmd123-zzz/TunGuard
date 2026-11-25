@@ -114,7 +114,7 @@ Windows 应用调用标准域名解析（`getaddrinfo`）时，真实向外发 U
   - 若未来需要"退出托盘仍常驻保护"，应拆分为独立 **Windows Service** 维护动态会话，而不是让托盘程序往内核写 `FWPM_FILTER_FLAG_PERSISTENT` 规则。
 - **权限与降级**：
   - WFP 写操作强制需要管理员权限。虽然 [app.manifest](app.manifest#L8) 已配置 `highestAvailable` 且 [StartupManager](TunGuard.cs#L6595) 配置了 `<RunLevel>HighestAvailable</RunLevel>`，但标准非管理员账户无法提权。
-  - 当 `FwpmEngineOpen0` 返回 `ERROR_ACCESS_DENIED` (`5`) 时，必须**优雅降级**为现有进程监控模式，并在托盘与控制面板明确提示"内核断网未启用（需管理员权限）"。
+  - **实测注意**：Windows BFE 在非管理员环境下允许 `FwpmEngineOpen0` 成功返回句柄，直到 `FwpmTransactionBegin0(..., 0)` 开启读写事务时才返回 `ERROR_ACCESS_DENIED` (`5`)。因此需在引擎打开与初始化事务全链路统一捕获 `5` / `0x80070005`，并**优雅降级**为现有进程监控模式，在托盘与控制面板明确提示"已降级（需管理员权限）"。
 - **Defender 误报提示**：未签名自编译程序同时调用 `TerminateProcess` + `fwpuclnt.dll` 写入 WFP 规则，可能提高启发式误报率，沿用 [README.md](README.md#L109-L115) 中的文件夹排除项说明即可。
 
 ---
@@ -156,9 +156,9 @@ const uint FWPM_SESSION_FLAG_DYNAMIC = 0x00000001;      // 进程退出/崩溃�
 const uint FWP_ACTION_BLOCK  = 0x00001001;
 const uint FWP_ACTION_PERMIT = 0x00001002;
 
-// 鉴权服务与事务标志
-const uint RPC_C_AUTHN_WINNT = 10;
-const uint FWPM_TXN_WRITE    = 0;                       // 0 = 读写事务，1 = FWPM_TXN_READ_ONLY
+// 鉴权服务与事务标志（SDK 仅定义 FWPM_TXN_READ_ONLY = 1；读写事务直接传 0）
+const uint RPC_C_AUTHN_WINNT    = 10;
+const uint FWPM_TXN_READ_ONLY   = 0x00000001;
 
 // 匹配类型（fwptypes.h）
 enum FWP_MATCH_TYPE : uint
@@ -186,7 +186,8 @@ enum FWP_DATA_TYPE : uint
     FWP_FLOAT = 9, FWP_DOUBLE = 10, FWP_BYTE_ARRAY16_TYPE = 11, FWP_BYTE_BLOB_TYPE = 12,
     FWP_SID = 13, FWP_SECURITY_DESCRIPTOR_TYPE = 14, FWP_TOKEN_INFORMATION_TYPE = 15,
     FWP_TOKEN_ACCESS_INFORMATION_TYPE = 16, FWP_UNICODE_STRING_TYPE = 17,
-    FWP_BYTE_ARRAY6_TYPE = 18, FWP_SINGLE_DATA_TYPE_MAX = 0xFF,
+    FWP_BYTE_ARRAY6_TYPE = 18, FWP_BITMAP_INDEX_TYPE = 19, FWP_BITMAP_ARRAY64_TYPE = 20,
+    FWP_SID_AND_ATTRIBUTES_HASH_TYPE = 21, FWP_SINGLE_DATA_TYPE_MAX = 0xFF,
     FWP_V4_ADDR_MASK = 0x100, FWP_V6_ADDR_MASK = 0x101, FWP_RANGE_TYPE = 0x102,
 }
 ```
@@ -488,3 +489,32 @@ sealed class WfpKillSwitch : IDisposable
 - [FwpmEngineOpen0](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmengineopen0) / [FwpmGetAppIdFromFileName0](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmgetappidfromfilename0)
 - [FWPM_FILTER0](https://learn.microsoft.com/en-us/windows/win32/api/fwpmtypes/ns-fwpmtypes-fwpm_filter0) / [FWPM_SESSION0](https://learn.microsoft.com/en-us/windows/win32/api/fwpmtypes/ns-fwpmtypes-fwpm_session0) / [FWP_VALUE0](https://learn.microsoft.com/en-us/windows/win32/api/fwptypes/ns-fwptypes-fwp_value0)
 - [OpenVPN `wfp_block.c` 参考实现](https://build.openvpn.net/doxygen/wfp__block_8c_source.html)
+
+---
+
+## 附：复核记录（2026-11-25）
+
+> 对本文第 4 节常量 / P/Invoke / 结构体布局逐项核对后的结论。**核心部分正确，可进入实现阶段。**
+
+### 已核实正确（重点：结构体布局）
+
+| 项目 | 结果 |
+| --- | --- |
+| `FWPM_FILTER0`（size 200，`context` 在偏移 152） | ✅ 正确。`context` 必须用含 `ulong` 的 16 字节 `FWPM_FILTER_CONTEXT0` 强制 8 字节对齐，否则后续字段整体前移 4 字节导致越界。 |
+| `FWPM_ACTION0`（size 20） | ✅ 正确。`GUID` 为 4 字节对齐（非 8），`type`(4) + `GUID`(16) = 20。 |
+| `FWP_VALUE0` 中 `FWP_UINT64` 是**指针**（`UINT64*`）而非值 | ✅ 正确（经典 WFP 陷阱）。 |
+| `FWPM_SESSION0` / `PROVIDER0` / `SUBLAYER0`（72 / 64 / 72） | ✅ 正确，字段顺序与对齐均对。 |
+| `FWPM_FILTER_CONDITION0`（size 40：`fieldKey` 0 / `matchType` 16 / `conditionValue` 24） | ✅ 正确。 |
+| `FwpmEngineOpen0` 首参为 `serverName`（非 `securityDescriptor`） | ✅ 正确。 |
+| `FWP_ACTION_BLOCK/PERMIT = 0x1001/0x1002`、`FWP_CONDITION_FLAG_IS_LOOPBACK = 0x1` | ✅ 正确。 |
+| `ALE_APP_ID` / `IP_LOCAL_INTERFACE` / `IP_REMOTE_PORT` / `FLAGS` 的 GUID | ✅ 与 `fwpmu.h` 一致。 |
+| `FWPM_CONDITION_ALE_PACKAGE_ID = 71bc78fa-f17c-4997-a602-6abb261f351c`（`FWP_SID`） | ✅ 正确。 |
+| 集成点 `MIB_IF_ROW2` 偏移 0 为 8 字节 `InterfaceLuid` | ✅ 正确，与 `IF_ROW_INDEX_OFFSET = 8` 自洽。 |
+
+### 待验证 / 小瑕疵（均不在关键路径，已同步处理）
+
+1. **`FWPM_CONDITION_IP_PROTOCOL` 的 GUID `3971ef2b-623e-4f9a-8cb1-6e79b806b9a7`**：已核对与 `fwpmu.h` 一致（`FWP_UINT8`，6=TCP / 17=UDP）；且当前 [TunGuard.cs](TunGuard.cs) 的全局 53 端口 DNS 规则直接按 `IP_REMOTE_PORT == 53` 同时覆盖 UDP/TCP，实际未依赖该字段。
+2. **`FWPM_TXN_WRITE = 0` 的注释**：✅ 已修正 §4.1——改为官方常量 `FWPM_TXN_READ_ONLY = 0x00000001`，并注明读写事务直接传 `0`。
+3. **`FWP_DATA_TYPE` 枚举尾部不全**：✅ 已补齐 §4.1 中的 `FWP_BITMAP_INDEX_TYPE = 19`、`FWP_BITMAP_ARRAY64_TYPE = 20`、`FWP_SID_AND_ATTRIBUTES_HASH_TYPE = 21`。
+4. **释放时机**：`FwpmGetAppIdFromFileName0` 返回的 appId 与非托管条件内存，在**单个 `FwpmFilterAdd0` 返回后**即可 `FwpmFreeMemory0` 释放（WFP 会深拷贝 filter 定义），无需跨事务保留至 commit。实际实现中条件数组在单次 `FwpmFilterAdd0` 后立即释放；`appId`/`PSID` 在单次 `SyncState` 事务前预解析以复用于同一目标的多条 V4/V6 规则，并在 `finally` 中统一释放。
+5. **非管理员权限实测补充**：✅ 已补充 §3.5——Windows BFE 对非管理员会话允许 `FwpmEngineOpen0` 成功返回句柄，直到 `FwpmTransactionBegin0(..., 0)` 才返回 `ERROR_ACCESS_DENIED (0x5)`，已在 `TunGuard.cs` 的 `FormatWfpError` 中全链路统一识别并优雅降级。
