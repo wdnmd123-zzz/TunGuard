@@ -13,7 +13,7 @@
 
 ## 核心亮点
 
-- **零外部依赖 · 单文件 ~236 KB**：纯 C# + Win32 P/Invoke（`iphlpapi.dll` / `fwpuclnt.dll` / `userenv.dll`），直接利用 Windows 内置 `.NET Framework 4.x`（`csc.exe`）编译为单个原生 x64 可执行文件。
+- **零外部依赖 · 单文件 ~238 KB**：纯 C# + Win32 P/Invoke（`iphlpapi.dll` / `fwpuclnt.dll` / `userenv.dll`），直接利用 Windows 内置 `.NET Framework 4.x`（`csc.exe`）编译为单个原生 x64 可执行文件。
 - **内核级零漏包兜底（WFP）**：在 Windows 内核 `ALE_AUTH_CONNECT`（IPv4 + IPv6）层常驻受控应用出站规则——仅放行 TUN 虚拟网卡与 Loopback，TUN 掉线瞬间**零时间窗**丢弃物理网卡直连流量；支持**纯内核断网保留进程**或**内核断网 + 强杀双重兜底**。
 - **免配置直连 Clash 内核**：自动探测并复用 Clash Verge 的 Windows Named Pipe（`\\.\pipe\verge-mihomo-*`），**无需开启外部 HTTP 控制器**即可读取实时节点链路（支持自动回退 TCP 外部控制器）。
 - **极低后台开销**：事件驱动 + HTTP/1.1 Keep-Alive 单组定向查询 + 零反射轻量 JSON 提取，单次节点巡检 `< 0.5 ms`。
@@ -23,11 +23,21 @@
 
 ## 界面预览
 
+### 控制面板
+
 <p align="center">
   <img src="docs/control-panel.png" alt="TunGuard 控制面板运行截图" width="820" />
 </p>
 
 > 控制面板集中提供受控应用自动检测与路径管理、WFP 内核策略开关、置顶弹窗与日志目录配置、按订阅筛选的节点穿梭框与保存前实时命中预览，以及底部的 GitHub 仓库入口、版本检测与一键更新。
+
+### 屏幕置顶拦截提示
+
+<p align="center">
+  <img src="docs/block-alert.png" alt="TunGuard 屏幕置顶拦截提示弹窗" width="480" />
+</p>
+
+> 当 TUN 未开启或出口节点未命中允许列表且受控软件触发拦截时，屏幕上方立即弹出置顶提醒卡片，直观展示拦截原因、当前出口链路、允许节点列表与执行动作，并支持一键打开控制面板或查看日志。
 
 ---
 
@@ -113,7 +123,7 @@ TunGuard 支持三种防护执行模式，可在控制面板随时切换：
 
 ### 4. 屏幕置顶拦截弹窗、异步日志系统 & 系统托盘
 
-- **屏幕置顶拦截弹窗（`popupOnBlock`，默认开启）**：在 TUN 未开启或节点不匹配状态下，一旦打开受控应用或运行中被拦截，屏幕上方即刻弹出非阻塞置顶提醒卡片（支持拖拽与 `Esc` 关闭），清晰展示**拦截原因、当前出口链路、允许节点与执行动作**，并直达控制面板与日志查看器；`10 s` 倒计时自动收起（鼠标悬停暂停），恢复合规后自动关闭。
+- **屏幕置顶拦截弹窗（`popupOnBlock`，默认开启）**：在 TUN 未开启或节点不匹配状态下，一旦打开受控应用或运行中被拦截，屏幕上方即刻弹出非阻塞置顶提醒卡片（支持拖拽），清晰展示**拦截原因、当前出口链路、允许节点与执行动作**，并直达控制面板与日志查看器；卡片保持常驻直至手动点击 **「确认」** / 按 `Esc` 关闭，或在网络状态恢复合规后自动收起，确保重要拦截提示不会被错过。
 - **异步日志系统 & 日志查看器**：独立后台线程无阻塞异步落盘，按天切分 `TunGuard-yyyy-MM-dd.log`（UTF-8 无 BOM）。右键托盘或控制面板点击 **「查看日志...」** 可按日期切换日志、按 `INFO / WARN / ERROR` 分级着色筛选、关键词搜索、自动滚动跟踪、复制与清空；支持自定义日志目录（写权限预检、一键恢复默认、打开目录，以及自动询问迁移历史日志）。
 - **动态盾牌托盘图标**：
 
@@ -291,6 +301,7 @@ Select-String -Path .\wfp_filters.xml -Pattern "TunGuard WFP Kill Switch"
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | GitHub Actions 自动构建、版本递增与 Release 发布工作流（附带 `SHA256SUMS.txt`） |
 | [`update.md`](update.md) | WFP 内核级 Kill Switch 方案架构设计与 Windows x64 ABI 参考文档 |
 | [`docs/control-panel.png`](docs/control-panel.png) | README 展示用控制面板运行截图 |
+| [`docs/block-alert.png`](docs/block-alert.png) | README 展示用屏幕置顶拦截提示弹窗截图 |
 | [`.gitignore`](.gitignore) | 忽略编译产物（`*.exe`、`*.ico`、`*.pdb`）、本地配置（`TunGuard.config.json`）与运行日志（`logs/`、`*.log`） |
 | `TunGuard.config.json` | 本地守护配置与已发现路径缓存（运行时自动生成，不纳入版本控制） |
 | `logs/` | 按天切分的运行日志目录 `TunGuard-yyyy-MM-dd.log`（运行时自动生成，不纳入版本控制） |
