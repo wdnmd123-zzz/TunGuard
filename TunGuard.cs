@@ -53,9 +53,16 @@ namespace TunGuard
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
-                using (TrayApplication app = new TrayApplication(PingEventName))
+                try
                 {
-                    Application.Run(app);
+                    using (TrayApplication app = new TrayApplication(PingEventName))
+                    {
+                        Application.Run(app);
+                    }
+                }
+                finally
+                {
+                    AppLogger.Shutdown();
                 }
             }
         }
@@ -226,6 +233,9 @@ namespace TunGuard
         public bool WfpEnabled { get; set; }
         public bool WfpKillOnBlock { get; set; }
         public bool WfpBlockNonTunDns { get; set; }
+        public bool PopupOnBlock { get; set; }
+        public string LogDirectory { get; set; }
+        public Dictionary<string, List<string>> CustomAppPaths { get; set; }
         public Dictionary<string, List<string>> DiscoveredAppPaths { get; set; }
 
         public NodeGuardConfig()
@@ -240,7 +250,27 @@ namespace TunGuard
             WfpEnabled = true;
             WfpKillOnBlock = true;
             WfpBlockNonTunDns = false;
+            PopupOnBlock = true;
+            LogDirectory = string.Empty;
+            CustomAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             DiscoveredAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        public int GetCustomAppPathCount()
+        {
+            if (CustomAppPaths == null || CustomAppPaths.Count == 0)
+            {
+                return 0;
+            }
+            int total = 0;
+            foreach (KeyValuePair<string, List<string>> kv in CustomAppPaths)
+            {
+                if (kv.Value != null)
+                {
+                    total += kv.Value.Count;
+                }
+            }
+            return total;
         }
 
         public GuardedAppFlags GetGuardedAppFlags()
@@ -266,6 +296,8 @@ namespace TunGuard
             copy.WfpEnabled = WfpEnabled;
             copy.WfpKillOnBlock = WfpKillOnBlock;
             copy.WfpBlockNonTunDns = WfpBlockNonTunDns;
+            copy.PopupOnBlock = PopupOnBlock;
+            copy.LogDirectory = LogDirectory != null ? LogDirectory.Trim() : string.Empty;
 
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (AllowedNodes != null)
@@ -285,40 +317,75 @@ namespace TunGuard
                 }
             }
 
-            if (DiscoveredAppPaths != null)
+            CopyNormalizedAppPathMap(CustomAppPaths, copy.CustomAppPaths);
+            CopyNormalizedAppPathMap(DiscoveredAppPaths, copy.DiscoveredAppPaths);
+            return copy;
+        }
+
+        internal static void CopyNormalizedAppPathMap(
+            Dictionary<string, List<string>> source,
+            Dictionary<string, List<string>> target)
+        {
+            if (source == null || target == null)
             {
-                string[] knownKeys = new string[] { "antigravity", "chatgpt", "claude" };
-                for (int k = 0; k < knownKeys.Length; k++)
+                return;
+            }
+            string[] knownKeys = new string[] { "antigravity", "chatgpt", "claude" };
+            for (int k = 0; k < knownKeys.Length; k++)
+            {
+                string key = knownKeys[k];
+                List<string> srcList;
+                if (!source.TryGetValue(key, out srcList) || srcList == null || srcList.Count == 0)
                 {
-                    string key = knownKeys[k];
-                    List<string> srcList;
-                    if (!DiscoveredAppPaths.TryGetValue(key, out srcList) || srcList == null || srcList.Count == 0)
+                    continue;
+                }
+                HashSet<string> seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                List<string> cleanList = new List<string>();
+                for (int i = 0; i < srcList.Count; i++)
+                {
+                    string normalizedPath = NormalizeConfiguredPathEntry(srcList[i]);
+                    if (string.IsNullOrEmpty(normalizedPath))
                     {
                         continue;
                     }
-                    HashSet<string> seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    List<string> cleanList = new List<string>();
-                    for (int i = 0; i < srcList.Count; i++)
+                    if (seenPaths.Add(normalizedPath))
                     {
-                        string rawPath = srcList[i];
-                        if (string.IsNullOrWhiteSpace(rawPath))
-                        {
-                            continue;
-                        }
-                        string trimmedPath = rawPath.Trim();
-                        if (seenPaths.Add(trimmedPath))
-                        {
-                            cleanList.Add(trimmedPath);
-                        }
-                    }
-                    if (cleanList.Count > 0)
-                    {
-                        cleanList.Sort(StringComparer.OrdinalIgnoreCase);
-                        copy.DiscoveredAppPaths[key] = cleanList;
+                        cleanList.Add(normalizedPath);
                     }
                 }
+                if (cleanList.Count > 0)
+                {
+                    cleanList.Sort(StringComparer.OrdinalIgnoreCase);
+                    target[key] = cleanList;
+                }
             }
-            return copy;
+        }
+
+        internal static string NormalizeConfiguredPathEntry(string rawPath)
+        {
+            if (string.IsNullOrWhiteSpace(rawPath))
+            {
+                return null;
+            }
+            string trimmed = rawPath.Trim().Trim('"').Trim();
+            if (trimmed.Length == 0)
+            {
+                return null;
+            }
+            try
+            {
+                string full = Path.GetFullPath(trimmed);
+                string root = Path.GetPathRoot(full);
+                if (!string.Equals(full, root, StringComparison.OrdinalIgnoreCase))
+                {
+                    full = full.TrimEnd('\\', '/');
+                }
+                return full;
+            }
+            catch
+            {
+                return trimmed;
+            }
         }
 
         public string GetGuardedAppsSummaryText()
@@ -529,53 +596,73 @@ namespace TunGuard
             {
                 cfg.WfpBlockNonTunDns = parsedBool;
             }
-
-            if (TryGetIgnoreCase(obj, "discoveredAppPaths", out val) && val != null)
+            if (TryGetBoolIgnoreCase(obj, "popupOnBlock", out parsedBool))
             {
-                Dictionary<string, object> pathsObj = val as Dictionary<string, object>;
-                if (pathsObj != null)
+                cfg.PopupOnBlock = parsedBool;
+            }
+            if (TryGetIgnoreCase(obj, "logDirectory", out val) && val != null)
+            {
+                cfg.LogDirectory = val.ToString();
+            }
+
+            ReadAppPathMapFromObject(obj, "customAppPaths", cfg.CustomAppPaths);
+            ReadAppPathMapFromObject(obj, "discoveredAppPaths", cfg.DiscoveredAppPaths);
+
+            return cfg.CloneNormalized();
+        }
+
+        private static void ReadAppPathMapFromObject(
+            Dictionary<string, object> obj,
+            string fieldName,
+            Dictionary<string, List<string>> target)
+        {
+            object val;
+            if (!TryGetIgnoreCase(obj, fieldName, out val) || val == null)
+            {
+                return;
+            }
+            Dictionary<string, object> pathsObj = val as Dictionary<string, object>;
+            if (pathsObj == null)
+            {
+                return;
+            }
+            foreach (KeyValuePair<string, object> kv in pathsObj)
+            {
+                if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value == null)
                 {
-                    foreach (KeyValuePair<string, object> kv in pathsObj)
+                    continue;
+                }
+                List<string> pathList = new List<string>();
+                object[] arr = kv.Value as object[];
+                if (arr != null)
+                {
+                    for (int i = 0; i < arr.Length; i++)
                     {
-                        if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value == null)
+                        if (arr[i] != null)
                         {
-                            continue;
-                        }
-                        List<string> pathList = new List<string>();
-                        object[] arr = kv.Value as object[];
-                        if (arr != null)
-                        {
-                            for (int i = 0; i < arr.Length; i++)
-                            {
-                                if (arr[i] != null)
-                                {
-                                    pathList.Add(arr[i].ToString());
-                                }
-                            }
-                        }
-                        else
-                        {
-                            System.Collections.IList list = kv.Value as System.Collections.IList;
-                            if (list != null)
-                            {
-                                for (int i = 0; i < list.Count; i++)
-                                {
-                                    if (list[i] != null)
-                                    {
-                                        pathList.Add(list[i].ToString());
-                                    }
-                                }
-                            }
-                        }
-                        if (pathList.Count > 0)
-                        {
-                            cfg.DiscoveredAppPaths[kv.Key] = pathList;
+                            pathList.Add(arr[i].ToString());
                         }
                     }
                 }
+                else
+                {
+                    System.Collections.IList list = kv.Value as System.Collections.IList;
+                    if (list != null)
+                    {
+                        for (int i = 0; i < list.Count; i++)
+                        {
+                            if (list[i] != null)
+                            {
+                                pathList.Add(list[i].ToString());
+                            }
+                        }
+                    }
+                }
+                if (pathList.Count > 0)
+                {
+                    target[kv.Key] = pathList;
+                }
             }
-
-            return cfg.CloneNormalized();
         }
 
         public static string SerializePretty(NodeGuardConfig config)
@@ -609,49 +696,62 @@ namespace TunGuard
             sb.AppendLine("  },");
             sb.Append("  \"wfpEnabled\": ").Append(cfg.WfpEnabled ? "true" : "false").AppendLine(",");
             sb.Append("  \"wfpKillOnBlock\": ").Append(cfg.WfpKillOnBlock ? "true" : "false").AppendLine(",");
-            sb.Append("  \"wfpBlockNonTunDns\": ").Append(cfg.WfpBlockNonTunDns ? "true" : "false");
+            sb.Append("  \"wfpBlockNonTunDns\": ").Append(cfg.WfpBlockNonTunDns ? "true" : "false").AppendLine(",");
+            sb.Append("  \"popupOnBlock\": ").Append(cfg.PopupOnBlock ? "true" : "false").AppendLine(",");
+            sb.Append("  \"logDirectory\": ").Append(EscapeJsonString(cfg.LogDirectory));
 
+            bool hasCustom = cfg.CustomAppPaths != null && cfg.CustomAppPaths.Count > 0;
             bool hasDiscovered = cfg.DiscoveredAppPaths != null && cfg.DiscoveredAppPaths.Count > 0;
+            if (hasCustom)
+            {
+                sb.AppendLine(",");
+                AppendAppPathMapJson(sb, "customAppPaths", cfg.CustomAppPaths);
+            }
             if (hasDiscovered)
             {
                 sb.AppendLine(",");
-                sb.AppendLine("  \"discoveredAppPaths\": {");
-                List<string> keys = new List<string>(cfg.DiscoveredAppPaths.Keys);
-                keys.Sort(StringComparer.OrdinalIgnoreCase);
-                for (int k = 0; k < keys.Count; k++)
-                {
-                    string key = keys[k];
-                    List<string> paths = cfg.DiscoveredAppPaths[key];
-                    sb.Append("    ").Append(EscapeJsonString(key)).Append(": [");
-                    if (paths != null && paths.Count > 0)
-                    {
-                        sb.AppendLine();
-                        for (int i = 0; i < paths.Count; i++)
-                        {
-                            sb.Append("      ").Append(EscapeJsonString(paths[i]));
-                            if (i < paths.Count - 1)
-                            {
-                                sb.Append(",");
-                            }
-                            sb.AppendLine();
-                        }
-                        sb.Append("    ");
-                    }
-                    sb.Append("]");
-                    if (k < keys.Count - 1)
-                    {
-                        sb.Append(",");
-                    }
-                    sb.AppendLine();
-                }
-                sb.AppendLine("  }");
+                AppendAppPathMapJson(sb, "discoveredAppPaths", cfg.DiscoveredAppPaths);
             }
-            else
-            {
-                sb.AppendLine();
-            }
+            sb.AppendLine();
             sb.AppendLine("}");
             return sb.ToString();
+        }
+
+        private static void AppendAppPathMapJson(
+            StringBuilder sb,
+            string fieldName,
+            Dictionary<string, List<string>> map)
+        {
+            sb.Append("  ").Append(EscapeJsonString(fieldName)).AppendLine(": {");
+            List<string> keys = new List<string>(map.Keys);
+            keys.Sort(StringComparer.OrdinalIgnoreCase);
+            for (int k = 0; k < keys.Count; k++)
+            {
+                string key = keys[k];
+                List<string> paths = map[key];
+                sb.Append("    ").Append(EscapeJsonString(key)).Append(": [");
+                if (paths != null && paths.Count > 0)
+                {
+                    sb.AppendLine();
+                    for (int i = 0; i < paths.Count; i++)
+                    {
+                        sb.Append("      ").Append(EscapeJsonString(paths[i]));
+                        if (i < paths.Count - 1)
+                        {
+                            sb.Append(",");
+                        }
+                        sb.AppendLine();
+                    }
+                    sb.Append("    ");
+                }
+                sb.Append("]");
+                if (k < keys.Count - 1)
+                {
+                    sb.Append(",");
+                }
+                sb.AppendLine();
+            }
+            sb.Append("  }");
         }
 
         private static bool TryGetBoolIgnoreCase(Dictionary<string, object> dict, string key, out bool result)
@@ -750,6 +850,748 @@ namespace TunGuard
                 }
             }
             return null;
+        }
+    }
+
+    internal enum LogLevel
+    {
+        Info = 0,
+        Warn = 1,
+        Error = 2
+    }
+
+    internal struct LogEntry
+    {
+        public DateTime Timestamp;
+        public LogLevel Level;
+        public string Category;
+        public string Message;
+        public string FormattedLine;
+    }
+
+    internal static class AppLogger
+    {
+        private const string DefaultSubDirName = "logs";
+        public const string LogFilePrefix = "TunGuard-";
+        public const string LogFileExtension = ".log";
+        private const int MaxQueueSize = 4096;
+        private const int MaxRecentEntries = 1000;
+
+        private struct QueuedWrite
+        {
+            public string Directory;
+            public DateTime Timestamp;
+            public string Line;
+        }
+
+        private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
+        private static readonly object LockObj = new object();
+        private static readonly Queue<QueuedWrite> WriteQueue = new Queue<QueuedWrite>(64);
+        private static readonly Queue<LogEntry> RecentEntries = new Queue<LogEntry>(128);
+        private static readonly AutoResetEvent WriteSignal = new AutoResetEvent(false);
+        private static readonly ManualResetEvent DrainedSignal = new ManualResetEvent(true);
+        private static readonly ManualResetEvent StopSignal = new ManualResetEvent(false);
+
+        private static Thread _writerThread;
+        private static bool _started;
+        private static bool _shutdown;
+        private static string _configuredDir = string.Empty;
+        private static string _effectiveDir = DefaultLogDirectory;
+        private static string _lastWriteError = string.Empty;
+
+        public static event Action<LogEntry> EntryLogged;
+
+        public static string DefaultLogDirectory
+        {
+            get
+            {
+                return NormalizeDirPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DefaultSubDirName));
+            }
+        }
+
+        public static string ConfiguredLogDirectory
+        {
+            get
+            {
+                lock (LockObj)
+                {
+                    return _configuredDir;
+                }
+            }
+        }
+
+        public static string EffectiveLogDirectory
+        {
+            get
+            {
+                lock (LockObj)
+                {
+                    return _effectiveDir;
+                }
+            }
+        }
+
+        public static bool IsUsingDefaultDirectory
+        {
+            get
+            {
+                lock (LockObj)
+                {
+                    return string.IsNullOrEmpty(_configuredDir) ||
+                           PathsEqual(_effectiveDir, DefaultLogDirectory);
+                }
+            }
+        }
+
+        public static string LastWriteError
+        {
+            get
+            {
+                lock (LockObj)
+                {
+                    return _lastWriteError;
+                }
+            }
+        }
+
+        public static void Initialize(string configuredDir)
+        {
+            lock (LockObj)
+            {
+                if (_shutdown)
+                {
+                    return;
+                }
+
+                string normalized;
+                string err;
+                if (TryValidateWritableDirectory(configuredDir, out normalized, out err))
+                {
+                    _configuredDir = string.IsNullOrWhiteSpace(configuredDir) || PathsEqual(normalized, DefaultLogDirectory)
+                        ? string.Empty
+                        : normalized;
+                    _effectiveDir = normalized;
+                    _lastWriteError = string.Empty;
+                }
+                else
+                {
+                    _configuredDir = string.Empty;
+                    _effectiveDir = DefaultLogDirectory;
+                    _lastWriteError = err ?? string.Empty;
+                    TryEnsureDirectoryExists(_effectiveDir);
+                }
+
+                if (!_started)
+                {
+                    _started = true;
+                    _writerThread = new Thread(WriterLoop)
+                    {
+                        Name = "TunGuardLogWriter",
+                        IsBackground = true,
+                        Priority = ThreadPriority.BelowNormal
+                    };
+                    _writerThread.Start();
+                }
+            }
+        }
+
+        public static void ConfigureDirectoryQuiet(string configuredDir)
+        {
+            string trimmed = configuredDir != null ? configuredDir.Trim() : string.Empty;
+            string normalized;
+            string err;
+            if (!TryValidateWritableDirectory(trimmed, out normalized, out err))
+            {
+                Warn("LOG", "配置中的日志目录无效或不可写，继续使用当前目录 (" + EffectiveLogDirectory + "): " + trimmed + " | " + err);
+                return;
+            }
+
+            string prevDir;
+            bool changed;
+            lock (LockObj)
+            {
+                prevDir = _effectiveDir;
+                changed = !PathsEqual(prevDir, normalized);
+                _configuredDir = string.IsNullOrEmpty(trimmed) || PathsEqual(normalized, DefaultLogDirectory)
+                    ? string.Empty
+                    : normalized;
+                if (changed)
+                {
+                    _effectiveDir = normalized;
+                    _lastWriteError = string.Empty;
+                }
+            }
+
+            if (changed)
+            {
+                Info("LOG", "日志存放目录已更新: " + prevDir + " -> " + normalized);
+            }
+        }
+
+        public static bool SetLogDirectory(string rawConfiguredDir, bool migrateExisting, out int migratedCount, out string effectivePath, out string error)
+        {
+            migratedCount = 0;
+            effectivePath = EffectiveLogDirectory;
+            error = null;
+
+            string trimmed = rawConfiguredDir != null ? rawConfiguredDir.Trim() : string.Empty;
+            string normalized;
+            if (!TryValidateWritableDirectory(trimmed, out normalized, out error))
+            {
+                return false;
+            }
+
+            string oldDir = EffectiveLogDirectory;
+            bool dirChanged = !PathsEqual(oldDir, normalized);
+            string nextConfigured = string.IsNullOrEmpty(trimmed) || PathsEqual(normalized, DefaultLogDirectory)
+                ? string.Empty
+                : normalized;
+
+            if (!dirChanged)
+            {
+                lock (LockObj)
+                {
+                    _configuredDir = nextConfigured;
+                    _effectiveDir = normalized;
+                    _lastWriteError = string.Empty;
+                }
+                effectivePath = normalized;
+                return true;
+            }
+
+            Info("LOG", "准备变更日志存放目录: " + oldDir + " -> " + normalized);
+            Flush(1500);
+
+            if (migrateExisting)
+            {
+                string migrateErr;
+                MigrateLogFiles(oldDir, normalized, out migratedCount, out migrateErr);
+                if (!string.IsNullOrEmpty(migrateErr))
+                {
+                    Warn("LOG", "迁移历史日志时部分文件未完成: " + migrateErr);
+                }
+            }
+
+            lock (LockObj)
+            {
+                _configuredDir = nextConfigured;
+                _effectiveDir = normalized;
+                _lastWriteError = string.Empty;
+            }
+
+            effectivePath = normalized;
+            string suffix = migratedCount > 0 ? (" (已迁移 " + migratedCount + " 个历史日志文件)") : string.Empty;
+            Info("LOG", "日志存放目录已切换为: " + normalized + " (原目录: " + oldDir + ")" + suffix);
+            Flush(1000);
+            return true;
+        }
+
+        public static string ResolveEffectiveDirectory(string configuredDir)
+        {
+            if (string.IsNullOrWhiteSpace(configuredDir))
+            {
+                return DefaultLogDirectory;
+            }
+            try
+            {
+                string expanded = Environment.ExpandEnvironmentVariables(configuredDir.Trim().Trim('"'));
+                if (string.IsNullOrWhiteSpace(expanded))
+                {
+                    return DefaultLogDirectory;
+                }
+                return NormalizeDirPath(Path.GetFullPath(expanded));
+            }
+            catch
+            {
+                return DefaultLogDirectory;
+            }
+        }
+
+        public static bool TryValidateWritableDirectory(string rawPath, out string normalizedPath, out string error)
+        {
+            normalizedPath = null;
+            error = null;
+            try
+            {
+                string target = string.IsNullOrWhiteSpace(rawPath)
+                    ? DefaultLogDirectory
+                    : NormalizeDirPath(Path.GetFullPath(Environment.ExpandEnvironmentVariables(rawPath.Trim().Trim('"'))));
+
+                if (!Directory.Exists(target))
+                {
+                    Directory.CreateDirectory(target);
+                }
+
+                string probeFile = Path.Combine(target, ".tunguard_write_probe_" + Process.GetCurrentProcess().Id + "_" + Environment.TickCount + ".tmp");
+                using (FileStream fs = new FileStream(probeFile, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    fs.WriteByte(0x20);
+                }
+                try
+                {
+                    File.Delete(probeFile);
+                }
+                catch
+                {
+                }
+
+                normalizedPath = target;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        public static string GetLogFilePathForDate(string directory, DateTime date)
+        {
+            string dir = string.IsNullOrWhiteSpace(directory) ? DefaultLogDirectory : directory;
+            return Path.Combine(dir, LogFilePrefix + date.ToString("yyyy-MM-dd") + LogFileExtension);
+        }
+
+        public static string GetCurrentLogFilePath()
+        {
+            return GetLogFilePathForDate(EffectiveLogDirectory, DateTime.Now);
+        }
+
+        public static List<string> ListLogFiles(string directory)
+        {
+            List<string> result = new List<string>();
+            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            {
+                return result;
+            }
+            try
+            {
+                string[] files = Directory.GetFiles(directory, LogFilePrefix + "*" + LogFileExtension, SearchOption.TopDirectoryOnly);
+                Array.Sort(files, (a, b) => string.Compare(Path.GetFileName(b), Path.GetFileName(a), StringComparison.OrdinalIgnoreCase));
+                for (int i = 0; i < files.Length; i++)
+                {
+                    result.Add(files[i]);
+                }
+            }
+            catch
+            {
+            }
+            return result;
+        }
+
+        public static int CountLogFiles(string directory)
+        {
+            return ListLogFiles(directory).Count;
+        }
+
+        public static void MigrateLogFiles(string sourceDir, string destDir, out int migratedCount, out string firstError)
+        {
+            migratedCount = 0;
+            firstError = null;
+            if (string.IsNullOrWhiteSpace(sourceDir) || string.IsNullOrWhiteSpace(destDir) || PathsEqual(sourceDir, destDir))
+            {
+                return;
+            }
+            List<string> files = ListLogFiles(sourceDir);
+            if (files.Count == 0)
+            {
+                return;
+            }
+            TryEnsureDirectoryExists(destDir);
+            for (int i = 0; i < files.Count; i++)
+            {
+                string src = files[i];
+                string fileName = Path.GetFileName(src);
+                if (string.IsNullOrEmpty(fileName))
+                {
+                    continue;
+                }
+                string dst = Path.Combine(destDir, fileName);
+                try
+                {
+                    if (File.Exists(dst))
+                    {
+                        string baseName = Path.GetFileNameWithoutExtension(fileName);
+                        dst = Path.Combine(destDir, baseName + "-migrated-" + DateTime.Now.ToString("HHmmss") + LogFileExtension);
+                    }
+                    try
+                    {
+                        File.Move(src, dst);
+                    }
+                    catch
+                    {
+                        File.Copy(src, dst, false);
+                        try
+                        {
+                            File.Delete(src);
+                        }
+                        catch
+                        {
+                        }
+                    }
+                    migratedCount++;
+                }
+                catch (Exception ex)
+                {
+                    if (firstError == null)
+                    {
+                        firstError = fileName + ": " + ex.Message;
+                    }
+                }
+            }
+        }
+
+        public static string[] ReadLogFileLinesSafe(string filePath, int maxTailLines, out int totalLines, out long fileBytes)
+        {
+            totalLines = 0;
+            fileBytes = 0;
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            {
+                return new string[0];
+            }
+
+            int cap = maxTailLines > 0 ? maxTailLines : 2000;
+            string[] ring = new string[cap];
+            int writeIdx = 0;
+            int count = 0;
+
+            try
+            {
+                using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    fileBytes = fs.Length;
+                    using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                    {
+                        string line;
+                        while ((line = sr.ReadLine()) != null)
+                        {
+                            totalLines++;
+                            ring[writeIdx] = line;
+                            writeIdx = (writeIdx + 1) % cap;
+                            if (count < cap)
+                            {
+                                count++;
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                return new string[0];
+            }
+
+            string[] output = new string[count];
+            int start = (count < cap) ? 0 : writeIdx;
+            for (int i = 0; i < count; i++)
+            {
+                output[i] = ring[(start + i) % cap];
+            }
+            return output;
+        }
+
+        public static bool TryClearLogFile(string filePath, out string error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                error = "未指定日志文件";
+                return false;
+            }
+            Flush(1000);
+            try
+            {
+                using (FileStream fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    // Truncated to 0 bytes
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        public static void Info(string category, string message)
+        {
+            Log(LogLevel.Info, category, message);
+        }
+
+        public static void Warn(string category, string message)
+        {
+            Log(LogLevel.Warn, category, message);
+        }
+
+        public static void Error(string category, string message)
+        {
+            Log(LogLevel.Error, category, message);
+        }
+
+        public static void Log(LogLevel level, string category, string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return;
+            }
+
+            DateTime now = DateTime.Now;
+            string cat = string.IsNullOrWhiteSpace(category) ? "APP" : category.Trim().ToUpperInvariant();
+            string cleanMsg = SanitizeSingleLine(message);
+            string levelTag = level == LogLevel.Error ? "ERROR" : (level == LogLevel.Warn ? "WARN " : "INFO ");
+            string formatted = string.Format(
+                "{0:yyyy-MM-dd HH:mm:ss.fff} [{1}] [{2,-6}] {3}",
+                now,
+                levelTag,
+                cat,
+                cleanMsg);
+
+            LogEntry entry = new LogEntry
+            {
+                Timestamp = now,
+                Level = level,
+                Category = cat,
+                Message = cleanMsg,
+                FormattedLine = formatted
+            };
+
+            lock (LockObj)
+            {
+                if (_shutdown)
+                {
+                    return;
+                }
+                if (!_started)
+                {
+                    _started = true;
+                    _writerThread = new Thread(WriterLoop)
+                    {
+                        Name = "TunGuardLogWriter",
+                        IsBackground = true,
+                        Priority = ThreadPriority.BelowNormal
+                    };
+                    _writerThread.Start();
+                }
+
+                if (RecentEntries.Count >= MaxRecentEntries)
+                {
+                    RecentEntries.Dequeue();
+                }
+                RecentEntries.Enqueue(entry);
+
+                if (WriteQueue.Count < MaxQueueSize)
+                {
+                    WriteQueue.Enqueue(new QueuedWrite
+                    {
+                        Directory = _effectiveDir,
+                        Timestamp = now,
+                        Line = formatted
+                    });
+                    DrainedSignal.Reset();
+                    try
+                    {
+                        WriteSignal.Set();
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            Action<LogEntry> handler = EntryLogged;
+            if (handler != null)
+            {
+                try
+                {
+                    handler(entry);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        public static void Flush(int timeoutMs)
+        {
+            lock (LockObj)
+            {
+                if (!_started || _shutdown)
+                {
+                    return;
+                }
+            }
+            try
+            {
+                WriteSignal.Set();
+                DrainedSignal.WaitOne(timeoutMs);
+            }
+            catch
+            {
+            }
+        }
+
+        public static void Shutdown()
+        {
+            Thread threadToJoin;
+            lock (LockObj)
+            {
+                if (_shutdown)
+                {
+                    return;
+                }
+                _shutdown = true;
+                threadToJoin = _writerThread;
+                _writerThread = null;
+            }
+
+            try
+            {
+                StopSignal.Set();
+                WriteSignal.Set();
+            }
+            catch
+            {
+            }
+
+            if (threadToJoin != null && threadToJoin.IsAlive)
+            {
+                threadToJoin.Join(1500);
+            }
+        }
+
+        private static void WriterLoop()
+        {
+            WaitHandle[] handles = new WaitHandle[] { StopSignal, WriteSignal };
+            List<QueuedWrite> batch = new List<QueuedWrite>(64);
+
+            while (true)
+            {
+                DrainBatchToDisk(batch);
+
+                bool isStopping;
+                lock (LockObj)
+                {
+                    isStopping = _shutdown && WriteQueue.Count == 0;
+                }
+                if (isStopping)
+                {
+                    break;
+                }
+
+                try
+                {
+                    WaitHandle.WaitAny(handles, 2000);
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+            }
+
+            DrainBatchToDisk(batch);
+        }
+
+        private static void DrainBatchToDisk(List<QueuedWrite> batch)
+        {
+            while (true)
+            {
+                batch.Clear();
+                lock (LockObj)
+                {
+                    if (WriteQueue.Count == 0)
+                    {
+                        DrainedSignal.Set();
+                        return;
+                    }
+                    while (WriteQueue.Count > 0 && batch.Count < 256)
+                    {
+                        batch.Add(WriteQueue.Dequeue());
+                    }
+                }
+
+                WriteBatchGrouped(batch);
+            }
+        }
+
+        private static void WriteBatchGrouped(List<QueuedWrite> batch)
+        {
+            int idx = 0;
+            while (idx < batch.Count)
+            {
+                string dir = batch[idx].Directory;
+                string filePath = GetLogFilePathForDate(dir, batch[idx].Timestamp);
+                StringBuilder sb = new StringBuilder(batch.Count * 96);
+                sb.AppendLine(batch[idx].Line);
+                idx++;
+
+                while (idx < batch.Count)
+                {
+                    string nextPath = GetLogFilePathForDate(batch[idx].Directory, batch[idx].Timestamp);
+                    if (!string.Equals(nextPath, filePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+                    sb.AppendLine(batch[idx].Line);
+                    idx++;
+                }
+
+                try
+                {
+                    TryEnsureDirectoryExists(dir);
+                    using (FileStream fs = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                    using (StreamWriter sw = new StreamWriter(fs, Utf8NoBom))
+                    {
+                        sw.Write(sb.ToString());
+                    }
+                    lock (LockObj)
+                    {
+                        _lastWriteError = string.Empty;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (LockObj)
+                    {
+                        _lastWriteError = ex.Message;
+                    }
+                }
+            }
+        }
+
+        private static void TryEnsureDirectoryExists(string dir)
+        {
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+        }
+
+        private static string SanitizeSingleLine(string s)
+        {
+            if (s.IndexOf('\n') < 0 && s.IndexOf('\r') < 0)
+            {
+                return s;
+            }
+            return s.Replace("\r\n", " | ").Replace('\n', ' ').Replace('\r', ' ');
+        }
+
+        private static string NormalizeDirPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return string.Empty;
+            }
+            string full = path.Trim();
+            if (full.Length > 3)
+            {
+                full = full.TrimEnd('\\', '/');
+            }
+            return full;
+        }
+
+        public static bool PathsEqual(string a, string b)
+        {
+            return string.Equals(NormalizeDirPath(a), NormalizeDirPath(b), StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -4213,6 +5055,45 @@ namespace TunGuard
         public double TotalElapsedMs;
     }
 
+    internal sealed class TargetMatchRules
+    {
+        public static readonly TargetMatchRules Empty = new TargetMatchRules(
+            new Dictionary<string, GuardedAppFlags>(StringComparer.OrdinalIgnoreCase),
+            new List<KeyValuePair<string, GuardedAppFlags>>(),
+            new List<KeyValuePair<string, GuardedAppFlags>>(),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            GuardedAppFlags.None,
+            string.Empty);
+
+        public readonly Dictionary<string, GuardedAppFlags> CustomExePaths;
+        public readonly List<KeyValuePair<string, GuardedAppFlags>> CustomDirPrefixes;
+        public readonly List<KeyValuePair<string, GuardedAppFlags>> TrustedRootPrefixes;
+        public readonly HashSet<string> CustomExeNames;
+        public readonly GuardedAppFlags CustomDirAppMask;
+        public readonly string Signature;
+
+        public TargetMatchRules(
+            Dictionary<string, GuardedAppFlags> customExePaths,
+            List<KeyValuePair<string, GuardedAppFlags>> customDirPrefixes,
+            List<KeyValuePair<string, GuardedAppFlags>> trustedRootPrefixes,
+            HashSet<string> customExeNames,
+            GuardedAppFlags customDirAppMask,
+            string signature)
+        {
+            CustomExePaths = customExePaths;
+            CustomDirPrefixes = customDirPrefixes;
+            TrustedRootPrefixes = trustedRootPrefixes;
+            CustomExeNames = customExeNames;
+            CustomDirAppMask = customDirAppMask;
+            Signature = signature ?? string.Empty;
+        }
+
+        public bool HasCustomDirectoriesFor(GuardedAppFlags enabledApps)
+        {
+            return (CustomDirAppMask & enabledApps) != GuardedAppFlags.None;
+        }
+    }
+
     internal sealed class TargetProcessKiller
     {
         private const uint TH32CS_SNAPPROCESS = 0x00000002;
@@ -4280,6 +5161,30 @@ namespace TunGuard
         private HashSet<uint> _nextBenignPids = new HashSet<uint>();
         private bool _benignCacheValid;
         private GuardedAppFlags _enabledApps = GuardedAppFlags.All;
+        private volatile TargetMatchRules _matchRules = TargetMatchRules.Empty;
+
+        public Action<string> MatchedImagePathCallback { get; set; }
+
+        public void SetMatchRules(TargetMatchRules rules)
+        {
+            TargetMatchRules next = rules ?? TargetMatchRules.Empty;
+            TargetMatchRules current = _matchRules;
+            if (current != null && string.Equals(current.Signature, next.Signature, StringComparison.Ordinal))
+            {
+                return;
+            }
+            _matchRules = next;
+            InvalidateCache();
+        }
+
+        private void NotifyMatchedImagePath(string fullPath)
+        {
+            Action<string> cb = MatchedImagePathCallback;
+            if (cb != null && !string.IsNullOrEmpty(fullPath))
+            {
+                cb(fullPath);
+            }
+        }
 
         // Independent fast-path buffers for passive running-path discovery (WFP hot-add)
         private uint[] _discoverPidBuffer = new uint[1024];
@@ -4289,6 +5194,120 @@ namespace TunGuard
         private HashSet<uint> _discoverPrevSeenPids = new HashSet<uint>();
         private HashSet<uint> _discoverNextSeenPids = new HashSet<uint>();
         private readonly StringBuilder _discoverPathBuf = new StringBuilder(2048);
+
+        // Independent fast-path buffers for detecting newly opened guarded apps in WFP-only mode
+        private uint[] _launchPidBuffer = new uint[1024];
+        private uint[] _launchLastSnapshot = new uint[1024];
+        private int _launchLastSnapshotCount;
+        private bool _launchLastSnapshotValid;
+        private HashSet<uint> _launchPrevSeenPids = new HashSet<uint>();
+        private HashSet<uint> _launchNextSeenPids = new HashSet<uint>();
+        private readonly StringBuilder _launchPathBuf = new StringBuilder(2048);
+
+        public void ResetLaunchDetectCache()
+        {
+            _launchLastSnapshotValid = false;
+            _launchLastSnapshotCount = 0;
+            _launchPrevSeenPids.Clear();
+            _launchNextSeenPids.Clear();
+        }
+
+        // Zero-allocation fast-path scan to detect running or newly launched guarded apps without killing them
+        public GuardedAppFlags DetectGuardedApps(bool resetBaseline)
+        {
+            GuardedAppFlags enabledApps = _enabledApps;
+            if (enabledApps == GuardedAppFlags.None)
+            {
+                return GuardedAppFlags.None;
+            }
+
+            if (resetBaseline)
+            {
+                ResetLaunchDetectCache();
+            }
+
+            int pidCount;
+            if (!EnumerateProcessIdsInto(ref _launchPidBuffer, out pidCount))
+            {
+                return GuardedAppFlags.None;
+            }
+
+            if (!resetBaseline && _launchLastSnapshotValid && pidCount == _launchLastSnapshotCount)
+            {
+                bool identical = true;
+                for (int i = 0; i < pidCount; i++)
+                {
+                    if (_launchPidBuffer[i] != _launchLastSnapshot[i])
+                    {
+                        identical = false;
+                        break;
+                    }
+                }
+                if (identical)
+                {
+                    return GuardedAppFlags.None;
+                }
+            }
+
+            _launchNextSeenPids.Clear();
+            GuardedAppFlags matchedApps = GuardedAppFlags.None;
+            for (int i = 0; i < pidCount; i++)
+            {
+                uint pid = _launchPidBuffer[i];
+                if (pid == 0 || pid == SelfPid)
+                {
+                    continue;
+                }
+
+                if (!resetBaseline && _launchPrevSeenPids.Contains(pid))
+                {
+                    _launchNextSeenPids.Add(pid);
+                    continue;
+                }
+
+                IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hQuery != IntPtr.Zero)
+                {
+                    try
+                    {
+                        _launchPathBuf.Clear();
+                        uint size = (uint)_launchPathBuf.Capacity;
+                        if (QueryFullProcessImageNameW(hQuery, 0, _launchPathBuf, ref size) && size > 0)
+                        {
+                            string fullPath = _launchPathBuf.ToString();
+                            GuardedAppFlags app = MatchTargetImagePath(fullPath, enabledApps, _matchRules);
+                            if (app != GuardedAppFlags.None)
+                            {
+                                matchedApps |= app;
+                                NotifyMatchedImagePath(fullPath);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        CloseHandle(hQuery);
+                    }
+                    _launchNextSeenPids.Add(pid);
+                }
+                else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    _launchNextSeenPids.Add(pid);
+                }
+            }
+
+            HashSet<uint> swap = _launchPrevSeenPids;
+            _launchPrevSeenPids = _launchNextSeenPids;
+            _launchNextSeenPids = swap;
+
+            if (_launchLastSnapshot.Length < pidCount)
+            {
+                _launchLastSnapshot = new uint[_launchPidBuffer.Length];
+            }
+            Array.Copy(_launchPidBuffer, _launchLastSnapshot, pidCount);
+            _launchLastSnapshotCount = pidCount;
+            _launchLastSnapshotValid = true;
+            return matchedApps;
+        }
 
         public void ResetDiscoveryCache()
         {
@@ -4415,6 +5434,60 @@ namespace TunGuard
             return false;
         }
 
+        // Thread-safe one-shot snapshot scan (uses local buffers; safe to call from UI/ThreadPool)
+        internal static GuardedAppFlags ScanRunningProcessesSnapshot(
+            TargetMatchRules rules,
+            Action<string> onImagePathFound)
+        {
+            uint[] pidBuf = new uint[1024];
+            int pidCount;
+            if (!EnumerateProcessIdsInto(ref pidBuf, out pidCount))
+            {
+                return GuardedAppFlags.None;
+            }
+
+            GuardedAppFlags runningApps = GuardedAppFlags.None;
+            StringBuilder pathBuf = new StringBuilder(2048);
+            for (int i = 0; i < pidCount; i++)
+            {
+                uint pid = pidBuf[i];
+                if (pid == 0 || pid == SelfPid)
+                {
+                    continue;
+                }
+
+                IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hQuery == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    pathBuf.Clear();
+                    uint size = (uint)pathBuf.Capacity;
+                    if (QueryFullProcessImageNameW(hQuery, 0, pathBuf, ref size) && size > 0)
+                    {
+                        string fullPath = pathBuf.ToString();
+                        if (onImagePathFound != null)
+                        {
+                            onImagePathFound(fullPath);
+                        }
+                        GuardedAppFlags hit = MatchTargetImagePath(fullPath, GuardedAppFlags.All, rules);
+                        if (hit != GuardedAppFlags.None)
+                        {
+                            runningApps |= hit;
+                        }
+                    }
+                }
+                finally
+                {
+                    CloseHandle(hQuery);
+                }
+            }
+            return runningApps;
+        }
+
         // Returns true if any previously disabled target app was newly enabled
         public bool SetEnabledApps(GuardedAppFlags apps)
         {
@@ -4435,6 +5508,7 @@ namespace TunGuard
             _lastPidSnapshotCount = 0;
             _prevBenignPids.Clear();
             _nextBenignPids.Clear();
+            ResetLaunchDetectCache();
         }
 
         public KillResult KillAllNow()
@@ -4677,7 +5751,7 @@ namespace TunGuard
                     {
                         TryTerminateKnownTarget(pid, directApp, ref killed, ref accessDenied, ref killedApps, ref deniedApps);
                     }
-                    else if (NeedsPathVerification(exe, enabledApps))
+                    else if (NeedsPathVerification(exe, enabledApps, _matchRules))
                     {
                         _pathVerifyCandidates.Add(pid);
                     }
@@ -4725,13 +5799,38 @@ namespace TunGuard
             ref GuardedAppFlags killedApps,
             ref GuardedAppFlags deniedApps)
         {
-            IntPtr hProc = OpenProcess(PROCESS_TERMINATE, false, pid);
+            bool canQuery = true;
+            IntPtr hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc == IntPtr.Zero && Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+            {
+                canQuery = false;
+                hProc = OpenProcess(PROCESS_TERMINATE, false, pid);
+            }
             if (hProc == IntPtr.Zero)
             {
                 if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
                 {
                     accessDenied++;
                     deniedApps |= appFlag;
+                    if (MatchedImagePathCallback != null)
+                    {
+                        IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                        if (hQuery != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                string deniedPath = QueryImagePath(hQuery);
+                                if (deniedPath != null)
+                                {
+                                    NotifyMatchedImagePath(deniedPath);
+                                }
+                            }
+                            finally
+                            {
+                                CloseHandle(hQuery);
+                            }
+                        }
+                    }
                 }
                 return;
             }
@@ -4747,6 +5846,15 @@ namespace TunGuard
                 {
                     accessDenied++;
                     deniedApps |= appFlag;
+                }
+
+                if (canQuery && MatchedImagePathCallback != null)
+                {
+                    string fullPath = QueryImagePath(hProc);
+                    if (fullPath != null)
+                    {
+                        NotifyMatchedImagePath(fullPath);
+                    }
                 }
             }
             finally
@@ -4766,6 +5874,7 @@ namespace TunGuard
             out bool isBenign)
         {
             isBenign = false;
+            TargetMatchRules rules = _matchRules;
             IntPtr hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
             if (hProc != IntPtr.Zero)
             {
@@ -4777,7 +5886,7 @@ namespace TunGuard
                         return;
                     }
 
-                    GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps);
+                    GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps, rules);
                     if (matched != GuardedAppFlags.None)
                     {
                         if (TerminateProcess(hProc, 1))
@@ -4790,6 +5899,7 @@ namespace TunGuard
                             accessDenied++;
                             deniedApps |= matched;
                         }
+                        NotifyMatchedImagePath(fullPath);
                     }
                     else
                     {
@@ -4813,11 +5923,12 @@ namespace TunGuard
                         string fullPath = QueryImagePath(hQuery);
                         if (fullPath != null)
                         {
-                            GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps);
+                            GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps, rules);
                             if (matched != GuardedAppFlags.None)
                             {
                                 accessDenied++;
                                 deniedApps |= matched;
+                                NotifyMatchedImagePath(fullPath);
                             }
                             else
                             {
@@ -4879,6 +5990,11 @@ namespace TunGuard
 
         internal static bool NeedsPathVerification(string exe, GuardedAppFlags enabledApps)
         {
+            return NeedsPathVerification(exe, enabledApps, null);
+        }
+
+        internal static bool NeedsPathVerification(string exe, GuardedAppFlags enabledApps, TargetMatchRules rules)
+        {
             if (enabledApps == GuardedAppFlags.None || string.IsNullOrEmpty(exe))
             {
                 return false;
@@ -4899,10 +6015,27 @@ namespace TunGuard
                 return true;
             }
 
+            if (rules != null)
+            {
+                if (rules.HasCustomDirectoriesFor(enabledApps))
+                {
+                    return !IsIgnoredInstallerExeName(exe);
+                }
+                if (rules.CustomExeNames.Count > 0 && rules.CustomExeNames.Contains(exe))
+                {
+                    return true;
+                }
+            }
+
             return false;
         }
 
         internal static GuardedAppFlags MatchTargetImagePath(string fullPath, GuardedAppFlags enabledApps)
+        {
+            return MatchTargetImagePath(fullPath, enabledApps, null);
+        }
+
+        internal static GuardedAppFlags MatchTargetImagePath(string fullPath, GuardedAppFlags enabledApps, TargetMatchRules rules)
         {
             if (enabledApps == GuardedAppFlags.None || string.IsNullOrEmpty(fullPath))
             {
@@ -4920,21 +6053,87 @@ namespace TunGuard
 
             if ((enabledApps & GuardedAppFlags.Antigravity) != 0 &&
                 IsLanguageServerExeName(exe) &&
-                IsAntigravityPath(fullPath))
+                (IsAntigravityPath(fullPath) || MatchesTrustedRoot(fullPath, GuardedAppFlags.Antigravity, rules)))
             {
                 return GuardedAppFlags.Antigravity;
             }
 
             if ((enabledApps & GuardedAppFlags.ChatGPT) != 0 &&
                 IsChatGPTAuxiliaryExeName(exe) &&
-                IsChatGPTDesktopPath(fullPath))
+                (IsChatGPTDesktopPath(fullPath) || MatchesTrustedRoot(fullPath, GuardedAppFlags.ChatGPT, rules)))
             {
                 return GuardedAppFlags.ChatGPT;
             }
 
             if ((enabledApps & GuardedAppFlags.Claude) != 0 &&
                 IsClaudeAuxiliaryExeName(exe) &&
-                IsClaudeDesktopPath(fullPath))
+                (IsClaudeDesktopPath(fullPath) || MatchesTrustedRoot(fullPath, GuardedAppFlags.Claude, rules)))
+            {
+                return GuardedAppFlags.Claude;
+            }
+
+            if (rules != null)
+            {
+                GuardedAppFlags customExactFlag;
+                if (rules.CustomExePaths.Count > 0 &&
+                    rules.CustomExePaths.TryGetValue(fullPath, out customExactFlag))
+                {
+                    GuardedAppFlags hit = customExactFlag & enabledApps;
+                    if (hit != GuardedAppFlags.None)
+                    {
+                        return hit;
+                    }
+                }
+
+                if (rules.CustomDirPrefixes.Count > 0 && !IsIgnoredInstallerExeName(exe))
+                {
+                    GuardedAppFlags dirHits = GuardedAppFlags.None;
+                    for (int i = 0; i < rules.CustomDirPrefixes.Count; i++)
+                    {
+                        KeyValuePair<string, GuardedAppFlags> entry = rules.CustomDirPrefixes[i];
+                        if ((entry.Value & enabledApps) != 0 &&
+                            fullPath.StartsWith(entry.Key, StringComparison.OrdinalIgnoreCase))
+                        {
+                            dirHits |= (entry.Value & enabledApps);
+                        }
+                    }
+                    if (dirHits != GuardedAppFlags.None)
+                    {
+                        return dirHits;
+                    }
+                }
+            }
+
+            return GuardedAppFlags.None;
+        }
+
+        internal static GuardedAppFlags MatchTargetExeInTrustedFolder(string fullPath, GuardedAppFlags appFlag)
+        {
+            if (appFlag == GuardedAppFlags.None || string.IsNullOrEmpty(fullPath))
+            {
+                return GuardedAppFlags.None;
+            }
+
+            int lastSlash = fullPath.LastIndexOf('\\');
+            string exe = lastSlash >= 0 ? fullPath.Substring(lastSlash + 1) : fullPath;
+
+            GuardedAppFlags direct = MatchDirectExeName(exe, appFlag);
+            if (direct != GuardedAppFlags.None)
+            {
+                return direct;
+            }
+
+            if ((appFlag & GuardedAppFlags.Antigravity) != 0 && IsLanguageServerExeName(exe))
+            {
+                return GuardedAppFlags.Antigravity;
+            }
+
+            if ((appFlag & GuardedAppFlags.ChatGPT) != 0 && IsChatGPTAuxiliaryExeName(exe))
+            {
+                return GuardedAppFlags.ChatGPT;
+            }
+
+            if ((appFlag & GuardedAppFlags.Claude) != 0 && IsClaudeAuxiliaryExeName(exe))
             {
                 return GuardedAppFlags.Claude;
             }
@@ -4942,9 +6141,42 @@ namespace TunGuard
             return GuardedAppFlags.None;
         }
 
+        private static bool MatchesTrustedRoot(string fullPath, GuardedAppFlags appFlag, TargetMatchRules rules)
+        {
+            if (rules == null || rules.TrustedRootPrefixes.Count == 0)
+            {
+                return false;
+            }
+            for (int i = 0; i < rules.TrustedRootPrefixes.Count; i++)
+            {
+                KeyValuePair<string, GuardedAppFlags> entry = rules.TrustedRootPrefixes[i];
+                if ((entry.Value & appFlag) != 0 &&
+                    fullPath.StartsWith(entry.Key, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        internal static bool IsIgnoredInstallerExeName(string exe)
+        {
+            if (string.IsNullOrEmpty(exe))
+            {
+                return true;
+            }
+            return exe.StartsWith("unins", StringComparison.OrdinalIgnoreCase) ||
+                   exe.StartsWith("Uninstall", StringComparison.OrdinalIgnoreCase) ||
+                   exe.EndsWith("-backup.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "elevate.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "elevation_service.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "elevated_tracing_service.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool IsLanguageServerExeName(string exe)
         {
-            return exe.StartsWith("language_server", StringComparison.OrdinalIgnoreCase) &&
+            return !IsIgnoredInstallerExeName(exe) &&
+                   exe.StartsWith("language_server", StringComparison.OrdinalIgnoreCase) &&
                    exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
         }
 
@@ -4955,17 +6187,19 @@ namespace TunGuard
 
         private static bool IsChatGPTAuxiliaryExeName(string exe)
         {
-            if (string.Equals(exe, "Codex.exe", StringComparison.OrdinalIgnoreCase))
+            if (IsIgnoredInstallerExeName(exe) || !exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                return true;
+                return false;
             }
-            return exe.StartsWith("ChatGPT", StringComparison.OrdinalIgnoreCase) &&
-                   exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+            return exe.StartsWith("ChatGPT", StringComparison.OrdinalIgnoreCase) ||
+                   exe.StartsWith("Codex", StringComparison.OrdinalIgnoreCase) ||
+                   exe.StartsWith("OpenAI", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsChatGPTDesktopPath(string fullPath)
         {
-            return fullPath.IndexOf("\\WindowsApps\\OpenAI.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            return fullPath.IndexOf("\\WindowsApps\\OpenAI", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\WindowsApps\\ChatGPT", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\OpenAI\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\OpenAI\\Codex\\", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -4981,16 +6215,21 @@ namespace TunGuard
 
         private static bool IsClaudeAuxiliaryExeName(string exe)
         {
-            return string.Equals(exe, "Claude.exe", StringComparison.OrdinalIgnoreCase) ||
+            if (IsIgnoredInstallerExeName(exe) || !exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            return exe.StartsWith("Claude", StringComparison.OrdinalIgnoreCase) ||
+                   exe.StartsWith("Anthropic", StringComparison.OrdinalIgnoreCase) ||
                    string.Equals(exe, "cowork-svc.exe", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsClaudeDesktopPath(string fullPath)
         {
             return fullPath.IndexOf("\\WindowsApps\\Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   fullPath.IndexOf("\\WindowsApps\\Anthropic.", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   fullPath.IndexOf("\\WindowsApps\\AnthropicPBC.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\WindowsApps\\Anthropic", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\AnthropicClaude\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Anthropic\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude-3p\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude-zh", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -5002,8 +6241,22 @@ namespace TunGuard
         }
     }
 
+    internal sealed class AppPathDiagnostics
+    {
+        public List<string> AntigravityExes = new List<string>();
+        public List<string> ChatGptExes = new List<string>();
+        public List<string> ClaudeExes = new List<string>();
+        public List<string> ChatGptPackages = new List<string>();
+        public List<string> ClaudePackages = new List<string>();
+        public GuardedAppFlags RunningApps;
+        public DateTime ScannedAt;
+    }
+
     internal sealed class GuardedAppPathResolver
     {
+        private const int DefaultScanMaxDepth = 5;
+        private const int MaxCustomDirExes = 64;
+
         private static readonly HashSet<string> SkipDirNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "node_modules", ".git", "cache", "gpucache", "code cache", "locales",
@@ -5017,6 +6270,20 @@ namespace TunGuard
         private readonly HashSet<string> _chatGptPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _claudePackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _mihomoPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private readonly HashSet<string> _trustedAntigravityRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _trustedChatGptRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _trustedClaudeRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private readonly List<string> _customAntigravityEntries = new List<string>();
+        private readonly List<string> _customChatGptEntries = new List<string>();
+        private readonly List<string> _customClaudeEntries = new List<string>();
+
+        private readonly HashSet<string> _customAntigravityExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _customChatGptExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _customClaudeExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private volatile TargetMatchRules _matchRules = TargetMatchRules.Empty;
         private bool _cacheDirty;
 
         public bool HasDirtyCache
@@ -5030,40 +6297,111 @@ namespace TunGuard
             }
         }
 
+        public TargetMatchRules GetMatchRules()
+        {
+            return _matchRules;
+        }
+
+        public void ApplyCustomPathsFromConfig(NodeGuardConfig cfg)
+        {
+            List<string> antiEntries = ExtractConfigPathList(cfg != null ? cfg.CustomAppPaths : null, "antigravity");
+            List<string> chatEntries = ExtractConfigPathList(cfg != null ? cfg.CustomAppPaths : null, "chatgpt");
+            List<string> claudeEntries = ExtractConfigPathList(cfg != null ? cfg.CustomAppPaths : null, "claude");
+
+            List<string> antiExes = ResolveCustomEntriesToExes(antiEntries);
+            List<string> chatExes = ResolveCustomEntriesToExes(chatEntries);
+            List<string> claudeExes = ResolveCustomEntriesToExes(claudeEntries);
+
+            lock (_lock)
+            {
+                ReplaceListLocked(_customAntigravityEntries, antiEntries);
+                ReplaceListLocked(_customChatGptEntries, chatEntries);
+                ReplaceListLocked(_customClaudeEntries, claudeEntries);
+
+                ReplaceSetLocked(_customAntigravityExes, antiExes);
+                ReplaceSetLocked(_customChatGptExes, chatExes);
+                ReplaceSetLocked(_customClaudeExes, claudeExes);
+
+                RebuildMatchRulesLocked();
+
+                TargetMatchRules rules = _matchRules;
+                if (PruneUnmatchedPathsLocked(_antigravityPaths, GuardedAppFlags.Antigravity, rules)) _cacheDirty = true;
+                if (PruneUnmatchedPathsLocked(_chatGptPaths, GuardedAppFlags.ChatGPT, rules)) _cacheDirty = true;
+                if (PruneUnmatchedPathsLocked(_claudePaths, GuardedAppFlags.Claude, rules)) _cacheDirty = true;
+            }
+        }
+
+        private static bool PruneUnmatchedPathsLocked(HashSet<string> set, GuardedAppFlags appFlag, TargetMatchRules rules)
+        {
+            List<string> stale = null;
+            foreach (string path in set)
+            {
+                if (!File.Exists(path) ||
+                    TargetProcessKiller.MatchTargetImagePath(path, appFlag, rules) == GuardedAppFlags.None)
+                {
+                    if (stale == null) stale = new List<string>();
+                    stale.Add(path);
+                }
+            }
+            if (stale == null)
+            {
+                return false;
+            }
+            for (int i = 0; i < stale.Count; i++)
+            {
+                set.Remove(stale[i]);
+            }
+            return true;
+        }
+
         public void LoadFromConfigCache(NodeGuardConfig cfg)
         {
+            ApplyCustomPathsFromConfig(cfg);
             if (cfg == null || cfg.DiscoveredAppPaths == null)
             {
                 return;
             }
 
+            TargetMatchRules rules = _matchRules;
             lock (_lock)
             {
-                LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "antigravity", GuardedAppFlags.Antigravity, _antigravityPaths);
-                LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "chatgpt", GuardedAppFlags.ChatGPT, _chatGptPaths);
-                LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "claude", GuardedAppFlags.Claude, _claudePaths);
+                bool hadStale = false;
+                if (LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "antigravity", GuardedAppFlags.Antigravity, rules, _antigravityPaths)) hadStale = true;
+                if (LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "chatgpt", GuardedAppFlags.ChatGPT, rules, _chatGptPaths)) hadStale = true;
+                if (LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "claude", GuardedAppFlags.Claude, rules, _claudePaths)) hadStale = true;
+                if (hadStale)
+                {
+                    _cacheDirty = true;
+                }
             }
         }
 
-        private static void LoadCachedKeyLocked(
+        private static bool LoadCachedKeyLocked(
             Dictionary<string, List<string>> map,
             string key,
             GuardedAppFlags appFlag,
+            TargetMatchRules rules,
             HashSet<string> targetSet)
         {
             List<string> list;
             if (!map.TryGetValue(key, out list) || list == null)
             {
-                return;
+                return false;
             }
+            bool hadStale = false;
             for (int i = 0; i < list.Count; i++)
             {
                 string norm = NormalizeExistingFile(list[i]);
-                if (norm != null && TargetProcessKiller.MatchTargetImagePath(norm, appFlag) != GuardedAppFlags.None)
+                if (norm != null && TargetProcessKiller.MatchTargetImagePath(norm, appFlag, rules) != GuardedAppFlags.None)
                 {
                     targetSet.Add(norm);
                 }
+                else
+                {
+                    hadStale = true;
+                }
             }
+            return hadStale;
         }
 
         public void ScanStaticInstallations()
@@ -5074,9 +6412,12 @@ namespace TunGuard
             List<string> foundChatPkg = new List<string>();
             List<string> foundClaudePkg = new List<string>();
             List<string> foundMihomo = new List<string>();
+            List<string> foundAntiRoots = new List<string>();
+            List<string> foundChatRoots = new List<string>();
+            List<string> foundClaudeRoots = new List<string>();
 
             // 1. MSIX / AppModel registry packages (Claude Desktop & ChatGPT Desktop)
-            ScanAppxPackages(foundChat, foundClaude, foundChatPkg, foundClaudePkg);
+            ScanAppxPackages(foundChat, foundClaude, foundChatPkg, foundClaudePkg, foundChatRoots, foundClaudeRoots);
 
             // 2. Standard desktop installation directories
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -5092,7 +6433,7 @@ namespace TunGuard
             };
             for (int i = 0; i < antiDirs.Length; i++)
             {
-                ScanDirectoryForApp(antiDirs[i], GuardedAppFlags.Antigravity, 3, foundAnti);
+                ScanDirectoryForApp(antiDirs[i], GuardedAppFlags.Antigravity, DefaultScanMaxDepth, false, foundAnti);
             }
 
             string[] chatDirs = new string[]
@@ -5105,21 +6446,24 @@ namespace TunGuard
             };
             for (int i = 0; i < chatDirs.Length; i++)
             {
-                ScanDirectoryForApp(chatDirs[i], GuardedAppFlags.ChatGPT, 3, foundChat);
+                ScanDirectoryForApp(chatDirs[i], GuardedAppFlags.ChatGPT, DefaultScanMaxDepth, false, foundChat);
             }
 
             string[] claudeDirs = new string[]
             {
                 CombineSafe(localAppData, "AnthropicClaude"),
+                CombineSafe(localAppData, "Anthropic"),
                 CombineSafe(localAppData, "Programs\\Claude"),
+                CombineSafe(localAppData, "Programs\\AnthropicClaude"),
                 CombineSafe(localAppData, "Claude"),
                 CombineSafe(localAppData, "Claude-3p"),
                 CombineSafe(progFiles, "Claude"),
-                CombineSafe(progFiles, "AnthropicClaude")
+                CombineSafe(progFiles, "AnthropicClaude"),
+                CombineSafe(progFiles, "Anthropic")
             };
             for (int i = 0; i < claudeDirs.Length; i++)
             {
-                ScanDirectoryForApp(claudeDirs[i], GuardedAppFlags.Claude, 3, foundClaude);
+                ScanDirectoryForApp(claudeDirs[i], GuardedAppFlags.Claude, DefaultScanMaxDepth, false, foundClaude);
             }
 
             string[] clashDirs = new string[]
@@ -5134,7 +6478,24 @@ namespace TunGuard
             }
 
             // 3. Uninstall registry entries (captures custom drive installs like D:\Program Files...)
-            ScanUninstallRegistry(foundAnti, foundChat, foundClaude, foundMihomo);
+            ScanUninstallRegistry(foundAnti, foundChat, foundClaude, foundMihomo, foundAntiRoots, foundChatRoots, foundClaudeRoots);
+
+            // 4. Desktop & Start Menu shortcuts (.lnk) — captures portable/custom-location installs
+            ScanShortcutsForApps(foundAnti, foundChat, foundClaude, foundAntiRoots, foundChatRoots, foundClaudeRoots);
+
+            // 5. Refresh resolved exes for user-configured custom directories (picks up updated binaries inside custom folders)
+            List<string> customAntiSnapshot;
+            List<string> customChatSnapshot;
+            List<string> customClaudeSnapshot;
+            lock (_lock)
+            {
+                customAntiSnapshot = new List<string>(_customAntigravityEntries);
+                customChatSnapshot = new List<string>(_customChatGptEntries);
+                customClaudeSnapshot = new List<string>(_customClaudeEntries);
+            }
+            List<string> customAntiExes = ResolveCustomEntriesToExes(customAntiSnapshot);
+            List<string> customChatExes = ResolveCustomEntriesToExes(customChatSnapshot);
+            List<string> customClaudeExes = ResolveCustomEntriesToExes(customClaudeSnapshot);
 
             lock (_lock)
             {
@@ -5144,6 +6505,18 @@ namespace TunGuard
                 for (int i = 0; i < foundChatPkg.Count; i++) _chatGptPackages.Add(foundChatPkg[i]);
                 for (int i = 0; i < foundClaudePkg.Count; i++) _claudePackages.Add(foundClaudePkg[i]);
                 for (int i = 0; i < foundMihomo.Count; i++) _mihomoPaths.Add(foundMihomo[i]);
+
+                bool rulesChanged = false;
+                if (AddRootsLocked(_trustedAntigravityRoots, foundAntiRoots)) rulesChanged = true;
+                if (AddRootsLocked(_trustedChatGptRoots, foundChatRoots)) rulesChanged = true;
+                if (AddRootsLocked(_trustedClaudeRoots, foundClaudeRoots)) rulesChanged = true;
+                if (ReplaceSetLocked(_customAntigravityExes, customAntiExes)) rulesChanged = true;
+                if (ReplaceSetLocked(_customChatGptExes, customChatExes)) rulesChanged = true;
+                if (ReplaceSetLocked(_customClaudeExes, customClaudeExes)) rulesChanged = true;
+                if (rulesChanged)
+                {
+                    RebuildMatchRulesLocked();
+                }
             }
         }
 
@@ -5156,23 +6529,43 @@ namespace TunGuard
             }
 
             bool changed = false;
-            GuardedAppFlags matched = TargetProcessKiller.MatchTargetImagePath(norm, GuardedAppFlags.All);
+            TargetMatchRules rules = _matchRules;
+            GuardedAppFlags matched = TargetProcessKiller.MatchTargetImagePath(norm, GuardedAppFlags.All, rules);
             if (matched != GuardedAppFlags.None)
             {
+                int slashIdx = norm.LastIndexOf('\\');
+                string exeName = slashIdx >= 0 ? norm.Substring(slashIdx + 1) : norm;
+                GuardedAppFlags directMatched = TargetProcessKiller.MatchDirectExeName(exeName, matched);
+                string parentDir = Path.GetDirectoryName(norm);
+                string trustedRootDir = (directMatched != GuardedAppFlags.None && IsSafeRootDirectory(parentDir))
+                    ? NormalizeDirectoryPath(parentDir)
+                    : null;
+
                 List<string> siblingAnti = null;
-                if ((matched & GuardedAppFlags.Antigravity) != 0 &&
-                    norm.EndsWith("\\Antigravity.exe", StringComparison.OrdinalIgnoreCase))
+                List<string> siblingChat = null;
+                List<string> siblingClaude = null;
+                if (!string.IsNullOrEmpty(trustedRootDir))
                 {
-                    string dir = Path.GetDirectoryName(norm);
-                    if (!string.IsNullOrEmpty(dir))
+                    if ((directMatched & GuardedAppFlags.Antigravity) != 0)
                     {
                         siblingAnti = new List<string>();
-                        ScanDirectoryForApp(Path.Combine(dir, "resources"), GuardedAppFlags.Antigravity, 2, siblingAnti);
+                        ScanDirectoryForApp(trustedRootDir, GuardedAppFlags.Antigravity, 3, true, siblingAnti);
+                    }
+                    if ((directMatched & GuardedAppFlags.ChatGPT) != 0)
+                    {
+                        siblingChat = new List<string>();
+                        ScanDirectoryForApp(trustedRootDir, GuardedAppFlags.ChatGPT, 3, true, siblingChat);
+                    }
+                    if ((directMatched & GuardedAppFlags.Claude) != 0)
+                    {
+                        siblingClaude = new List<string>();
+                        ScanDirectoryForApp(trustedRootDir, GuardedAppFlags.Claude, 3, true, siblingClaude);
                     }
                 }
 
                 lock (_lock)
                 {
+                    bool rulesChanged = false;
                     if ((matched & GuardedAppFlags.Antigravity) != 0)
                     {
                         if (_antigravityPaths.Add(norm))
@@ -5184,16 +6577,52 @@ namespace TunGuard
                         {
                             changed = true;
                         }
+                        if (!string.IsNullOrEmpty(trustedRootDir) &&
+                            (directMatched & GuardedAppFlags.Antigravity) != 0 &&
+                            _trustedAntigravityRoots.Add(trustedRootDir))
+                        {
+                            rulesChanged = true;
+                        }
                     }
-                    if ((matched & GuardedAppFlags.ChatGPT) != 0 && _chatGptPaths.Add(norm))
+                    if ((matched & GuardedAppFlags.ChatGPT) != 0)
                     {
-                        _cacheDirty = true;
-                        changed = true;
+                        if (_chatGptPaths.Add(norm))
+                        {
+                            _cacheDirty = true;
+                            changed = true;
+                        }
+                        if (siblingChat != null && AddRangeMarkDirtyLocked(_chatGptPaths, siblingChat, true))
+                        {
+                            changed = true;
+                        }
+                        if (!string.IsNullOrEmpty(trustedRootDir) &&
+                            (directMatched & GuardedAppFlags.ChatGPT) != 0 &&
+                            _trustedChatGptRoots.Add(trustedRootDir))
+                        {
+                            rulesChanged = true;
+                        }
                     }
-                    if ((matched & GuardedAppFlags.Claude) != 0 && _claudePaths.Add(norm))
+                    if ((matched & GuardedAppFlags.Claude) != 0)
                     {
-                        _cacheDirty = true;
-                        changed = true;
+                        if (_claudePaths.Add(norm))
+                        {
+                            _cacheDirty = true;
+                            changed = true;
+                        }
+                        if (siblingClaude != null && AddRangeMarkDirtyLocked(_claudePaths, siblingClaude, true))
+                        {
+                            changed = true;
+                        }
+                        if (!string.IsNullOrEmpty(trustedRootDir) &&
+                            (directMatched & GuardedAppFlags.Claude) != 0 &&
+                            _trustedClaudeRoots.Add(trustedRootDir))
+                        {
+                            rulesChanged = true;
+                        }
+                    }
+                    if (rulesChanged)
+                    {
+                        RebuildMatchRulesLocked();
                     }
                 }
                 return changed;
@@ -5254,16 +6683,19 @@ namespace TunGuard
             {
                 if ((enabledApps & GuardedAppFlags.Antigravity) != 0)
                 {
-                    CopyExistingFilesLocked(_antigravityPaths, exeSet);
+                    if (CopyExistingFilesLocked(_antigravityPaths, exeSet)) _cacheDirty = true;
+                    CopyExistingFilesLocked(_customAntigravityExes, exeSet);
                 }
                 if ((enabledApps & GuardedAppFlags.ChatGPT) != 0)
                 {
-                    CopyExistingFilesLocked(_chatGptPaths, exeSet);
+                    if (CopyExistingFilesLocked(_chatGptPaths, exeSet)) _cacheDirty = true;
+                    CopyExistingFilesLocked(_customChatGptExes, exeSet);
                     foreach (string p in _chatGptPackages) pkgSet.Add(p);
                 }
                 if ((enabledApps & GuardedAppFlags.Claude) != 0)
                 {
-                    CopyExistingFilesLocked(_claudePaths, exeSet);
+                    if (CopyExistingFilesLocked(_claudePaths, exeSet)) _cacheDirty = true;
+                    CopyExistingFilesLocked(_customClaudeExes, exeSet);
                     foreach (string p in _claudePackages) pkgSet.Add(p);
                 }
                 CopyExistingFilesLocked(_mihomoPaths, mihomoSet);
@@ -5277,6 +6709,38 @@ namespace TunGuard
             mihomoPaths.Sort(StringComparer.OrdinalIgnoreCase);
         }
 
+        public AppPathDiagnostics GetDiagnostics()
+        {
+            AppPathDiagnostics diag = new AppPathDiagnostics();
+            HashSet<string> antiSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> chatSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> claudeSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            lock (_lock)
+            {
+                CopyExistingFilesLocked(_antigravityPaths, antiSet);
+                CopyExistingFilesLocked(_customAntigravityExes, antiSet);
+                CopyExistingFilesLocked(_chatGptPaths, chatSet);
+                CopyExistingFilesLocked(_customChatGptExes, chatSet);
+                CopyExistingFilesLocked(_claudePaths, claudeSet);
+                CopyExistingFilesLocked(_customClaudeExes, claudeSet);
+
+                diag.ChatGptPackages.AddRange(_chatGptPackages);
+                diag.ClaudePackages.AddRange(_claudePackages);
+            }
+
+            diag.AntigravityExes.AddRange(antiSet);
+            diag.ChatGptExes.AddRange(chatSet);
+            diag.ClaudeExes.AddRange(claudeSet);
+            diag.AntigravityExes.Sort(StringComparer.OrdinalIgnoreCase);
+            diag.ChatGptExes.Sort(StringComparer.OrdinalIgnoreCase);
+            diag.ClaudeExes.Sort(StringComparer.OrdinalIgnoreCase);
+            diag.ChatGptPackages.Sort(StringComparer.OrdinalIgnoreCase);
+            diag.ClaudePackages.Sort(StringComparer.OrdinalIgnoreCase);
+            diag.ScannedAt = DateTime.Now;
+            return diag;
+        }
+
         public bool MergeIntoConfig(NodeGuardConfig config, bool clearDirtyFlag)
         {
             if (config == null)
@@ -5288,55 +6752,105 @@ namespace TunGuard
                 config.DiscoveredAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             }
 
-            bool addedAny = false;
+            bool changedAny = false;
             lock (_lock)
             {
-                if (MergeAppSetLocked(config.DiscoveredAppPaths, "antigravity", _antigravityPaths)) addedAny = true;
-                if (MergeAppSetLocked(config.DiscoveredAppPaths, "chatgpt", _chatGptPaths)) addedAny = true;
-                if (MergeAppSetLocked(config.DiscoveredAppPaths, "claude", _claudePaths)) addedAny = true;
+                TargetMatchRules rules = _matchRules;
+                if (MergeAppSetLocked(config.DiscoveredAppPaths, "antigravity", GuardedAppFlags.Antigravity, rules, _antigravityPaths)) changedAny = true;
+                if (MergeAppSetLocked(config.DiscoveredAppPaths, "chatgpt", GuardedAppFlags.ChatGPT, rules, _chatGptPaths)) changedAny = true;
+                if (MergeAppSetLocked(config.DiscoveredAppPaths, "claude", GuardedAppFlags.Claude, rules, _claudePaths)) changedAny = true;
                 if (clearDirtyFlag)
                 {
                     _cacheDirty = false;
                 }
             }
-            return addedAny;
+            return changedAny;
         }
 
         private static bool MergeAppSetLocked(
             Dictionary<string, List<string>> targetMap,
             string key,
+            GuardedAppFlags appFlag,
+            TargetMatchRules rules,
             HashSet<string> source)
         {
-            if (source.Count == 0)
+            List<string> existingList;
+            bool hadExisting = targetMap.TryGetValue(key, out existingList) && existingList != null && existingList.Count > 0;
+
+            HashSet<string> cleanSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (hadExisting)
+            {
+                for (int i = 0; i < existingList.Count; i++)
+                {
+                    string norm = NormalizeExistingFile(existingList[i]);
+                    if (norm != null &&
+                        TargetProcessKiller.MatchTargetImagePath(norm, appFlag, rules) != GuardedAppFlags.None)
+                    {
+                        cleanSet.Add(norm);
+                    }
+                }
+            }
+
+            List<string> staleSource = null;
+            foreach (string path in source)
+            {
+                if (File.Exists(path))
+                {
+                    cleanSet.Add(path);
+                }
+                else
+                {
+                    if (staleSource == null) staleSource = new List<string>();
+                    staleSource.Add(path);
+                }
+            }
+            if (staleSource != null)
+            {
+                for (int i = 0; i < staleSource.Count; i++)
+                {
+                    source.Remove(staleSource[i]);
+                }
+            }
+
+            List<string> cleanList = new List<string>(cleanSet);
+            cleanList.Sort(StringComparer.OrdinalIgnoreCase);
+
+            if (!hadExisting && cleanList.Count == 0)
+            {
+                targetMap.Remove(key);
+                return false;
+            }
+
+            bool same = hadExisting && existingList.Count == cleanList.Count;
+            if (same)
+            {
+                for (int i = 0; i < cleanList.Count; i++)
+                {
+                    if (!string.Equals(existingList[i], cleanList[i], StringComparison.OrdinalIgnoreCase))
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+
+            if (same)
             {
                 return false;
             }
 
-            List<string> existingList;
-            if (!targetMap.TryGetValue(key, out existingList) || existingList == null)
+            if (cleanList.Count > 0)
             {
-                existingList = new List<string>();
-                targetMap[key] = existingList;
+                targetMap[key] = cleanList;
             }
-
-            HashSet<string> existingSet = new HashSet<string>(existingList, StringComparer.OrdinalIgnoreCase);
-            bool added = false;
-            foreach (string path in source)
+            else
             {
-                if (existingSet.Add(path))
-                {
-                    existingList.Add(path);
-                    added = true;
-                }
+                targetMap.Remove(key);
             }
-            if (added)
-            {
-                existingList.Sort(StringComparer.OrdinalIgnoreCase);
-            }
-            return added;
+            return true;
         }
 
-        private static void CopyExistingFilesLocked(HashSet<string> source, HashSet<string> dest)
+        private static bool CopyExistingFilesLocked(HashSet<string> source, HashSet<string> dest)
         {
             List<string> stale = null;
             foreach (string path in source)
@@ -5357,7 +6871,9 @@ namespace TunGuard
                 {
                     source.Remove(stale[i]);
                 }
+                return true;
             }
+            return false;
         }
 
         private bool AddRangeMarkDirtyLocked(HashSet<string> target, List<string> items, bool markDirty)
@@ -5377,11 +6893,361 @@ namespace TunGuard
             return changed;
         }
 
+        private static bool AddRootsLocked(HashSet<string> target, List<string> roots)
+        {
+            bool changed = false;
+            for (int i = 0; i < roots.Count; i++)
+            {
+                string norm = NormalizeDirectoryPath(roots[i]);
+                if (!string.IsNullOrEmpty(norm) && IsSafeRootDirectory(norm) && target.Add(norm))
+                {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        private static void ReplaceListLocked(List<string> target, List<string> items)
+        {
+            target.Clear();
+            if (items != null)
+            {
+                target.AddRange(items);
+            }
+        }
+
+        private static bool ReplaceSetLocked(HashSet<string> target, List<string> items)
+        {
+            HashSet<string> next = new HashSet<string>(items ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
+            if (target.Count == next.Count && target.SetEquals(next))
+            {
+                return false;
+            }
+            target.Clear();
+            foreach (string s in next)
+            {
+                target.Add(s);
+            }
+            return true;
+        }
+
+        private static List<string> ExtractConfigPathList(Dictionary<string, List<string>> map, string key)
+        {
+            List<string> result = new List<string>();
+            if (map == null)
+            {
+                return result;
+            }
+            List<string> raw;
+            if (!map.TryGetValue(key, out raw) || raw == null)
+            {
+                return result;
+            }
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < raw.Count; i++)
+            {
+                string norm = NodeGuardConfig.NormalizeConfiguredPathEntry(raw[i]);
+                if (!string.IsNullOrEmpty(norm) && seen.Add(norm))
+                {
+                    result.Add(norm);
+                }
+            }
+            result.Sort(StringComparer.OrdinalIgnoreCase);
+            return result;
+        }
+
+        private static List<string> ResolveCustomEntriesToExes(List<string> entries)
+        {
+            HashSet<string> found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (entries == null || entries.Count == 0)
+            {
+                return new List<string>();
+            }
+            for (int i = 0; i < entries.Count; i++)
+            {
+                string entry = entries[i];
+                if (string.IsNullOrEmpty(entry))
+                {
+                    continue;
+                }
+                if (entry.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    string normFile = NormalizeExistingFile(entry);
+                    if (normFile != null)
+                    {
+                        found.Add(normFile);
+                    }
+                }
+                else if (Directory.Exists(entry) && IsSafeRootDirectory(entry))
+                {
+                    List<string> dirExes = new List<string>();
+                    ScanCustomDirectoryRecursive(entry, 0, DefaultScanMaxDepth, MaxCustomDirExes, dirExes);
+                    for (int j = 0; j < dirExes.Count; j++)
+                    {
+                        found.Add(dirExes[j]);
+                    }
+                }
+            }
+            List<string> list = new List<string>(found);
+            list.Sort(StringComparer.OrdinalIgnoreCase);
+            return list;
+        }
+
+        private static void ScanCustomDirectoryRecursive(string dir, int depth, int maxDepth, int maxFiles, List<string> output)
+        {
+            if (output.Count >= maxFiles)
+            {
+                return;
+            }
+            try
+            {
+                string[] files = Directory.GetFiles(dir, "*.exe", SearchOption.TopDirectoryOnly);
+                for (int i = 0; i < files.Length && output.Count < maxFiles; i++)
+                {
+                    string exe = Path.GetFileName(files[i]);
+                    if (TargetProcessKiller.IsIgnoredInstallerExeName(exe))
+                    {
+                        continue;
+                    }
+                    string norm = NormalizeExistingFile(files[i]);
+                    if (norm != null)
+                    {
+                        output.Add(norm);
+                    }
+                }
+
+                if (depth >= maxDepth || output.Count >= maxFiles)
+                {
+                    return;
+                }
+
+                string[] subDirs = Directory.GetDirectories(dir);
+                for (int i = 0; i < subDirs.Length && output.Count < maxFiles; i++)
+                {
+                    string name = Path.GetFileName(subDirs[i]);
+                    if (string.IsNullOrEmpty(name) || SkipDirNames.Contains(name))
+                    {
+                        continue;
+                    }
+                    ScanCustomDirectoryRecursive(subDirs[i], depth + 1, maxDepth, maxFiles, output);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void RebuildMatchRulesLocked()
+        {
+            Dictionary<string, GuardedAppFlags> customExePaths = new Dictionary<string, GuardedAppFlags>(StringComparer.OrdinalIgnoreCase);
+            List<KeyValuePair<string, GuardedAppFlags>> customDirPrefixes = new List<KeyValuePair<string, GuardedAppFlags>>();
+            List<KeyValuePair<string, GuardedAppFlags>> trustedRootPrefixes = new List<KeyValuePair<string, GuardedAppFlags>>();
+            HashSet<string> customExeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            GuardedAppFlags customDirMask = GuardedAppFlags.None;
+
+            CollectCustomRulesForApp(_customAntigravityEntries, _customAntigravityExes, GuardedAppFlags.Antigravity, customExePaths, customDirPrefixes, customExeNames, ref customDirMask);
+            CollectCustomRulesForApp(_customChatGptEntries, _customChatGptExes, GuardedAppFlags.ChatGPT, customExePaths, customDirPrefixes, customExeNames, ref customDirMask);
+            CollectCustomRulesForApp(_customClaudeEntries, _customClaudeExes, GuardedAppFlags.Claude, customExePaths, customDirPrefixes, customExeNames, ref customDirMask);
+
+            CollectTrustedRootsForApp(_trustedAntigravityRoots, GuardedAppFlags.Antigravity, trustedRootPrefixes);
+            CollectTrustedRootsForApp(_trustedChatGptRoots, GuardedAppFlags.ChatGPT, trustedRootPrefixes);
+            CollectTrustedRootsForApp(_trustedClaudeRoots, GuardedAppFlags.Claude, trustedRootPrefixes);
+
+            StringBuilder sig = new StringBuilder(256);
+            List<string> sortedExeKeys = new List<string>(customExePaths.Keys);
+            sortedExeKeys.Sort(StringComparer.OrdinalIgnoreCase);
+            sig.Append("E:");
+            for (int i = 0; i < sortedExeKeys.Count; i++)
+            {
+                string k = sortedExeKeys[i];
+                sig.Append(k).Append('=').Append((int)customExePaths[k]).Append(';');
+            }
+            customDirPrefixes.Sort((a, b) => string.Compare(a.Key, b.Key, StringComparison.OrdinalIgnoreCase));
+            sig.Append("|D:");
+            for (int i = 0; i < customDirPrefixes.Count; i++)
+            {
+                sig.Append(customDirPrefixes[i].Key).Append('=').Append((int)customDirPrefixes[i].Value).Append(';');
+            }
+            trustedRootPrefixes.Sort((a, b) => string.Compare(a.Key, b.Key, StringComparison.OrdinalIgnoreCase));
+            sig.Append("|R:");
+            for (int i = 0; i < trustedRootPrefixes.Count; i++)
+            {
+                sig.Append(trustedRootPrefixes[i].Key).Append('=').Append((int)trustedRootPrefixes[i].Value).Append(';');
+            }
+
+            _matchRules = new TargetMatchRules(
+                customExePaths,
+                customDirPrefixes,
+                trustedRootPrefixes,
+                customExeNames,
+                customDirMask,
+                sig.ToString());
+        }
+
+        private static void CollectCustomRulesForApp(
+            List<string> entries,
+            HashSet<string> resolvedExes,
+            GuardedAppFlags appFlag,
+            Dictionary<string, GuardedAppFlags> customExePaths,
+            List<KeyValuePair<string, GuardedAppFlags>> customDirPrefixes,
+            HashSet<string> customExeNames,
+            ref GuardedAppFlags customDirMask)
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                string entry = entries[i];
+                if (string.IsNullOrEmpty(entry))
+                {
+                    continue;
+                }
+                if (entry.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    GuardedAppFlags existing;
+                    customExePaths.TryGetValue(entry, out existing);
+                    customExePaths[entry] = existing | appFlag;
+                    string exeName = Path.GetFileName(entry);
+                    if (!string.IsNullOrEmpty(exeName))
+                    {
+                        customExeNames.Add(exeName);
+                    }
+                }
+                else if (IsSafeRootDirectory(entry))
+                {
+                    string prefix = EnsureTrailingBackslash(entry);
+                    if (!string.IsNullOrEmpty(prefix))
+                    {
+                        customDirPrefixes.Add(new KeyValuePair<string, GuardedAppFlags>(prefix, appFlag));
+                        customDirMask |= appFlag;
+                    }
+                }
+            }
+
+            foreach (string exePath in resolvedExes)
+            {
+                string exeName = Path.GetFileName(exePath);
+                if (!string.IsNullOrEmpty(exeName))
+                {
+                    customExeNames.Add(exeName);
+                }
+            }
+        }
+
+        private static void CollectTrustedRootsForApp(
+            HashSet<string> roots,
+            GuardedAppFlags appFlag,
+            List<KeyValuePair<string, GuardedAppFlags>> output)
+        {
+            foreach (string root in roots)
+            {
+                string prefix = EnsureTrailingBackslash(root);
+                if (!string.IsNullOrEmpty(prefix))
+                {
+                    output.Add(new KeyValuePair<string, GuardedAppFlags>(prefix, appFlag));
+                }
+            }
+        }
+
+        private static string EnsureTrailingBackslash(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir))
+            {
+                return null;
+            }
+            return dir.EndsWith("\\", StringComparison.Ordinal) ? dir : (dir + "\\");
+        }
+
+        private static string NormalizeDirectoryPath(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir))
+            {
+                return null;
+            }
+            try
+            {
+                string full = Path.GetFullPath(dir.Trim().Trim('"'));
+                string root = Path.GetPathRoot(full);
+                if (!string.Equals(full, root, StringComparison.OrdinalIgnoreCase))
+                {
+                    full = full.TrimEnd('\\', '/');
+                }
+                return full;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        internal static bool IsSafeRootDirectory(string dir)
+        {
+            string unused;
+            return IsSafeCustomDirectory(dir, out unused);
+        }
+
+        internal static bool IsSafeCustomDirectory(string dir, out string reason)
+        {
+            reason = string.Empty;
+            string norm = NormalizeDirectoryPath(dir);
+            if (string.IsNullOrEmpty(norm))
+            {
+                reason = "目录路径无效。";
+                return false;
+            }
+
+            string driveRoot = Path.GetPathRoot(norm);
+            if (!string.IsNullOrEmpty(driveRoot) &&
+                string.Equals(norm.TrimEnd('\\'), driveRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            {
+                reason = "不能添加整个磁盘根目录（如 C:\\ 或 D:\\），请选择具体的软件安装目录。";
+                return false;
+            }
+
+            string winDir = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+            if (!string.IsNullOrEmpty(winDir) &&
+                (string.Equals(norm, winDir, StringComparison.OrdinalIgnoreCase) ||
+                 norm.StartsWith(winDir + "\\", StringComparison.OrdinalIgnoreCase)))
+            {
+                reason = "不能添加 Windows 系统目录或其子目录。";
+                return false;
+            }
+
+            string progFiles = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+            string progFilesX86 = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86));
+            string localAppData = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+            string appData = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData));
+            string commonAppData = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData));
+            string userProfile = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            string usersRoot = !string.IsNullOrEmpty(userProfile) ? NormalizeDirectoryPath(Path.GetDirectoryName(userProfile)) : null;
+            string desktop = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+            string documents = NormalizeDirectoryPath(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
+            string localPrograms = !string.IsNullOrEmpty(localAppData) ? NormalizeDirectoryPath(Path.Combine(localAppData, "Programs")) : null;
+            string windowsApps = !string.IsNullOrEmpty(progFiles) ? NormalizeDirectoryPath(Path.Combine(progFiles, "WindowsApps")) : null;
+
+            string[] blockedExact = new string[]
+            {
+                progFiles, progFilesX86, localAppData, appData, commonAppData,
+                userProfile, usersRoot, desktop, documents, localPrograms, windowsApps
+            };
+            for (int i = 0; i < blockedExact.Length; i++)
+            {
+                if (!string.IsNullOrEmpty(blockedExact[i]) &&
+                    string.Equals(norm, blockedExact[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    reason = "该目录范围过宽（属于系统或用户公共根目录），请选择具体应用所在的子目录。";
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         private static void ScanAppxPackages(
             List<string> foundChat,
             List<string> foundClaude,
             List<string> foundChatPkg,
-            List<string> foundClaudePkg)
+            List<string> foundClaudePkg,
+            List<string> foundChatRoots,
+            List<string> foundClaudeRoots)
         {
             ScanAppxRegistryRoot(
                 Registry.CurrentUser,
@@ -5390,7 +7256,9 @@ namespace TunGuard
                 foundChat,
                 foundClaude,
                 foundChatPkg,
-                foundClaudePkg);
+                foundClaudePkg,
+                foundChatRoots,
+                foundClaudeRoots);
 
             ScanAppxRegistryRoot(
                 Registry.LocalMachine,
@@ -5399,7 +7267,9 @@ namespace TunGuard
                 foundChat,
                 foundClaude,
                 foundChatPkg,
-                foundClaudePkg);
+                foundClaudePkg,
+                foundChatRoots,
+                foundClaudeRoots);
         }
 
         private static void ScanAppxRegistryRoot(
@@ -5409,7 +7279,9 @@ namespace TunGuard
             List<string> foundChat,
             List<string> foundClaude,
             List<string> foundChatPkg,
-            List<string> foundClaudePkg)
+            List<string> foundClaudePkg,
+            List<string> foundChatRoots,
+            List<string> foundClaudeRoots)
         {
             try
             {
@@ -5463,11 +7335,13 @@ namespace TunGuard
 
                                 if ((appFlag & GuardedAppFlags.ChatGPT) != 0)
                                 {
-                                    ScanDirectoryForApp(folder, GuardedAppFlags.ChatGPT, 3, foundChat);
+                                    foundChatRoots.Add(folder);
+                                    ScanDirectoryForApp(folder, GuardedAppFlags.ChatGPT, DefaultScanMaxDepth, true, foundChat);
                                 }
                                 if ((appFlag & GuardedAppFlags.Claude) != 0)
                                 {
-                                    ScanDirectoryForApp(folder, GuardedAppFlags.Claude, 3, foundClaude);
+                                    foundClaudeRoots.Add(folder);
+                                    ScanDirectoryForApp(folder, GuardedAppFlags.Claude, DefaultScanMaxDepth, true, foundClaude);
                                 }
                             }
                         }
@@ -5488,14 +7362,13 @@ namespace TunGuard
             {
                 return GuardedAppFlags.None;
             }
-            if (pkgFullName.StartsWith("OpenAI.", StringComparison.OrdinalIgnoreCase) ||
+            if (pkgFullName.StartsWith("OpenAI", StringComparison.OrdinalIgnoreCase) ||
                 pkgFullName.StartsWith("ChatGPT", StringComparison.OrdinalIgnoreCase))
             {
                 return GuardedAppFlags.ChatGPT;
             }
-            if (pkgFullName.StartsWith("Claude_", StringComparison.OrdinalIgnoreCase) ||
-                pkgFullName.StartsWith("Anthropic.", StringComparison.OrdinalIgnoreCase) ||
-                pkgFullName.StartsWith("AnthropicPBC.", StringComparison.OrdinalIgnoreCase))
+            if (pkgFullName.StartsWith("Claude", StringComparison.OrdinalIgnoreCase) ||
+                pkgFullName.StartsWith("Anthropic", StringComparison.OrdinalIgnoreCase))
             {
                 return GuardedAppFlags.Claude;
             }
@@ -5523,11 +7396,14 @@ namespace TunGuard
             List<string> foundAnti,
             List<string> foundChat,
             List<string> foundClaude,
-            List<string> foundMihomo)
+            List<string> foundMihomo,
+            List<string> foundAntiRoots,
+            List<string> foundChatRoots,
+            List<string> foundClaudeRoots)
         {
-            ScanUninstallRoot(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo);
-            ScanUninstallRoot(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo);
-            ScanUninstallRoot(Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo);
+            ScanUninstallRoot(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo, foundAntiRoots, foundChatRoots, foundClaudeRoots);
+            ScanUninstallRoot(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo, foundAntiRoots, foundChatRoots, foundClaudeRoots);
+            ScanUninstallRoot(Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo, foundAntiRoots, foundChatRoots, foundClaudeRoots);
         }
 
         private static void ScanUninstallRoot(
@@ -5536,7 +7412,10 @@ namespace TunGuard
             List<string> foundAnti,
             List<string> foundChat,
             List<string> foundClaude,
-            List<string> foundMihomo)
+            List<string> foundMihomo,
+            List<string> foundAntiRoots,
+            List<string> foundChatRoots,
+            List<string> foundClaudeRoots)
         {
             try
             {
@@ -5555,17 +7434,32 @@ namespace TunGuard
                                 if (string.IsNullOrEmpty(displayName)) continue;
 
                                 bool isAnti = displayName.IndexOf("Antigravity", StringComparison.OrdinalIgnoreCase) >= 0;
-                                bool isChat = displayName.IndexOf("ChatGPT", StringComparison.OrdinalIgnoreCase) >= 0;
-                                bool isClaude = displayName.IndexOf("Claude", StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool isChat = displayName.IndexOf("ChatGPT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                              displayName.IndexOf("Codex", StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool isClaude = displayName.IndexOf("Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                displayName.IndexOf("Anthropic", StringComparison.OrdinalIgnoreCase) >= 0;
                                 bool isClash = displayName.IndexOf("Clash Verge", StringComparison.OrdinalIgnoreCase) >= 0;
                                 if (!isAnti && !isChat && !isClaude && !isClash) continue;
 
                                 string dir = ExtractInstallDirectoryFromUninstall(entry);
                                 if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
 
-                                if (isAnti) ScanDirectoryForApp(dir, GuardedAppFlags.Antigravity, 3, foundAnti);
-                                if (isChat) ScanDirectoryForApp(dir, GuardedAppFlags.ChatGPT, 3, foundChat);
-                                if (isClaude) ScanDirectoryForApp(dir, GuardedAppFlags.Claude, 3, foundClaude);
+                                bool trusted = IsSafeRootDirectory(dir);
+                                if (isAnti)
+                                {
+                                    if (trusted) foundAntiRoots.Add(dir);
+                                    ScanDirectoryForApp(dir, GuardedAppFlags.Antigravity, DefaultScanMaxDepth, trusted, foundAnti);
+                                }
+                                if (isChat)
+                                {
+                                    if (trusted) foundChatRoots.Add(dir);
+                                    ScanDirectoryForApp(dir, GuardedAppFlags.ChatGPT, DefaultScanMaxDepth, trusted, foundChat);
+                                }
+                                if (isClaude)
+                                {
+                                    if (trusted) foundClaudeRoots.Add(dir);
+                                    ScanDirectoryForApp(dir, GuardedAppFlags.Claude, DefaultScanMaxDepth, trusted, foundClaude);
+                                }
                                 if (isClash) ScanDirectoryForMihomo(dir, foundMihomo);
                             }
                         }
@@ -5573,6 +7467,195 @@ namespace TunGuard
                         {
                         }
                     }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ScanShortcutsForApps(
+            List<string> foundAnti,
+            List<string> foundChat,
+            List<string> foundClaude,
+            List<string> foundAntiRoots,
+            List<string> foundChatRoots,
+            List<string> foundClaudeRoots)
+        {
+            List<KeyValuePair<string, GuardedAppFlags>> candidateShortcuts = new List<KeyValuePair<string, GuardedAppFlags>>();
+            string[] shortcutDirs = new string[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory),
+                CombineSafe(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"),
+                CombineSafe(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
+            };
+
+            HashSet<string> visitedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < shortcutDirs.Length; i++)
+            {
+                string dir = shortcutDirs[i];
+                if (string.IsNullOrEmpty(dir) || !visitedDirs.Add(dir) || !Directory.Exists(dir))
+                {
+                    continue;
+                }
+                CollectMatchingShortcutsRecursive(dir, 0, 2, candidateShortcuts);
+            }
+
+            if (candidateShortcuts.Count == 0)
+            {
+                return;
+            }
+
+            object shell = null;
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null)
+                {
+                    return;
+                }
+                shell = Activator.CreateInstance(shellType);
+                if (shell == null)
+                {
+                    return;
+                }
+
+                for (int i = 0; i < candidateShortcuts.Count; i++)
+                {
+                    string lnkPath = candidateShortcuts[i].Key;
+                    GuardedAppFlags hintFlag = candidateShortcuts[i].Value;
+                    object shortcut = null;
+                    try
+                    {
+                        shortcut = shellType.InvokeMember(
+                            "CreateShortcut",
+                            BindingFlags.InvokeMethod,
+                            null,
+                            shell,
+                            new object[] { lnkPath });
+                        if (shortcut == null)
+                        {
+                            continue;
+                        }
+                        string rawTarget = shortcut.GetType().InvokeMember(
+                            "TargetPath",
+                            BindingFlags.GetProperty,
+                            null,
+                            shortcut,
+                            null) as string;
+                        string normExe = NormalizeExistingFile(rawTarget);
+                        if (normExe == null || !normExe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        GuardedAppFlags verified = TargetProcessKiller.MatchTargetExeInTrustedFolder(normExe, hintFlag);
+                        if (verified == GuardedAppFlags.None)
+                        {
+                            continue;
+                        }
+
+                        string parentDir = Path.GetDirectoryName(normExe);
+                        bool trustedDir = IsSafeRootDirectory(parentDir);
+                        if ((verified & GuardedAppFlags.Antigravity) != 0)
+                        {
+                            foundAnti.Add(normExe);
+                            if (trustedDir)
+                            {
+                                foundAntiRoots.Add(parentDir);
+                                ScanDirectoryForApp(parentDir, GuardedAppFlags.Antigravity, 3, true, foundAnti);
+                            }
+                        }
+                        if ((verified & GuardedAppFlags.ChatGPT) != 0)
+                        {
+                            foundChat.Add(normExe);
+                            if (trustedDir)
+                            {
+                                foundChatRoots.Add(parentDir);
+                                ScanDirectoryForApp(parentDir, GuardedAppFlags.ChatGPT, 3, true, foundChat);
+                            }
+                        }
+                        if ((verified & GuardedAppFlags.Claude) != 0)
+                        {
+                            foundClaude.Add(normExe);
+                            if (trustedDir)
+                            {
+                                foundClaudeRoots.Add(parentDir);
+                                ScanDirectoryForApp(parentDir, GuardedAppFlags.Claude, 3, true, foundClaude);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    finally
+                    {
+                        if (shortcut != null && Marshal.IsComObject(shortcut))
+                        {
+                            try { Marshal.FinalReleaseComObject(shortcut); } catch { }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (shell != null && Marshal.IsComObject(shell))
+                {
+                    try { Marshal.FinalReleaseComObject(shell); } catch { }
+                }
+            }
+        }
+
+        private static void CollectMatchingShortcutsRecursive(
+            string dir,
+            int depth,
+            int maxDepth,
+            List<KeyValuePair<string, GuardedAppFlags>> output)
+        {
+            try
+            {
+                string[] files = Directory.GetFiles(dir, "*.lnk", SearchOption.TopDirectoryOnly);
+                for (int i = 0; i < files.Length; i++)
+                {
+                    string name = Path.GetFileNameWithoutExtension(files[i]);
+                    if (string.IsNullOrEmpty(name))
+                    {
+                        continue;
+                    }
+                    GuardedAppFlags hint = GuardedAppFlags.None;
+                    if (name.IndexOf("Antigravity", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hint |= GuardedAppFlags.Antigravity;
+                    }
+                    if (name.IndexOf("ChatGPT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("Codex", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hint |= GuardedAppFlags.ChatGPT;
+                    }
+                    if (name.IndexOf("Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("Anthropic", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hint |= GuardedAppFlags.Claude;
+                    }
+                    if (hint != GuardedAppFlags.None)
+                    {
+                        output.Add(new KeyValuePair<string, GuardedAppFlags>(files[i], hint));
+                    }
+                }
+
+                if (depth >= maxDepth)
+                {
+                    return;
+                }
+
+                string[] subDirs = Directory.GetDirectories(dir);
+                for (int i = 0; i < subDirs.Length; i++)
+                {
+                    CollectMatchingShortcutsRecursive(subDirs[i], depth + 1, maxDepth, output);
                 }
             }
             catch
@@ -5609,16 +7692,16 @@ namespace TunGuard
             return null;
         }
 
-        private static void ScanDirectoryForApp(string rootDir, GuardedAppFlags appFlag, int maxDepth, List<string> output)
+        private static void ScanDirectoryForApp(string rootDir, GuardedAppFlags appFlag, int maxDepth, bool trustFolderForApp, List<string> output)
         {
             if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
             {
                 return;
             }
-            ScanDirectoryForAppRecursive(rootDir, appFlag, 0, maxDepth, output);
+            ScanDirectoryForAppRecursive(rootDir, appFlag, 0, maxDepth, trustFolderForApp, output);
         }
 
-        private static void ScanDirectoryForAppRecursive(string dir, GuardedAppFlags appFlag, int depth, int maxDepth, List<string> output)
+        private static void ScanDirectoryForAppRecursive(string dir, GuardedAppFlags appFlag, int depth, int maxDepth, bool trustFolderForApp, List<string> output)
         {
             try
             {
@@ -5626,7 +7709,14 @@ namespace TunGuard
                 for (int i = 0; i < files.Length; i++)
                 {
                     string norm = NormalizeExistingFile(files[i]);
-                    if (norm != null && TargetProcessKiller.MatchTargetImagePath(norm, appFlag) != GuardedAppFlags.None)
+                    if (norm == null)
+                    {
+                        continue;
+                    }
+                    GuardedAppFlags hit = trustFolderForApp
+                        ? TargetProcessKiller.MatchTargetExeInTrustedFolder(norm, appFlag)
+                        : TargetProcessKiller.MatchTargetImagePath(norm, appFlag);
+                    if (hit != GuardedAppFlags.None)
                     {
                         output.Add(norm);
                     }
@@ -5645,7 +7735,7 @@ namespace TunGuard
                     {
                         continue;
                     }
-                    ScanDirectoryForAppRecursive(subDirs[i], appFlag, depth + 1, maxDepth, output);
+                    ScanDirectoryForAppRecursive(subDirs[i], appFlag, depth + 1, maxDepth, trustFolderForApp, output);
                 }
             }
             catch
@@ -6835,6 +8925,7 @@ namespace TunGuard
 
         private const int ACTIVE_INTERVAL_MS = 250;
         private const int INACTIVE_GUARD_INTERVAL_MS = 30;
+        private const int INACTIVE_WFP_WATCH_INTERVAL_MS = 100;
         private const int PAUSED_INTERVAL_MS = 1000;
         private const int CONFIG_STAT_INTERVAL_MS = 1000;
         private const int INACTIVE_ADAPTER_POLL_MS = 500;
@@ -6916,6 +9007,7 @@ namespace TunGuard
         private bool _pendingRulesRefresh;
         private bool _pendingNodeConfigReload;
         private bool _pendingFullProcessScan;
+        private bool _pendingPathDiscover;
         private bool _watcherNeedsRestart;
         private string _pendingTriggerSource;
 
@@ -6971,10 +9063,13 @@ namespace TunGuard
         private Thread _watchdogThread;
         private readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
         private readonly AutoResetEvent _wakeEvent = new AutoResetEvent(false);
+        private long _lastAccessDeniedLogTicks;
+        private static readonly long AccessDeniedLogCooldownTicks = TimeSpan.FromSeconds(10).Ticks;
 
         public event Action<TunStatus> StatusChanged;
         public event Action<KillResult, string, TunStatus> ProcessesKilled;
-        public event Action<string, TunStatus> WfpBlocked;
+        public event Action<GuardedAppFlags, string, TunStatus> WfpBlocked;
+        public event Action<GuardedAppFlags, TunStatus> GuardedAppLaunchedWhileBlocked;
         public event Action<int, GuardedAppFlags, string> AccessDenied;
         public event Action<NodeGuardConfig> NodeConfigChanged;
 
@@ -6993,7 +9088,12 @@ namespace TunGuard
             get { return _monitoringEnabled; }
             set
             {
+                bool changed = (_monitoringEnabled != value);
                 _monitoringEnabled = value;
+                if (changed)
+                {
+                    AppLogger.Info("APP", value ? "已恢复实时监控" : "已暂停实时监控（WFP 内核规则将自动清空）");
+                }
                 if (value)
                 {
                     SignalWake("恢复监控", true, true, true, true, true, true, true, false);
@@ -7035,10 +9135,50 @@ namespace TunGuard
         public void ApplyNodeGuardConfig(NodeGuardConfig config)
         {
             NodeGuardConfig normalized = (config != null ? config : new NodeGuardConfig()).CloneNormalized();
+            _pathResolver.ApplyCustomPathsFromConfig(normalized);
             _pathResolver.MergeIntoConfig(normalized, false);
             _nodeConfig = normalized;
+            AppLogger.ConfigureDirectoryQuiet(normalized.LogDirectory);
+            AppLogger.Info("CONFIG", FormatConfigSummary(normalized));
             _mihomoClient.InvalidateRulesCache();
+            lock (_signalLock)
+            {
+                _pendingPathDiscover = true;
+            }
             SignalWake("守护配置更新", false, false, false, false, true, true, true, true);
+        }
+
+        public AppPathDiagnostics GetAppPathDiagnostics(bool rescanNow)
+        {
+            bool discoveredAnyNew = false;
+            if (rescanNow)
+            {
+                _pathResolver.ScanStaticInstallations();
+            }
+
+            GuardedAppFlags runningApps = TargetProcessKiller.ScanRunningProcessesSnapshot(
+                _pathResolver.GetMatchRules(),
+                path =>
+                {
+                    if (_pathResolver.RecordRunningImagePath(path))
+                    {
+                        discoveredAnyNew = true;
+                        AppLogger.Info("WFP", "自动检测发现受控应用路径: " + path);
+                    }
+                });
+
+            if (rescanNow || discoveredAnyNew)
+            {
+                lock (_signalLock)
+                {
+                    _pendingPathDiscover = true;
+                }
+                SignalWake("控制面板自动检测受控应用", false, false, false, false, false, false, false, false);
+            }
+
+            AppPathDiagnostics diag = _pathResolver.GetDiagnostics();
+            diag.RunningApps = runningApps;
+            return diag;
         }
 
         public ClashSnapshot QueryLiveClashSnapshot()
@@ -7066,14 +9206,26 @@ namespace TunGuard
             SyncMihomoConnectionConfig();
             ReadNodeGuardConfigSafe(true);
 
+            AppLogger.Initialize(_nodeConfig != null ? _nodeConfig.LogDirectory : string.Empty);
+            AppLogger.Info("APP", "TunGuard 启动 | 配置: " + FormatConfigSummary(_nodeConfig) + " | 日志目录: " + AppLogger.EffectiveLogDirectory);
+
             // Prepare WFP engine and pre-discovered app paths BEFORE first evaluation
             _pathResolver.LoadFromConfigCache(_nodeConfig);
             _pathResolver.ScanStaticInstallations();
+            _killer.SetMatchRules(_pathResolver.GetMatchRules());
             _killer.DiscoverNewProcessPaths(true, path => _pathResolver.RecordRunningImagePath(path));
+            _killer.SetMatchRules(_pathResolver.GetMatchRules());
             if (_nodeConfig != null && _nodeConfig.WfpEnabled)
             {
-                string unusedWfpErr;
-                _wfp.TryInitialize(out unusedWfpErr);
+                string wfpInitErr;
+                if (_wfp.TryInitialize(out wfpInitErr))
+                {
+                    AppLogger.Info("WFP", "WFP 内核过滤引擎初始化成功 (DYNAMIC 动态会话)");
+                }
+                else
+                {
+                    AppLogger.Warn("WFP", "WFP 初始化降级: " + (string.IsNullOrEmpty(wfpInitErr) ? "未知原因" : wfpInitErr));
+                }
             }
 
             bool unusedFullScan;
@@ -7335,9 +9487,12 @@ namespace TunGuard
                 bool hasActiveTargets = loopCfg != null && loopCfg.GetGuardedAppFlags() != GuardedAppFlags.None;
                 bool needsFastKillGuard = !safe && hasActiveTargets &&
                                           (loopCfg == null || !loopCfg.WfpEnabled || loopCfg.WfpKillOnBlock || !_wfp.IsActive);
+                bool needsWfpLaunchWatch = !safe && hasActiveTargets && !needsFastKillGuard;
                 int intervalMs = !monitoring
                     ? PAUSED_INTERVAL_MS
-                    : (needsFastKillGuard ? INACTIVE_GUARD_INTERVAL_MS : ACTIVE_INTERVAL_MS);
+                    : (needsFastKillGuard
+                        ? INACTIVE_GUARD_INTERVAL_MS
+                        : (needsWfpLaunchWatch ? INACTIVE_WFP_WATCH_INTERVAL_MS : ACTIVE_INTERVAL_MS));
 
                 int waited;
                 try
@@ -7364,6 +9519,7 @@ namespace TunGuard
                 bool refreshRules;
                 bool reloadNodeConfig;
                 bool forceFullScan;
+                bool forcePathDiscover;
                 bool restartWatcher;
                 string triggerSource;
 
@@ -7377,6 +9533,7 @@ namespace TunGuard
                     refreshRules = _pendingRulesRefresh;
                     reloadNodeConfig = _pendingNodeConfigReload;
                     forceFullScan = _pendingFullProcessScan;
+                    forcePathDiscover = _pendingPathDiscover;
                     restartWatcher = _watcherNeedsRestart;
                     triggerSource = _pendingTriggerSource;
 
@@ -7388,6 +9545,7 @@ namespace TunGuard
                     _pendingRulesRefresh = false;
                     _pendingNodeConfigReload = false;
                     _pendingFullProcessScan = false;
+                    _pendingPathDiscover = false;
                     _watcherNeedsRestart = false;
                     _pendingTriggerSource = null;
                 }
@@ -7424,6 +9582,7 @@ namespace TunGuard
                 {
                     RefreshNodeConfigStatAfterSave();
                     _pathResolver.LoadFromConfigCache(_nodeConfig);
+                    _killer.SetMatchRules(_pathResolver.GetMatchRules());
                     recheckNode = true;
                     refreshRules = true;
                 }
@@ -7448,9 +9607,11 @@ namespace TunGuard
                     if (nodeCfgChanged)
                     {
                         _pathResolver.LoadFromConfigCache(_nodeConfig);
+                        _killer.SetMatchRules(_pathResolver.GetMatchRules());
                         recheckNode = true;
                         refreshRules = true;
                         forceFullScan = true;
+                        forcePathDiscover = true;
                         if (string.IsNullOrEmpty(triggerSource))
                         {
                             triggerSource = "配置文件热更新";
@@ -7464,17 +9625,26 @@ namespace TunGuard
                 }
 
                 NodeGuardConfig nodeCfg = _nodeConfig;
-                if (monitoring && nodeCfg != null && nodeCfg.WfpEnabled)
+                if (monitoring)
                 {
-                    if (nowMs - lastPathDiscoverMs >= PATH_DISCOVERY_INTERVAL_MS)
+                    bool needDiscover = forcePathDiscover || (nowMs - lastPathDiscoverMs >= PATH_DISCOVERY_INTERVAL_MS);
+                    if (needDiscover)
                     {
                         lastPathDiscoverMs = nowMs;
-                        _killer.DiscoverNewProcessPaths(false, path => _pathResolver.RecordRunningImagePath(path));
+                        _killer.DiscoverNewProcessPaths(forcePathDiscover, path =>
+                        {
+                            if (_pathResolver.RecordRunningImagePath(path))
+                            {
+                                AppLogger.Info("WFP", "热发现受控应用路径: " + path);
+                            }
+                        });
+                        _killer.SetMatchRules(_pathResolver.GetMatchRules());
                     }
                     if (nowMs - lastStaticRescanMs >= STATIC_APP_RESCAN_INTERVAL_MS)
                     {
                         lastStaticRescanMs = nowMs;
                         _pathResolver.ScanStaticInstallations();
+                        _killer.SetMatchRules(_pathResolver.GetMatchRules());
                     }
                     if (_pathResolver.HasDirtyCache && (nowMs - lastCachePersistMs >= CACHE_PERSIST_INTERVAL_MS))
                     {
@@ -7658,30 +9828,89 @@ namespace TunGuard
 
             // Process kill runs if WFP is disabled/degraded (fail-safe fallback) or user enabled KillOnBlock
             bool shouldKillProcesses = !nodeCfg.WfpEnabled || nodeCfg.WfpKillOnBlock || !wfpSnap.Active;
+            _killer.SetMatchRules(_pathResolver.GetMatchRules());
             bool appsExpanded = _killer.SetEnabledApps(guardedApps);
             KillResult killRes = default(KillResult);
             bool notifyWfpBlockOnly = false;
+            GuardedAppFlags wfpBlockedApps = GuardedAppFlags.None;
+            GuardedAppFlags launchedWhileBlockedApps = GuardedAppFlags.None;
             if (_monitoringEnabled && !next.IsGuardSafe && guardedApps != GuardedAppFlags.None)
             {
                 bool becameUnsafe = wasSafe && !next.IsGuardSafe;
-                if (shouldKillProcesses)
+                bool newlyDiscoveredForWfp = false;
+                _killer.MatchedImagePathCallback = matchedPath =>
                 {
-                    if (becameUnsafe || fullProcessScan || appsExpanded)
+                    if (_pathResolver.RecordRunningImagePath(matchedPath))
                     {
-                        killRes = _killer.KillAllNow();
-                        ranFullScan = true;
+                        newlyDiscoveredForWfp = true;
+                        AppLogger.Info("WFP", "拦截时即时发现受控应用路径: " + matchedPath);
+                    }
+                };
+                try
+                {
+                    if (shouldKillProcesses)
+                    {
+                        _killer.ResetLaunchDetectCache();
+                        if (becameUnsafe || fullProcessScan || appsExpanded)
+                        {
+                            killRes = _killer.KillAllNow();
+                            ranFullScan = true;
+                        }
+                        else
+                        {
+                            killRes = _killer.KillNewProcesses();
+                        }
                     }
                     else
                     {
-                        killRes = _killer.KillNewProcesses();
+                        if (becameUnsafe || forceNotify || appsExpanded)
+                        {
+                            wfpBlockedApps = _killer.DetectGuardedApps(true);
+                            if (becameUnsafe || wfpBlockedApps != GuardedAppFlags.None)
+                            {
+                                notifyWfpBlockOnly = true;
+                            }
+                        }
+                        else
+                        {
+                            launchedWhileBlockedApps = _killer.DetectGuardedApps(false);
+                        }
                     }
                 }
-                else if (becameUnsafe)
+                finally
                 {
-                    notifyWfpBlockOnly = true;
+                    _killer.MatchedImagePathCallback = null;
+                }
+
+                // Immediately commit newly discovered exe paths into WFP in the same tick (eliminates the 2s discovery window)
+                if (newlyDiscoveredForWfp)
+                {
+                    _killer.SetMatchRules(_pathResolver.GetMatchRules());
+                    if (nodeCfg.WfpEnabled)
+                    {
+                        _pathResolver.BuildTargets(guardedApps, out wfpExes, out wfpPkgs, out wfpMihomo);
+                        wfpSnap = _wfp.SyncState(
+                            _monitoringEnabled,
+                            nodeCfg.WfpEnabled,
+                            next.IsGuardSafe,
+                            next.IsTunActive ? next.AdapterLuid : 0UL,
+                            wfpExes,
+                            wfpPkgs,
+                            nodeCfg.WfpBlockNonTunDns,
+                            wfpMihomo,
+                            _clashLocalProxyPorts);
+                        next.WfpEnabled = wfpSnap.Enabled;
+                        next.WfpActive = wfpSnap.Active;
+                        next.WfpDegraded = wfpSnap.Degraded;
+                        next.WfpBlockingNow = wfpSnap.BlockingNow;
+                        next.WfpDnsGuardActive = wfpSnap.DnsGuardActive;
+                        next.WfpExeTargetCount = wfpSnap.ExeTargetCount;
+                        next.WfpPackageTargetCount = wfpSnap.PackageTargetCount;
+                        next.WfpStatusText = wfpSnap.StatusText ?? string.Empty;
+                    }
                 }
             }
-            else if ((next.IsGuardSafe && !wasSafe) || guardedApps == GuardedAppFlags.None)
+            else if ((next.IsGuardSafe && !wasSafe) || guardedApps == GuardedAppFlags.None || !_monitoringEnabled)
             {
                 _killer.InvalidateCache();
             }
@@ -7713,8 +9942,25 @@ namespace TunGuard
                 _currentStatus = next;
             }
 
+            LogStatusTransitions(prev, next, forceNotify, triggerSource);
+
             if (killRes.KilledCount > 0)
             {
+                bool isNodeKill = next.IsTunActive && next.NodeGuardEnabled && !next.IsNodeAllowed;
+                string killAppsText = killRes.KilledApps != GuardedAppFlags.None
+                    ? GuardedAppHelper.FormatNames(killRes.KilledApps)
+                    : "受控应用";
+                string killReason = isNodeKill ? next.NodeReason : next.Reason;
+                AppLogger.Warn(
+                    "GUARD",
+                    string.Format(
+                        "触发进程拦截 [{0}] | 原因: {1} | 已终止 {2} 共 {3} 个进程 (首轮 {4:F2} ms)",
+                        triggerSource,
+                        killReason,
+                        killAppsText,
+                        killRes.KilledCount,
+                        killRes.FirstPassMs));
+
                 Action<KillResult, string, TunStatus> killedHandler = ProcessesKilled;
                 if (killedHandler != null)
                 {
@@ -7723,15 +9969,55 @@ namespace TunGuard
             }
             else if (notifyWfpBlockOnly)
             {
-                Action<string, TunStatus> blockedHandler = WfpBlocked;
+                bool isNodeBlock = next.IsTunActive && next.NodeGuardEnabled && !next.IsNodeAllowed;
+                string blockReason = isNodeBlock ? next.NodeReason : next.Reason;
+                string runningInfo = wfpBlockedApps != GuardedAppFlags.None
+                    ? (" | 运行中受控应用: " + GuardedAppHelper.FormatNames(wfpBlockedApps))
+                    : " | 当前无运行中受控应用";
+                AppLogger.Warn(
+                    "GUARD",
+                    string.Format("触发 WFP 内核断网 [{0}] | 原因: {1}{2}", triggerSource, blockReason, runningInfo));
+
+                Action<GuardedAppFlags, string, TunStatus> blockedHandler = WfpBlocked;
                 if (blockedHandler != null)
                 {
-                    blockedHandler(triggerSource, next);
+                    blockedHandler(wfpBlockedApps, triggerSource, next);
+                }
+            }
+            else if (launchedWhileBlockedApps != GuardedAppFlags.None)
+            {
+                bool isNodeBlock = next.IsTunActive && next.NodeGuardEnabled && !next.IsNodeAllowed;
+                string blockReason = isNodeBlock ? next.NodeReason : next.Reason;
+                AppLogger.Warn(
+                    "GUARD",
+                    string.Format(
+                        "检测到拦截状态下启动受控应用: {0} | 原因: {1} | 已由 WFP 内核阻断联网",
+                        GuardedAppHelper.FormatNames(launchedWhileBlockedApps),
+                        blockReason));
+
+                Action<GuardedAppFlags, TunStatus> launchedHandler = GuardedAppLaunchedWhileBlocked;
+                if (launchedHandler != null)
+                {
+                    launchedHandler(launchedWhileBlockedApps, next);
                 }
             }
 
             if (killRes.AccessDeniedCount > 0)
             {
+                long nowTicks = DateTime.UtcNow.Ticks;
+                long prevLogTicks = Interlocked.Read(ref _lastAccessDeniedLogTicks);
+                if (nowTicks - prevLogTicks >= AccessDeniedLogCooldownTicks &&
+                    Interlocked.CompareExchange(ref _lastAccessDeniedLogTicks, nowTicks, prevLogTicks) == prevLogTicks)
+                {
+                    AppLogger.Error(
+                        "GUARD",
+                        string.Format(
+                            "权限不足无法终止进程 [{0}] | 应用: {1} ({2} 个进程，请以管理员身份运行)",
+                            triggerSource,
+                            GuardedAppHelper.FormatNames(killRes.DeniedApps),
+                            killRes.AccessDeniedCount));
+                }
+
                 Action<int, GuardedAppFlags, string> deniedHandler = AccessDenied;
                 if (deniedHandler != null)
                 {
@@ -7745,6 +10031,100 @@ namespace TunGuard
                 if (statusHandler != null)
                 {
                     statusHandler(next);
+                }
+            }
+        }
+
+        private static string FormatConfigSummary(NodeGuardConfig cfg)
+        {
+            if (cfg == null)
+            {
+                return "(默认配置)";
+            }
+            string modeDesc = cfg.WfpEnabled
+                ? (cfg.WfpKillOnBlock ? "WFP+终止进程" : "仅WFP断网")
+                : "仅终止进程";
+            return string.Format(
+                "受控应用=[{0}], {1}, 策略={2}, DNS53={3}, 弹窗={4}",
+                GuardedAppHelper.FormatShortNames(cfg.GetGuardedAppFlags()),
+                cfg.GetSummaryText(),
+                modeDesc,
+                cfg.WfpBlockNonTunDns ? "开" : "关",
+                cfg.PopupOnBlock ? "开" : "关");
+        }
+
+        private void LogStatusTransitions(TunStatus prev, TunStatus next, bool isInitial, string triggerSource)
+        {
+            if (isInitial)
+            {
+                string tunDesc = next.IsTunActive
+                    ? string.Format("{0} (LUID=0x{1:X})", next.Reason, next.AdapterLuid)
+                    : next.Reason;
+                string nodeDesc = next.NodeGuardEnabled
+                    ? (string.IsNullOrEmpty(next.ActiveNodeChain) ? next.NodeReason : (next.NodeReason + " [" + next.ActiveNodeChain + "]"))
+                    : "未启用";
+                AppLogger.Info(
+                    "STATUS",
+                    string.Format(
+                        "初始检测完成 | 安全={0} | TUN={1} | 节点={2} | WFP={3}",
+                        next.IsGuardSafe ? "是" : "否",
+                        tunDesc,
+                        nodeDesc,
+                        string.IsNullOrEmpty(next.WfpStatusText) ? "未启用" : next.WfpStatusText));
+                return;
+            }
+
+            if (prev.IsTunActive != next.IsTunActive ||
+                prev.AdapterLuid != next.AdapterLuid ||
+                !string.Equals(prev.Reason, next.Reason, StringComparison.Ordinal))
+            {
+                string luidPart = next.AdapterLuid != 0 ? (" | LUID=0x" + next.AdapterLuid.ToString("X")) : string.Empty;
+                if (next.IsTunActive)
+                {
+                    AppLogger.Info("TUN", string.Format("TUN 状态变更 [{0}]: {1}{2}", triggerSource, next.Reason, luidPart));
+                }
+                else
+                {
+                    AppLogger.Warn("TUN", string.Format("TUN 状态异常 [{0}]: {1}", triggerSource, next.Reason));
+                }
+            }
+
+            if (prev.NodeGuardEnabled != next.NodeGuardEnabled ||
+                (next.NodeGuardEnabled &&
+                 (prev.IsNodeAllowed != next.IsNodeAllowed ||
+                  !string.Equals(prev.ActiveNodeName, next.ActiveNodeName, StringComparison.Ordinal) ||
+                  !string.Equals(prev.NodeReason, next.NodeReason, StringComparison.Ordinal))))
+            {
+                if (!next.NodeGuardEnabled)
+                {
+                    AppLogger.Info("NODE", "节点守护已关闭");
+                }
+                else
+                {
+                    string chain = !string.IsNullOrEmpty(next.ActiveNodeChain) ? (" [" + next.ActiveNodeChain + "]") : string.Empty;
+                    if (next.IsNodeAllowed)
+                    {
+                        AppLogger.Info("NODE", string.Format("节点校验通过 [{0}]: {1}{2}", triggerSource, next.NodeReason, chain));
+                    }
+                    else
+                    {
+                        AppLogger.Warn("NODE", string.Format("节点校验未通过 [{0}]: {1}{2}", triggerSource, next.NodeReason, chain));
+                    }
+                }
+            }
+
+            if (prev.WfpActive != next.WfpActive ||
+                prev.WfpDegraded != next.WfpDegraded ||
+                prev.WfpBlockingNow != next.WfpBlockingNow ||
+                !string.Equals(prev.WfpStatusText, next.WfpStatusText, StringComparison.Ordinal))
+            {
+                if (next.WfpDegraded)
+                {
+                    AppLogger.Warn("WFP", "内核断网状态变更: " + next.WfpStatusText);
+                }
+                else
+                {
+                    AppLogger.Info("WFP", "内核断网状态变更: " + (string.IsNullOrEmpty(next.WfpStatusText) ? "未启用" : next.WfpStatusText));
                 }
             }
         }
@@ -8610,6 +10990,12 @@ namespace TunGuard
             _nodeConfig = loaded;
             _mihomoClient.InvalidateRulesCache();
 
+            if (!force)
+            {
+                AppLogger.ConfigureDirectoryQuiet(loaded.LogDirectory);
+                AppLogger.Info("CONFIG", "检测到外部配置文件热更新 | " + FormatConfigSummary(loaded));
+            }
+
             Action<NodeGuardConfig> cfgHandler = NodeConfigChanged;
             if (!force && cfgHandler != null)
             {
@@ -9108,6 +11494,1955 @@ namespace TunGuard
         }
     }
 
+    internal struct GuardAlertPayload
+    {
+        public string Title;
+        public string AppNames;
+        public string Reason;
+        public string ActiveChain;
+        public string AllowedNodesText;
+        public string ActionText;
+        public string HintText;
+        public bool IsSevere;
+        public bool IsKillEvent;
+        public int KilledDelta;
+        public double FirstPassMs;
+    }
+
+    internal sealed class GuardAlertForm : Form
+    {
+        private const int AutoCloseSeconds = 10;
+        private const int CS_DROPSHADOW = 0x00020000;
+        private const int WS_EX_TOPMOST = 0x00000008;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const int WM_NCLBUTTONDOWN = 0xA1;
+        private const int HTCAPTION = 0x2;
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr hWndInsertAfter,
+            int x,
+            int y,
+            int cx,
+            int cy,
+            uint uFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        private readonly Action _onOpenSettings;
+        private readonly Action _onOpenLogs;
+        private readonly Font _titleFont;
+        private readonly Font _boldLabelFont;
+        private readonly Font _hintFont;
+        private readonly Font _closeXFont;
+        private readonly System.Windows.Forms.Timer _countdownTimer;
+
+        private readonly Panel _badgePanel;
+        private readonly Label _lblTitle;
+        private readonly Button _btnCloseX;
+        private readonly Label _lblReasonVal;
+        private readonly Label _lblChainCaption;
+        private readonly Label _lblChainVal;
+        private readonly Label _lblAllowedCaption;
+        private readonly Label _lblAllowedVal;
+        private readonly Label _lblActionVal;
+        private readonly Label _lblHint;
+        private readonly Button _btnSettings;
+        private readonly Button _btnLogs;
+        private readonly Button _btnAck;
+
+        private Color _accentColor = Color.FromArgb(220, 38, 38);
+        private int _remainingSeconds = AutoCloseSeconds;
+        private int _burstKilledTotal;
+        private bool _positionedOnce;
+        private bool _dismissedByUser;
+
+        public bool DismissedByUser
+        {
+            get { return _dismissedByUser; }
+        }
+
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ClassStyle |= CS_DROPSHADOW;
+                cp.ExStyle |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+                return cp;
+            }
+        }
+
+        public GuardAlertForm(Action onOpenSettings, Action onOpenLogs)
+        {
+            _onOpenSettings = onOpenSettings;
+            _onOpenLogs = onOpenLogs;
+
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            DoubleBuffered = true;
+            BackColor = Color.White;
+            Font = new Font("Microsoft YaHei UI", 9.2f);
+            AutoScaleMode = AutoScaleMode.Font;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Padding = new Padding(1, 6, 1, 1);
+
+            _titleFont = new Font("Microsoft YaHei UI", 10.8f, FontStyle.Bold);
+            _boldLabelFont = new Font(Font, FontStyle.Bold);
+            _hintFont = new Font("Microsoft YaHei UI", 8.6f);
+            _closeXFont = new Font("Microsoft YaHei UI", 11f);
+
+            TableLayoutPanel root = new TableLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                ColumnCount = 1,
+                RowCount = 4,
+                Padding = new Padding(16, 12, 16, 14),
+                BackColor = Color.White,
+                Margin = new Padding(0)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // detail card
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // hint
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // buttons
+
+            // Header row (draggable)
+            TableLayoutPanel header = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 3,
+                RowCount = 1,
+                Margin = new Padding(0, 0, 0, 10),
+                BackColor = Color.White
+            };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            _badgePanel = new Panel
+            {
+                Size = new Size(28, 28),
+                Margin = new Padding(0, 1, 10, 0),
+                BackColor = Color.Transparent
+            };
+            _badgePanel.Paint += OnBadgePaint;
+
+            _lblTitle = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(370, 0),
+                Font = _titleFont,
+                ForeColor = Color.FromArgb(15, 23, 42),
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 3, 8, 0)
+            };
+
+            _btnCloseX = new Button
+            {
+                Text = "×",
+                FlatStyle = FlatStyle.Flat,
+                Size = new Size(28, 26),
+                Font = _closeXFont,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                BackColor = Color.White,
+                TabStop = false,
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0)
+            };
+            _btnCloseX.FlatAppearance.BorderSize = 0;
+            _btnCloseX.FlatAppearance.MouseOverBackColor = Color.FromArgb(241, 245, 249);
+            _btnCloseX.Click += (s, e) => DismissByUser();
+
+            header.Controls.Add(_badgePanel, 0, 0);
+            header.Controls.Add(_lblTitle, 1, 0);
+            header.Controls.Add(_btnCloseX, 2, 0);
+            AttachDragHandler(header);
+            AttachDragHandler(_badgePanel);
+            AttachDragHandler(_lblTitle);
+            root.Controls.Add(header, 0, 0);
+
+            // Details card
+            TableLayoutPanel card = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 4,
+                BackColor = Color.FromArgb(248, 250, 252),
+                Padding = new Padding(12, 10, 12, 10),
+                Margin = new Padding(0, 0, 0, 10)
+            };
+            card.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            Label lblReasonCap = CreateCaptionLabel("拦截原因:");
+            _lblReasonVal = CreateValueLabel(Color.FromArgb(185, 28, 28), true);
+
+            _lblChainCaption = CreateCaptionLabel("当前出口:");
+            _lblChainVal = CreateValueLabel(Color.FromArgb(30, 41, 59), false);
+
+            _lblAllowedCaption = CreateCaptionLabel("允许节点:");
+            _lblAllowedVal = CreateValueLabel(Color.FromArgb(21, 128, 61), false);
+
+            Label lblActionCap = CreateCaptionLabel("执行动作:");
+            _lblActionVal = CreateValueLabel(Color.FromArgb(51, 65, 85), false);
+
+            card.Controls.Add(lblReasonCap, 0, 0);
+            card.Controls.Add(_lblReasonVal, 1, 0);
+            card.Controls.Add(_lblChainCaption, 0, 1);
+            card.Controls.Add(_lblChainVal, 1, 1);
+            card.Controls.Add(_lblAllowedCaption, 0, 2);
+            card.Controls.Add(_lblAllowedVal, 1, 2);
+            card.Controls.Add(lblActionCap, 0, 3);
+            card.Controls.Add(_lblActionVal, 1, 3);
+            root.Controls.Add(card, 0, 1);
+
+            // Hint row
+            _lblHint = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(440, 0),
+                Font = _hintFont,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(2, 0, 2, 12)
+            };
+            root.Controls.Add(_lblHint, 0, 2);
+
+            // Footer buttons
+            TableLayoutPanel footer = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0)
+            };
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            FlowLayoutPanel leftBtns = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                WrapContents = false,
+                Margin = new Padding(0)
+            };
+
+            _btnSettings = new Button
+            {
+                Text = "打开控制面板",
+                AutoSize = true,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(241, 245, 249),
+                ForeColor = Color.FromArgb(30, 41, 59),
+                Padding = new Padding(8, 3, 8, 3),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 0, 8, 0)
+            };
+            _btnSettings.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
+            _btnSettings.Click += (s, e) =>
+            {
+                Action cb = _onOpenSettings;
+                DismissByUser();
+                if (cb != null)
+                {
+                    cb();
+                }
+            };
+
+            _btnLogs = new Button
+            {
+                Text = "查看日志",
+                AutoSize = true,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(241, 245, 249),
+                ForeColor = Color.FromArgb(30, 41, 59),
+                Padding = new Padding(8, 3, 8, 3),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0)
+            };
+            _btnLogs.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
+            _btnLogs.Click += (s, e) =>
+            {
+                Action cb = _onOpenLogs;
+                DismissByUser();
+                if (cb != null)
+                {
+                    cb();
+                }
+            };
+
+            leftBtns.Controls.Add(_btnSettings);
+            leftBtns.Controls.Add(_btnLogs);
+
+            _btnAck = new Button
+            {
+                Text = "知道了 (10s)",
+                AutoSize = true,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(220, 38, 38),
+                ForeColor = Color.White,
+                Padding = new Padding(12, 3, 12, 3),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(12, 0, 0, 0)
+            };
+            _btnAck.FlatAppearance.BorderSize = 0;
+            _btnAck.Click += (s, e) => DismissByUser();
+
+            footer.Controls.Add(leftBtns, 0, 0);
+            footer.Controls.Add(_btnAck, 1, 0);
+            root.Controls.Add(footer, 0, 3);
+
+            Controls.Add(root);
+
+            KeyPreview = true;
+            KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    DismissByUser();
+                }
+            };
+
+            _countdownTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+            _countdownTimer.Tick += OnCountdownTick;
+        }
+
+        private Label CreateCaptionLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                AutoSize = true,
+                Font = _boldLabelFont,
+                ForeColor = Color.FromArgb(71, 85, 105),
+                Margin = new Padding(0, 2, 10, 4)
+            };
+        }
+
+        private Label CreateValueLabel(Color foreColor, bool bold)
+        {
+            return new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(345, 0),
+                Font = bold ? _boldLabelFont : Font,
+                ForeColor = foreColor,
+                Margin = new Padding(0, 2, 0, 4)
+            };
+        }
+
+        private void AttachDragHandler(Control control)
+        {
+            control.MouseDown += (s, e) =>
+            {
+                if (e.Button == MouseButtons.Left)
+                {
+                    ReleaseCapture();
+                    SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(HTCAPTION), IntPtr.Zero);
+                }
+            };
+        }
+
+        private void OnBadgePaint(object sender, PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (SolidBrush brush = new SolidBrush(_accentColor))
+            {
+                e.Graphics.FillEllipse(brush, 1, 1, 25, 25);
+            }
+            using (Pen whitePen = new Pen(Color.White, 2.6f))
+            {
+                whitePen.StartCap = LineCap.Round;
+                whitePen.EndCap = LineCap.Round;
+                e.Graphics.DrawLine(whitePen, 13.5f, 7.5f, 13.5f, 15.5f);
+            }
+            using (SolidBrush whiteBrush = new SolidBrush(Color.White))
+            {
+                e.Graphics.FillEllipse(whiteBrush, 12.1f, 18.2f, 2.9f, 2.9f);
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (SolidBrush topBar = new SolidBrush(_accentColor))
+            {
+                e.Graphics.FillRectangle(topBar, 0, 0, Width, 5);
+            }
+            using (Pen borderPen = new Pen(Color.FromArgb(203, 213, 225), 1f))
+            {
+                e.Graphics.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
+            }
+        }
+
+        public void ShowOrUpdate(GuardAlertPayload payload, bool accumulateBurst)
+        {
+            _dismissedByUser = false;
+            _accentColor = payload.IsSevere
+                ? Color.FromArgb(220, 38, 38)
+                : Color.FromArgb(217, 119, 6);
+            _btnAck.BackColor = _accentColor;
+            _lblReasonVal.ForeColor = payload.IsSevere
+                ? Color.FromArgb(185, 28, 28)
+                : Color.FromArgb(180, 83, 9);
+
+            if (payload.IsKillEvent)
+            {
+                _burstKilledTotal = accumulateBurst ? (_burstKilledTotal + payload.KilledDelta) : payload.KilledDelta;
+            }
+            else
+            {
+                _burstKilledTotal = 0;
+            }
+
+            _lblTitle.Text = payload.Title ?? "TunGuard 拦截提示";
+            _lblReasonVal.Text = string.IsNullOrEmpty(payload.Reason) ? "当前状态不满足放行条件" : payload.Reason;
+
+            bool hasChain = !string.IsNullOrEmpty(payload.ActiveChain);
+            _lblChainCaption.Visible = hasChain;
+            _lblChainVal.Visible = hasChain;
+            _lblChainVal.Text = hasChain ? payload.ActiveChain : string.Empty;
+
+            bool hasAllowed = !string.IsNullOrEmpty(payload.AllowedNodesText);
+            _lblAllowedCaption.Visible = hasAllowed;
+            _lblAllowedVal.Visible = hasAllowed;
+            _lblAllowedVal.Text = hasAllowed ? payload.AllowedNodesText : string.Empty;
+
+            if (payload.IsKillEvent && _burstKilledTotal > 0)
+            {
+                string apps = string.IsNullOrEmpty(payload.AppNames) ? "受控应用" : payload.AppNames;
+                _lblActionVal.Text = string.Format(
+                    "已终止 {0} 共 {1} 个进程（首轮耗时 {2:F2} ms）",
+                    apps,
+                    _burstKilledTotal,
+                    payload.FirstPassMs);
+            }
+            else
+            {
+                _lblActionVal.Text = payload.ActionText ?? string.Empty;
+            }
+
+            _lblHint.Text = payload.HintText ?? string.Empty;
+
+            _remainingSeconds = AutoCloseSeconds;
+            UpdateAckButtonText();
+            _countdownTimer.Stop();
+            _countdownTimer.Start();
+
+            PerformLayout();
+            _badgePanel.Invalidate();
+            Invalidate();
+
+            if (!Visible)
+            {
+                PositionOnActiveScreen();
+                Show();
+            }
+            else if (!_positionedOnce)
+            {
+                PositionOnActiveScreen();
+            }
+
+            EnsureTopMostNoActivate();
+        }
+
+        private void PositionOnActiveScreen()
+        {
+            Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int x = area.Left + (area.Width - Width) / 2;
+            int y = area.Top + Math.Max(48, Math.Min(140, area.Height / 6));
+            if (x < area.Left + 12) x = area.Left + 12;
+            if (x + Width > area.Right - 12) x = Math.Max(area.Left + 12, area.Right - Width - 12);
+            if (y + Height > area.Bottom - 12) y = Math.Max(area.Top + 12, area.Bottom - Height - 12);
+            Location = new Point(x, y);
+            _positionedOnce = true;
+        }
+
+        private void EnsureTopMostNoActivate()
+        {
+            if (IsHandleCreated && !IsDisposed)
+            {
+                SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+
+        private void OnCountdownTick(object sender, EventArgs e)
+        {
+            if (IsDisposed || !Visible)
+            {
+                _countdownTimer.Stop();
+                return;
+            }
+            // Pause auto-close while cursor is hovering over the popup
+            if (Bounds.Contains(Cursor.Position))
+            {
+                return;
+            }
+            _remainingSeconds--;
+            if (_remainingSeconds <= 0)
+            {
+                _countdownTimer.Stop();
+                Close();
+                return;
+            }
+            UpdateAckButtonText();
+        }
+
+        private void UpdateAckButtonText()
+        {
+            _btnAck.Text = string.Format("知道了 ({0}s)", _remainingSeconds);
+        }
+
+        private void DismissByUser()
+        {
+            _dismissedByUser = true;
+            _countdownTimer.Stop();
+            Close();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_countdownTimer != null)
+                {
+                    _countdownTimer.Stop();
+                    _countdownTimer.Dispose();
+                }
+                if (_titleFont != null) _titleFont.Dispose();
+                if (_boldLabelFont != null) _boldLabelFont.Dispose();
+                if (_hintFont != null) _hintFont.Dispose();
+                if (_closeXFont != null) _closeXFont.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    internal delegate bool LogDirectoryChangeHandler(
+        string newConfiguredDir,
+        bool migrateExisting,
+        out int migratedCount,
+        out string effectiveDir,
+        out string error);
+
+    internal sealed class LogViewerForm : Form
+    {
+        private const int MaxDisplayedLines = 2000;
+        private const int MaxLiveLinesBeforeReload = 2500;
+
+        private sealed class LogFileItem
+        {
+            public string FullPath;
+            public string DisplayText;
+            public bool IsToday;
+
+            public override string ToString()
+            {
+                return DisplayText;
+            }
+        }
+
+        private readonly LogDirectoryChangeHandler _onChangeLogDir;
+        private readonly Font _boldFont;
+        private readonly Font _monoFont;
+        private readonly System.Windows.Forms.Timer _searchDebounceTimer;
+
+        private readonly TextBox _txtLogDir;
+        private readonly Label _lblDirBadge;
+        private readonly Button _btnChangeDir;
+        private readonly Button _btnResetDir;
+        private readonly Button _btnOpenDir;
+
+        private readonly ComboBox _cmbFiles;
+        private readonly ComboBox _cmbLevel;
+        private readonly TextBox _txtSearch;
+        private readonly CheckBox _chkAutoScroll;
+        private readonly Button _btnRefresh;
+        private readonly Button _btnCopy;
+        private readonly Button _btnClear;
+
+        private readonly RichTextBox _rtbLog;
+        private readonly Label _lblStatus;
+        private readonly Button _btnClose;
+
+        private string _activeFilePath = string.Empty;
+        private bool _viewingTodayFile;
+        private bool _suppressUiEvents;
+        private int _displayedLines;
+        private int _totalFileLines;
+        private long _currentFileBytes;
+
+        public LogViewerForm(LogDirectoryChangeHandler onChangeLogDir, Icon windowIcon)
+        {
+            _onChangeLogDir = onChangeLogDir;
+
+            Text = "运行日志 - TunGuard";
+            StartPosition = FormStartPosition.CenterScreen;
+            Font = new Font("Microsoft YaHei UI", 9f);
+            _boldFont = new Font(Font, FontStyle.Bold);
+            _monoFont = CreateMonoFont();
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(920, 600);
+            MinimumSize = new Size(740, 460);
+            if (windowIcon != null)
+            {
+                Icon = windowIcon;
+            }
+
+            _searchDebounceTimer = new System.Windows.Forms.Timer { Interval = 100 };
+            _searchDebounceTimer.Tick += (s, e) =>
+            {
+                _searchDebounceTimer.Stop();
+                LoadSelectedFileContent();
+            };
+
+            TableLayoutPanel root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 4,
+                Padding = new Padding(12)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Log directory bar
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: Filter toolbar
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 2: Log viewer
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Footer status bar
+
+            // Row 0: Log directory bar
+            TableLayoutPanel dirPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 6,
+                RowCount = 1,
+                BackColor = Color.FromArgb(245, 247, 250),
+                Padding = new Padding(10, 7, 10, 7),
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            Label lblDir = new Label
+            {
+                Text = "日志存放目录:",
+                AutoSize = true,
+                Font = _boldFont,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 4, 8, 2)
+            };
+
+            _txtLogDir = new TextBox
+            {
+                ReadOnly = true,
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Margin = new Padding(0, 2, 6, 2)
+            };
+
+            _lblDirBadge = new Label
+            {
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 4, 8, 2)
+            };
+
+            _btnChangeDir = new Button
+            {
+                Text = "修改目录...",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 6, 0)
+            };
+            _btnChangeDir.Click += OnChangeDirClick;
+
+            _btnResetDir = new Button
+            {
+                Text = "恢复默认",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 6, 0)
+            };
+            _btnResetDir.Click += OnResetDirClick;
+
+            _btnOpenDir = new Button
+            {
+                Text = "打开目录",
+                AutoSize = true,
+                Margin = new Padding(0)
+            };
+            _btnOpenDir.Click += OnOpenDirClick;
+
+            dirPanel.Controls.Add(lblDir, 0, 0);
+            dirPanel.Controls.Add(_txtLogDir, 1, 0);
+            dirPanel.Controls.Add(_lblDirBadge, 2, 0);
+            dirPanel.Controls.Add(_btnChangeDir, 3, 0);
+            dirPanel.Controls.Add(_btnResetDir, 4, 0);
+            dirPanel.Controls.Add(_btnOpenDir, 5, 0);
+            root.Controls.Add(dirPanel, 0, 0);
+
+            // Row 1: Filter & actions toolbar
+            TableLayoutPanel filterPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 10,
+                RowCount = 1,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 0: file label
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 210f)); // 1: file combo
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 2: level label
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88f)); // 3: level combo
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 4: search label
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); // 5: search box
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 6: auto scroll
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 7: refresh
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 8: copy
+            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 9: clear
+
+            Label lblFile = new Label
+            {
+                Text = "文件:",
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 4, 2)
+            };
+
+            _cmbFiles = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0, 2, 10, 2)
+            };
+            _cmbFiles.SelectedIndexChanged += (s, e) =>
+            {
+                if (!_suppressUiEvents)
+                {
+                    LoadSelectedFileContent();
+                }
+            };
+
+            Label lblLevel = new Label
+            {
+                Text = "级别:",
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 4, 2)
+            };
+
+            _cmbLevel = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0, 2, 10, 2)
+            };
+            _cmbLevel.Items.AddRange(new object[] { "全部", "INFO", "WARN", "ERROR" });
+            _cmbLevel.SelectedIndex = 0;
+            _cmbLevel.SelectedIndexChanged += (s, e) =>
+            {
+                if (!_suppressUiEvents)
+                {
+                    LoadSelectedFileContent();
+                }
+            };
+
+            Label lblSearch = new Label
+            {
+                Text = "搜索:",
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 4, 2)
+            };
+
+            _txtSearch = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0, 2, 10, 2)
+            };
+            _txtSearch.TextChanged += (s, e) =>
+            {
+                _searchDebounceTimer.Stop();
+                _searchDebounceTimer.Start();
+            };
+
+            _chkAutoScroll = new CheckBox
+            {
+                Text = "实时滚动",
+                AutoSize = true,
+                Checked = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 4, 8, 2)
+            };
+
+            _btnRefresh = new Button
+            {
+                Text = "刷新",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 6, 0)
+            };
+            _btnRefresh.Click += (s, e) => RefreshAll();
+
+            _btnCopy = new Button
+            {
+                Text = "复制",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 6, 0)
+            };
+            _btnCopy.Click += OnCopyClick;
+
+            _btnClear = new Button
+            {
+                Text = "清空",
+                AutoSize = true,
+                Margin = new Padding(0)
+            };
+            _btnClear.Click += OnClearClick;
+
+            filterPanel.Controls.Add(lblFile, 0, 0);
+            filterPanel.Controls.Add(_cmbFiles, 1, 0);
+            filterPanel.Controls.Add(lblLevel, 2, 0);
+            filterPanel.Controls.Add(_cmbLevel, 3, 0);
+            filterPanel.Controls.Add(lblSearch, 4, 0);
+            filterPanel.Controls.Add(_txtSearch, 5, 0);
+            filterPanel.Controls.Add(_chkAutoScroll, 6, 0);
+            filterPanel.Controls.Add(_btnRefresh, 7, 0);
+            filterPanel.Controls.Add(_btnCopy, 8, 0);
+            filterPanel.Controls.Add(_btnClear, 9, 0);
+            root.Controls.Add(filterPanel, 0, 1);
+
+            // Row 2: RichTextBox log content
+            _rtbLog = new RichTextBox
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                WordWrap = false,
+                DetectUrls = false,
+                ScrollBars = RichTextBoxScrollBars.Both,
+                BorderStyle = BorderStyle.FixedSingle,
+                BackColor = Color.FromArgb(24, 28, 36),
+                ForeColor = Color.FromArgb(226, 232, 240),
+                Font = _monoFont,
+                HideSelection = false,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            root.Controls.Add(_rtbLog, 0, 2);
+
+            // Row 3: Bottom status & close button
+            TableLayoutPanel footer = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0)
+            };
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            _lblStatus = new Label
+            {
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 5, 8, 0)
+            };
+
+            _btnClose = new Button
+            {
+                Text = "关闭",
+                AutoSize = true,
+                Padding = new Padding(14, 3, 14, 3),
+                DialogResult = DialogResult.Cancel,
+                Margin = new Padding(0)
+            };
+            _btnClose.Click += (s, e) => Close();
+
+            footer.Controls.Add(_lblStatus, 0, 0);
+            footer.Controls.Add(_btnClose, 1, 0);
+            root.Controls.Add(footer, 0, 3);
+
+            Controls.Add(root);
+            CancelButton = _btnClose;
+
+            Load += (s, e) =>
+            {
+                AppLogger.EntryLogged += OnLiveLogEntry;
+                RefreshAll();
+            };
+            FormClosed += (s, e) =>
+            {
+                AppLogger.EntryLogged -= OnLiveLogEntry;
+            };
+        }
+
+        private static Font CreateMonoFont()
+        {
+            try
+            {
+                return new Font("Consolas", 9.5f);
+            }
+            catch
+            {
+                return new Font("Microsoft YaHei UI", 9f);
+            }
+        }
+
+        public void SyncLogDirectoryChanged()
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            RefreshAll();
+        }
+
+        private void RefreshAll()
+        {
+            AppLogger.Flush(500);
+            UpdateDirectoryBar();
+            PopulateFileList();
+            LoadSelectedFileContent();
+        }
+
+        private void UpdateDirectoryBar()
+        {
+            string effective = AppLogger.EffectiveLogDirectory;
+            bool isDefault = AppLogger.IsUsingDefaultDirectory;
+            _txtLogDir.Text = effective;
+            _lblDirBadge.Text = isDefault ? "(默认)" : "(自定义)";
+            _btnResetDir.Enabled = !isDefault;
+        }
+
+        private void PopulateFileList()
+        {
+            string dir = AppLogger.EffectiveLogDirectory;
+            string todayPath = AppLogger.GetCurrentLogFilePath();
+            string prevSelected = _activeFilePath;
+
+            List<string> files = AppLogger.ListLogFiles(dir);
+            bool hasTodayInList = false;
+            for (int i = 0; i < files.Count; i++)
+            {
+                if (string.Equals(files[i], todayPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    hasTodayInList = true;
+                    break;
+                }
+            }
+            if (!hasTodayInList)
+            {
+                files.Insert(0, todayPath);
+            }
+
+            _suppressUiEvents = true;
+            _cmbFiles.BeginUpdate();
+            try
+            {
+                _cmbFiles.Items.Clear();
+                int restoreIdx = 0;
+                for (int i = 0; i < files.Count; i++)
+                {
+                    string path = files[i];
+                    bool isToday = string.Equals(path, todayPath, StringComparison.OrdinalIgnoreCase);
+                    string name = Path.GetFileName(path);
+                    string label = isToday ? (name + " [今天]") : name;
+                    _cmbFiles.Items.Add(new LogFileItem
+                    {
+                        FullPath = path,
+                        DisplayText = label,
+                        IsToday = isToday
+                    });
+                    if (!string.IsNullOrEmpty(prevSelected) &&
+                        string.Equals(path, prevSelected, StringComparison.OrdinalIgnoreCase))
+                    {
+                        restoreIdx = i;
+                    }
+                }
+                if (_cmbFiles.Items.Count > 0)
+                {
+                    _cmbFiles.SelectedIndex = restoreIdx;
+                }
+            }
+            finally
+            {
+                _cmbFiles.EndUpdate();
+                _suppressUiEvents = false;
+            }
+        }
+
+        private void LoadSelectedFileContent()
+        {
+            LogFileItem item = _cmbFiles.SelectedItem as LogFileItem;
+            if (item == null)
+            {
+                _activeFilePath = string.Empty;
+                _viewingTodayFile = false;
+                _rtbLog.Clear();
+                _lblStatus.Text = "暂无日志文件";
+                return;
+            }
+
+            _activeFilePath = item.FullPath;
+            _viewingTodayFile = item.IsToday;
+
+            int totalLines;
+            long fileBytes;
+            string[] lines = AppLogger.ReadLogFileLinesSafe(_activeFilePath, MaxDisplayedLines, out totalLines, out fileBytes);
+            _totalFileLines = totalLines;
+            _currentFileBytes = fileBytes;
+
+            string levelFilter = _cmbLevel.SelectedItem != null ? _cmbLevel.SelectedItem.ToString() : "全部";
+            string search = _txtSearch.Text != null ? _txtSearch.Text.Trim() : string.Empty;
+
+            List<string> matched = new List<string>(lines.Length);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (LineMatchesFilter(lines[i], levelFilter, search))
+                {
+                    matched.Add(lines[i]);
+                }
+            }
+            _displayedLines = matched.Count;
+
+            if (matched.Count == 0)
+            {
+                _rtbLog.Clear();
+                _rtbLog.ForeColor = Color.FromArgb(148, 163, 184);
+                _rtbLog.Text = File.Exists(_activeFilePath)
+                    ? "（当前筛选条件下无匹配日志记录）"
+                    : "（今日日志文件尚未生成记录）";
+            }
+            else
+            {
+                _rtbLog.Rtf = BuildColoredRtf(matched);
+                if (_chkAutoScroll.Checked)
+                {
+                    _rtbLog.SelectionStart = _rtbLog.TextLength;
+                    _rtbLog.ScrollToCaret();
+                }
+            }
+
+            UpdateStatusLabel();
+        }
+
+        private void OnLiveLogEntry(LogEntry entry)
+        {
+            if (IsDisposed || !IsHandleCreated)
+            {
+                return;
+            }
+            try
+            {
+                BeginInvoke((Action)(() => AppendLiveEntryOnUi(entry)));
+            }
+            catch
+            {
+            }
+        }
+
+        private void AppendLiveEntryOnUi(LogEntry entry)
+        {
+            if (IsDisposed || !_viewingTodayFile)
+            {
+                return;
+            }
+            string expectedToday = AppLogger.GetLogFilePathForDate(AppLogger.EffectiveLogDirectory, entry.Timestamp);
+            if (!string.Equals(expectedToday, _activeFilePath, StringComparison.OrdinalIgnoreCase))
+            {
+                RefreshAll();
+                return;
+            }
+
+            string levelFilter = _cmbLevel.SelectedItem != null ? _cmbLevel.SelectedItem.ToString() : "全部";
+            string search = _txtSearch.Text != null ? _txtSearch.Text.Trim() : string.Empty;
+            _totalFileLines++;
+
+            if (!LineMatchesFilter(entry.FormattedLine, levelFilter, search))
+            {
+                UpdateStatusLabel();
+                return;
+            }
+
+            if (_displayedLines == 0)
+            {
+                _rtbLog.Clear();
+            }
+
+            if (_displayedLines >= MaxLiveLinesBeforeReload)
+            {
+                LoadSelectedFileContent();
+                return;
+            }
+
+            bool shouldScroll = _chkAutoScroll.Checked;
+            int savedStart = _rtbLog.SelectionStart;
+            int savedLen = _rtbLog.SelectionLength;
+
+            _rtbLog.SelectionStart = _rtbLog.TextLength;
+            _rtbLog.SelectionLength = 0;
+            _rtbLog.SelectionColor = GetColorForLevel(entry.Level);
+            _rtbLog.AppendText(entry.FormattedLine + "\n");
+            _displayedLines++;
+
+            if (shouldScroll)
+            {
+                _rtbLog.SelectionStart = _rtbLog.TextLength;
+                _rtbLog.ScrollToCaret();
+            }
+            else
+            {
+                _rtbLog.Select(savedStart, savedLen);
+            }
+
+            UpdateStatusLabel();
+        }
+
+        private void UpdateStatusLabel()
+        {
+            string fileName = !string.IsNullOrEmpty(_activeFilePath) ? Path.GetFileName(_activeFilePath) : "无";
+            string sizeText = FormatFileSize(_currentFileBytes);
+            string truncateNote = _totalFileLines > MaxDisplayedLines
+                ? string.Format(" (仅加载最新 {0} 行)", MaxDisplayedLines)
+                : string.Empty;
+            string liveTag = _viewingTodayFile ? " | 实时跟踪中" : " | 历史日志";
+            string writeErr = AppLogger.LastWriteError;
+            string errTag = !string.IsNullOrEmpty(writeErr) ? (" | 写入异常: " + writeErr) : string.Empty;
+
+            _lblStatus.Text = string.Format(
+                "当前文件: {0} | 显示 {1} / 共 {2} 行{3} | 大小 {4}{5}{6}",
+                fileName,
+                _displayedLines,
+                _totalFileLines,
+                truncateNote,
+                sizeText,
+                liveTag,
+                errTag);
+        }
+
+        private static bool LineMatchesFilter(string line, string levelFilter, string search)
+        {
+            if (string.IsNullOrEmpty(line))
+            {
+                return false;
+            }
+            if (string.Equals(levelFilter, "INFO", StringComparison.OrdinalIgnoreCase))
+            {
+                if (line.IndexOf("[INFO", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+            else if (string.Equals(levelFilter, "WARN", StringComparison.OrdinalIgnoreCase))
+            {
+                if (line.IndexOf("[WARN", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+            else if (string.Equals(levelFilter, "ERROR", StringComparison.OrdinalIgnoreCase))
+            {
+                if (line.IndexOf("[ERROR", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+
+            if (!string.IsNullOrEmpty(search) &&
+                line.IndexOf(search, StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        private static Color GetColorForLevel(LogLevel level)
+        {
+            if (level == LogLevel.Error) return Color.FromArgb(248, 113, 113);
+            if (level == LogLevel.Warn) return Color.FromArgb(251, 191, 36);
+            return Color.FromArgb(226, 232, 240);
+        }
+
+        private static string BuildColoredRtf(List<string> lines)
+        {
+            StringBuilder sb = new StringBuilder(lines.Count * 120 + 256);
+            sb.Append(@"{\rtf1\ansi\deff0{\fonttbl{\f0\fnil Consolas;}{\f1\fnil Microsoft YaHei UI;}}");
+            sb.Append(@"{\colortbl;\red226\green232\blue240;\red251\green191\blue36;\red248\green113\blue113;}");
+            sb.Append(@"\viewkind4\uc1\f0\fs19 ");
+
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string line = lines[i];
+                if (line.IndexOf("[ERROR]", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    sb.Append(@"\cf3 ");
+                }
+                else if (line.IndexOf("[WARN", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    sb.Append(@"\cf2 ");
+                }
+                else
+                {
+                    sb.Append(@"\cf1 ");
+                }
+
+                for (int j = 0; j < line.Length; j++)
+                {
+                    char c = line[j];
+                    if (c == '\\')
+                    {
+                        sb.Append(@"\\");
+                    }
+                    else if (c == '{')
+                    {
+                        sb.Append(@"\{");
+                    }
+                    else if (c == '}')
+                    {
+                        sb.Append(@"\}");
+                    }
+                    else if (c >= 0x20 && c <= 0x7E)
+                    {
+                        sb.Append(c);
+                    }
+                    else
+                    {
+                        sb.Append(@"\u").Append(unchecked((short)c)).Append('?');
+                    }
+                }
+                sb.Append(@"\par");
+                sb.AppendLine();
+            }
+
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        private void OnChangeDirClick(object sender, EventArgs e)
+        {
+            using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = "请选择 TunGuard 日志文件的存放目录";
+                dlg.ShowNewFolderButton = true;
+                string cur = AppLogger.EffectiveLogDirectory;
+                if (Directory.Exists(cur))
+                {
+                    dlg.SelectedPath = cur;
+                }
+                if (dlg.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dlg.SelectedPath))
+                {
+                    return;
+                }
+                ApplyDirectoryChange(dlg.SelectedPath);
+            }
+        }
+
+        private void OnResetDirClick(object sender, EventArgs e)
+        {
+            ApplyDirectoryChange(string.Empty);
+        }
+
+        private void ApplyDirectoryChange(string newConfiguredDir)
+        {
+            string targetNormalized;
+            string checkErr;
+            if (!AppLogger.TryValidateWritableDirectory(newConfiguredDir, out targetNormalized, out checkErr))
+            {
+                MessageBox.Show(
+                    this,
+                    "无法使用所选日志目录（可能无写入权限或路径无效）：\n" + checkErr,
+                    "目录不可用",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            string currentDir = AppLogger.EffectiveLogDirectory;
+            if (AppLogger.PathsEqual(currentDir, targetNormalized))
+            {
+                int unusedMig;
+                string unusedEff;
+                string unusedErr;
+                if (_onChangeLogDir != null)
+                {
+                    _onChangeLogDir(newConfiguredDir, false, out unusedMig, out unusedEff, out unusedErr);
+                }
+                UpdateDirectoryBar();
+                return;
+            }
+
+            bool migrate = false;
+            int existingCount = AppLogger.CountLogFiles(currentDir);
+            if (existingCount > 0)
+            {
+                DialogResult ans = MessageBox.Show(
+                    this,
+                    string.Format(
+                        "原日志目录中共有 {0} 个历史日志文件：\n{1}\n\n是否将这些历史日志文件一并迁移到新目录？\n{2}\n\n· 选择「是」：迁移历史日志并继续记录\n· 选择「否」：仅将后续新日志写入新目录",
+                        existingCount,
+                        currentDir,
+                        targetNormalized),
+                    "迁移历史日志",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Question);
+                if (ans == DialogResult.Cancel)
+                {
+                    return;
+                }
+                migrate = (ans == DialogResult.Yes);
+            }
+
+            int migratedCount;
+            string effectiveDir;
+            string error;
+            bool ok = _onChangeLogDir != null
+                ? _onChangeLogDir(newConfiguredDir, migrate, out migratedCount, out effectiveDir, out error)
+                : AppLogger.SetLogDirectory(newConfiguredDir, migrate, out migratedCount, out effectiveDir, out error);
+
+            if (!ok)
+            {
+                MessageBox.Show(
+                    this,
+                    "修改日志存放目录失败：\n" + (error ?? "未知错误"),
+                    "修改失败",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            _activeFilePath = AppLogger.GetCurrentLogFilePath();
+            RefreshAll();
+
+            string msg = "日志存放目录已更新为：\n" + effectiveDir;
+            if (migratedCount > 0)
+            {
+                msg += string.Format("\n\n已迁移 {0} 个历史日志文件。", migratedCount);
+            }
+            MessageBox.Show(this, msg, "修改成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void OnOpenDirClick(object sender, EventArgs e)
+        {
+            string dir = AppLogger.EffectiveLogDirectory;
+            try
+            {
+                if (!Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                Process.Start("explorer.exe", "\"" + dir + "\"");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "打开日志目录失败：\n" + ex.Message, "打开失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void OnCopyClick(object sender, EventArgs e)
+        {
+            try
+            {
+                string text = _rtbLog.SelectionLength > 0 ? _rtbLog.SelectedText : _rtbLog.Text;
+                if (!string.IsNullOrEmpty(text))
+                {
+                    Clipboard.SetText(text);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void OnClearClick(object sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_activeFilePath) || !File.Exists(_activeFilePath))
+            {
+                return;
+            }
+            DialogResult confirm = MessageBox.Show(
+                this,
+                "确定要清空当前日志文件吗？\n" + _activeFilePath,
+                "确认清空日志",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+            string err;
+            if (!AppLogger.TryClearLogFile(_activeFilePath, out err))
+            {
+                MessageBox.Show(this, "清空日志文件失败：\n" + err, "清空失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            RefreshAll();
+        }
+
+        private static string FormatFileSize(long bytes)
+        {
+            if (bytes < 1024) return bytes + " B";
+            if (bytes < 1024 * 1024) return (bytes / 1024.0).ToString("F1") + " KB";
+            return (bytes / (1024.0 * 1024.0)).ToString("F2") + " MB";
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                AppLogger.EntryLogged -= OnLiveLogEntry;
+                if (_searchDebounceTimer != null)
+                {
+                    _searchDebounceTimer.Stop();
+                    _searchDebounceTimer.Dispose();
+                }
+                if (_boldFont != null) _boldFont.Dispose();
+                if (_monoFont != null) _monoFont.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    internal sealed class CustomAppPathsForm : Form
+    {
+        private sealed class AppOption
+        {
+            public string Key;
+            public string Label;
+
+            public override string ToString()
+            {
+                return Label;
+            }
+        }
+
+        private sealed class CustomEntryItem
+        {
+            public string RawPath;
+            public string DisplayText;
+
+            public override string ToString()
+            {
+                return DisplayText;
+            }
+        }
+
+        private readonly Dictionary<string, List<string>> _workingPaths;
+        private readonly Func<bool, AppPathDiagnostics> _diagnosticsProvider;
+        private readonly Font _boldFont;
+        private readonly ComboBox _cmbApp;
+        private readonly Button _btnRescan;
+        private readonly Label _lblCustomHeader;
+        private readonly ListBox _lstCustom;
+        private readonly Button _btnAddExe;
+        private readonly Button _btnAddDir;
+        private readonly Button _btnRemove;
+        private readonly Label _lblDiscoveredHeader;
+        private readonly ListBox _lstDiscovered;
+        private AppPathDiagnostics _diagnostics;
+
+        public Dictionary<string, List<string>> ResultCustomPaths { get; private set; }
+
+        public CustomAppPathsForm(
+            Dictionary<string, List<string>> initialCustomPaths,
+            Func<bool, AppPathDiagnostics> diagnosticsProvider,
+            Icon windowIcon)
+        {
+            _diagnosticsProvider = diagnosticsProvider;
+            _workingPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            NodeGuardConfig.CopyNormalizedAppPathMap(initialCustomPaths, _workingPaths);
+
+            Text = "受控应用路径管理 - TunGuard";
+            StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Microsoft YaHei UI", 9f);
+            _boldFont = new Font(Font, FontStyle.Bold);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(740, 540);
+            MinimumSize = new Size(620, 440);
+            MaximizeBox = true;
+            MinimizeBox = false;
+            if (windowIcon != null)
+            {
+                Icon = windowIcon;
+            }
+
+            TableLayoutPanel root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 5,
+                Padding = new Padding(14)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 0: app selector + rescan
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 52f)); // 1: custom paths panel
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 48f)); // 2: auto-discovered panel
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 3: tip
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 4: footer
+
+            // Row 0: App selector & Rescan
+            TableLayoutPanel topBar = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 3,
+                RowCount = 1,
+                Margin = new Padding(0, 0, 0, 10),
+                BackColor = Color.FromArgb(245, 247, 250),
+                Padding = new Padding(10, 7, 10, 7)
+            };
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            Label lblApp = new Label
+            {
+                Text = "受控应用:",
+                AutoSize = true,
+                Font = _boldFont,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 10, 2)
+            };
+
+            _cmbApp = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0, 2, 12, 2)
+            };
+            _cmbApp.Items.Add(new AppOption { Key = "claude", Label = "Claude 桌面端 (Claude Code)" });
+            _cmbApp.Items.Add(new AppOption { Key = "chatgpt", Label = "ChatGPT 桌面端 (Codex)" });
+            _cmbApp.Items.Add(new AppOption { Key = "antigravity", Label = "Antigravity" });
+            _cmbApp.SelectedIndex = 0;
+            _cmbApp.SelectedIndexChanged += (s, e) => RefreshListsForCurrentApp();
+
+            _btnRescan = new Button
+            {
+                Text = "立即重新扫描本机",
+                AutoSize = true,
+                Margin = new Padding(0, 1, 0, 1)
+            };
+            _btnRescan.Click += OnRescanClick;
+
+            topBar.Controls.Add(lblApp, 0, 0);
+            topBar.Controls.Add(_cmbApp, 1, 0);
+            topBar.Controls.Add(_btnRescan, 2, 0);
+            root.Controls.Add(topBar, 0, 0);
+
+            // Row 1: Custom paths panel
+            TableLayoutPanel customPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(8),
+                BackColor = Color.FromArgb(250, 251, 252),
+                Margin = new Padding(0, 0, 0, 10)
+            };
+            customPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            customPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            customPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            customPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            _lblCustomHeader = new Label
+            {
+                Text = "自定义目录 / 程序 (.exe) — 同时生效于进程拦截与 WFP 内核断网 (0)",
+                AutoSize = true,
+                Font = _boldFont,
+                Margin = new Padding(0, 0, 0, 6)
+            };
+
+            _lstCustom = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                SelectionMode = SelectionMode.MultiExtended,
+                IntegralHeight = false,
+                HorizontalScrollbar = true,
+                BorderStyle = BorderStyle.FixedSingle,
+                Margin = new Padding(0, 0, 0, 6)
+            };
+            _lstCustom.SelectedIndexChanged += (s, e) => _btnRemove.Enabled = _lstCustom.SelectedItems.Count > 0;
+
+            FlowLayoutPanel customBtns = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                WrapContents = true,
+                Margin = new Padding(0)
+            };
+
+            _btnAddDir = new Button
+            {
+                Text = "+ 添加目录...",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 8, 0)
+            };
+            _btnAddDir.Click += OnAddDirectoryClick;
+
+            _btnAddExe = new Button
+            {
+                Text = "+ 添加程序 (.exe)...",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 8, 0)
+            };
+            _btnAddExe.Click += OnAddExeClick;
+
+            _btnRemove = new Button
+            {
+                Text = "移除选中",
+                AutoSize = true,
+                Enabled = false,
+                Margin = new Padding(0)
+            };
+            _btnRemove.Click += OnRemoveSelectedClick;
+
+            customBtns.Controls.Add(_btnAddDir);
+            customBtns.Controls.Add(_btnAddExe);
+            customBtns.Controls.Add(_btnRemove);
+
+            customPanel.Controls.Add(_lblCustomHeader, 0, 0);
+            customPanel.Controls.Add(_lstCustom, 0, 1);
+            customPanel.Controls.Add(customBtns, 0, 2);
+            root.Controls.Add(customPanel, 0, 1);
+
+            // Row 2: Auto-discovered targets panel (read-only)
+            TableLayoutPanel discoveredPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Padding = new Padding(8),
+                BackColor = Color.FromArgb(250, 251, 252),
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            discoveredPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            discoveredPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            discoveredPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+
+            _lblDiscoveredHeader = new Label
+            {
+                Text = "当前已生效的本机保护目标（只读）",
+                AutoSize = true,
+                Font = _boldFont,
+                ForeColor = Color.FromArgb(21, 128, 61),
+                Margin = new Padding(0, 0, 0, 6)
+            };
+
+            _lstDiscovered = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                IntegralHeight = false,
+                HorizontalScrollbar = true,
+                BorderStyle = BorderStyle.FixedSingle,
+                Margin = new Padding(0)
+            };
+
+            discoveredPanel.Controls.Add(_lblDiscoveredHeader, 0, 0);
+            discoveredPanel.Controls.Add(_lstDiscovered, 0, 1);
+            root.Controls.Add(discoveredPanel, 0, 2);
+
+            // Row 3: Hint
+            Label lblHint = new Label
+            {
+                Text = "提示：若使用绿色/便携版、自定义安装目录，或未来软件更新改名/新增子进程，添加其安装目录即可自动覆盖全部 .exe；修改后请点击控制面板的「保存并生效」。",
+                AutoSize = true,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 0, 0, 10)
+            };
+            root.Controls.Add(lblHint, 0, 3);
+
+            // Row 4: Footer buttons
+            FlowLayoutPanel footer = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0)
+            };
+
+            Button btnCancel = new Button
+            {
+                Text = "取消",
+                AutoSize = true,
+                Padding = new Padding(14, 3, 14, 3),
+                DialogResult = DialogResult.Cancel,
+                Margin = new Padding(8, 0, 0, 0)
+            };
+
+            Button btnOk = new Button
+            {
+                Text = "确定",
+                AutoSize = true,
+                Padding = new Padding(14, 3, 14, 3),
+                Margin = new Padding(0)
+            };
+            btnOk.Click += (s, e) =>
+            {
+                ResultCustomPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                NodeGuardConfig.CopyNormalizedAppPathMap(_workingPaths, ResultCustomPaths);
+                DialogResult = DialogResult.OK;
+                Close();
+            };
+
+            footer.Controls.Add(btnCancel);
+            footer.Controls.Add(btnOk);
+            root.Controls.Add(footer, 0, 4);
+
+            Controls.Add(root);
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+
+            Load += (s, e) =>
+            {
+                LoadDiagnostics(false);
+                RefreshListsForCurrentApp();
+            };
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && _boldFont != null)
+            {
+                _boldFont.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        private string CurrentAppKey
+        {
+            get
+            {
+                AppOption opt = _cmbApp.SelectedItem as AppOption;
+                return opt != null ? opt.Key : "claude";
+            }
+        }
+
+        private void LoadDiagnostics(bool rescan)
+        {
+            if (_diagnosticsProvider != null)
+            {
+                try
+                {
+                    _diagnostics = _diagnosticsProvider(rescan);
+                }
+                catch
+                {
+                    _diagnostics = new AppPathDiagnostics();
+                }
+            }
+            if (_diagnostics == null)
+            {
+                _diagnostics = new AppPathDiagnostics();
+            }
+        }
+
+        private void OnRescanClick(object sender, EventArgs e)
+        {
+            _btnRescan.Enabled = false;
+            try
+            {
+                LoadDiagnostics(true);
+                RefreshListsForCurrentApp();
+            }
+            finally
+            {
+                _btnRescan.Enabled = true;
+            }
+        }
+
+        private void OnAddDirectoryClick(object sender, EventArgs e)
+        {
+            using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = "请选择受控应用的安装目录或便携版根目录（将自动覆盖该目录及子目录下的 .exe）";
+                dlg.ShowNewFolderButton = false;
+                if (dlg.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dlg.SelectedPath))
+                {
+                    return;
+                }
+                string reason;
+                if (!GuardedAppPathResolver.IsSafeCustomDirectory(dlg.SelectedPath, out reason))
+                {
+                    MessageBox.Show(this, reason, "目录不可用", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                AddCustomEntryForCurrentApp(dlg.SelectedPath);
+            }
+        }
+
+        private void OnAddExeClick(object sender, EventArgs e)
+        {
+            using (OpenFileDialog dlg = new OpenFileDialog())
+            {
+                dlg.Title = "请选择要保护的可执行程序 (.exe)";
+                dlg.Filter = "可执行文件 (*.exe)|*.exe";
+                dlg.Multiselect = true;
+                dlg.CheckFileExists = true;
+                if (dlg.ShowDialog(this) != DialogResult.OK || dlg.FileNames == null || dlg.FileNames.Length == 0)
+                {
+                    return;
+                }
+                for (int i = 0; i < dlg.FileNames.Length; i++)
+                {
+                    AddCustomEntryForCurrentApp(dlg.FileNames[i]);
+                }
+            }
+        }
+
+        private void AddCustomEntryForCurrentApp(string rawPath)
+        {
+            string norm = NodeGuardConfig.NormalizeConfiguredPathEntry(rawPath);
+            if (string.IsNullOrEmpty(norm))
+            {
+                return;
+            }
+            string key = CurrentAppKey;
+            List<string> list;
+            if (!_workingPaths.TryGetValue(key, out list) || list == null)
+            {
+                list = new List<string>();
+                _workingPaths[key] = list;
+            }
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i], norm, StringComparison.OrdinalIgnoreCase))
+                {
+                    RefreshListsForCurrentApp();
+                    return;
+                }
+            }
+            list.Add(norm);
+            list.Sort(StringComparer.OrdinalIgnoreCase);
+            RefreshListsForCurrentApp();
+        }
+
+        private void OnRemoveSelectedClick(object sender, EventArgs e)
+        {
+            if (_lstCustom.SelectedItems.Count == 0)
+            {
+                return;
+            }
+            string key = CurrentAppKey;
+            List<string> list;
+            if (!_workingPaths.TryGetValue(key, out list) || list == null)
+            {
+                return;
+            }
+            HashSet<string> toRemove = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < _lstCustom.SelectedItems.Count; i++)
+            {
+                CustomEntryItem item = _lstCustom.SelectedItems[i] as CustomEntryItem;
+                if (item != null && !string.IsNullOrEmpty(item.RawPath))
+                {
+                    toRemove.Add(item.RawPath);
+                }
+            }
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                if (toRemove.Contains(list[i]))
+                {
+                    list.RemoveAt(i);
+                }
+            }
+            if (list.Count == 0)
+            {
+                _workingPaths.Remove(key);
+            }
+            RefreshListsForCurrentApp();
+        }
+
+        private void RefreshListsForCurrentApp()
+        {
+            string key = CurrentAppKey;
+            List<string> customList;
+            _workingPaths.TryGetValue(key, out customList);
+            int customCount = customList != null ? customList.Count : 0;
+
+            _lstCustom.BeginUpdate();
+            _lstCustom.Items.Clear();
+            if (customList != null)
+            {
+                for (int i = 0; i < customList.Count; i++)
+                {
+                    string p = customList[i];
+                    bool isExe = p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+                    bool exists = isExe ? File.Exists(p) : Directory.Exists(p);
+                    string tag = isExe
+                        ? (exists ? "[程序] " : "[程序 · 本机不存在] ")
+                        : (exists ? "[目录] " : "[目录 · 本机不存在] ");
+                    _lstCustom.Items.Add(new CustomEntryItem { RawPath = p, DisplayText = tag + p });
+                }
+            }
+            _lstCustom.EndUpdate();
+            _lblCustomHeader.Text = string.Format("自定义目录 / 程序 (.exe) — 同时生效于进程拦截与 WFP 内核断网 ({0})", customCount);
+            _btnRemove.Enabled = false;
+
+            List<string> exes = null;
+            List<string> pkgs = null;
+            if (_diagnostics != null)
+            {
+                if (string.Equals(key, "antigravity", StringComparison.OrdinalIgnoreCase))
+                {
+                    exes = _diagnostics.AntigravityExes;
+                }
+                else if (string.Equals(key, "chatgpt", StringComparison.OrdinalIgnoreCase))
+                {
+                    exes = _diagnostics.ChatGptExes;
+                    pkgs = _diagnostics.ChatGptPackages;
+                }
+                else
+                {
+                    exes = _diagnostics.ClaudeExes;
+                    pkgs = _diagnostics.ClaudePackages;
+                }
+            }
+
+            int exeCount = exes != null ? exes.Count : 0;
+            int pkgCount = pkgs != null ? pkgs.Count : 0;
+            _lstDiscovered.BeginUpdate();
+            _lstDiscovered.Items.Clear();
+            if (pkgs != null)
+            {
+                for (int i = 0; i < pkgs.Count; i++)
+                {
+                    _lstDiscovered.Items.Add("[MSIX 包] " + pkgs[i]);
+                }
+            }
+            if (exes != null)
+            {
+                for (int i = 0; i < exes.Count; i++)
+                {
+                    _lstDiscovered.Items.Add("[程序] " + exes[i]);
+                }
+            }
+            if (_lstDiscovered.Items.Count == 0)
+            {
+                _lstDiscovered.Items.Add("(暂未在常见路径发现该应用；绿色版请在上方添加目录，或运行一次后自动热发现)");
+            }
+            _lstDiscovered.EndUpdate();
+            _lblDiscoveredHeader.Text = string.Format("当前已生效的本机保护目标（只读：{0} 个程序{1}）", exeCount, pkgCount > 0 ? (" + " + pkgCount + " 个 MSIX 包") : string.Empty);
+        }
+    }
+
     internal sealed class NodeSettingsForm : Form
     {
         private const string AutoGroupLabel = "(自动跟踪默认出口组)";
@@ -9137,7 +13472,10 @@ namespace TunGuard
         private readonly string _configPath;
         private readonly Func<ClashCatalogData> _catalogProvider;
         private readonly Func<TunStatus> _statusProvider;
+        private readonly Func<bool, AppPathDiagnostics> _pathDiagnosticsProvider;
+        private readonly Action _onOpenLogViewer;
         private readonly Dictionary<string, List<string>> _preservedDiscoveredPaths;
+        private Dictionary<string, List<string>> _draftCustomAppPaths;
 
         private readonly ToolTip _toolTip;
         private readonly Font _boldHeaderFont;
@@ -9145,10 +13483,18 @@ namespace TunGuard
         private readonly CheckBox _chkGuardAntigravity;
         private readonly CheckBox _chkGuardChatGPT;
         private readonly CheckBox _chkGuardClaude;
+        private readonly Button _btnAutoDetectApps;
+        private readonly Button _btnManagePaths;
+        private readonly Label _lblAppDetectStatus;
         private readonly CheckBox _chkWfpEnabled;
         private readonly CheckBox _chkWfpKillOnBlock;
         private readonly CheckBox _chkWfpBlockNonTunDns;
+        private readonly CheckBox _chkPopupOnBlock;
         private readonly Label _lblWfpStatus;
+        private readonly TextBox _txtLogDir;
+        private readonly Button _btnChangeLogDir;
+        private readonly Button _btnResetLogDir;
+        private readonly Button _btnViewLogs;
         private readonly CheckBox _chkEnabled;
         private readonly Label _lblClashStatus;
         private readonly Button _btnRefresh;
@@ -9186,10 +13532,13 @@ namespace TunGuard
 
         private ClashCatalogData _catalog;
         private ClashSnapshot _lastSnapshot;
+        private AppPathDiagnostics _lastAppDiagnostics;
         private string _lastActiveLeafNode = string.Empty;
         private int _refreshing;
+        private int _detectingApps;
         private bool _suppressFilterEvents;
         private bool _suppressAppToggleEvents;
+        private string _draftLogDirectory = string.Empty;
 
         public NodeGuardConfig ResultConfig { get; private set; }
 
@@ -9198,11 +13547,15 @@ namespace TunGuard
             string configPath,
             Func<ClashCatalogData> catalogProvider,
             Func<TunStatus> statusProvider,
+            Func<bool, AppPathDiagnostics> pathDiagnosticsProvider,
+            Action onOpenLogViewer,
             Icon windowIcon)
         {
             _configPath = configPath;
             _catalogProvider = catalogProvider;
             _statusProvider = statusProvider;
+            _pathDiagnosticsProvider = pathDiagnosticsProvider;
+            _onOpenLogViewer = onOpenLogViewer;
             _toolTip = new ToolTip();
             _searchDebounceTimer = new System.Windows.Forms.Timer { Interval = 80 };
             _searchDebounceTimer.Tick += (s, e) =>
@@ -9213,6 +13566,9 @@ namespace TunGuard
 
             NodeGuardConfig cfg = (initialConfig != null ? initialConfig : new NodeGuardConfig()).CloneNormalized();
             _preservedDiscoveredPaths = cfg.DiscoveredAppPaths ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            _draftCustomAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            NodeGuardConfig.CopyNormalizedAppPathMap(cfg.CustomAppPaths, _draftCustomAppPaths);
+            _draftLogDirectory = cfg.LogDirectory ?? string.Empty;
             for (int i = 0; i < cfg.AllowedNodes.Count; i++)
             {
                 AddSelectionInternal(cfg.AllowedNodes[i]);
@@ -9223,8 +13579,8 @@ namespace TunGuard
             Font = new Font("Microsoft YaHei UI", 9f);
             _boldHeaderFont = new Font(Font, FontStyle.Bold);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(860, 710);
-            MinimumSize = new Size(740, 590);
+            ClientSize = new Size(860, 760);
+            MinimumSize = new Size(740, 640);
             MaximizeBox = true;
             MinimizeBox = false;
             if (windowIcon != null)
@@ -9236,32 +13592,36 @@ namespace TunGuard
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 8,
+                RowCount = 9,
                 Padding = new Padding(14)
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Guarded target apps
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: WFP kernel kill switch panel
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2: Enable node guard switch
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Live Clash status banner
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 4: Proxy group & match mode
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 5: Transfer box
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 6: Live preview
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 7: Footer buttons
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2: Popup & logging settings panel
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Enable node guard switch
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 4: Live Clash status banner
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 5: Proxy group & match mode
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 6: Transfer box
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 7: Live preview
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 8: Footer buttons
 
-            // Row 0: Guarded target apps selector
+            // Row 0: Guarded target apps selector + auto-detection status
             TableLayoutPanel targetAppsPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
-                ColumnCount = 2,
-                RowCount = 1,
+                ColumnCount = 3,
+                RowCount = 2,
                 Margin = new Padding(0, 0, 0, 8),
                 BackColor = Color.FromArgb(245, 247, 250),
                 Padding = new Padding(10, 7, 10, 7)
             };
             targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            targetAppsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            targetAppsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             Label lblTargetApps = new Label
             {
@@ -9310,13 +13670,54 @@ namespace TunGuard
             _toolTip.SetToolTip(_chkGuardClaude, "拦截 Claude / Claude Code 桌面端（Claude.exe 及 MSIX 包组件，不影响 VS Code 插件或命令行 CLI）");
             _chkGuardClaude.CheckedChanged += OnTargetAppCheckedChanged;
 
+            FlowLayoutPanel targetAppsButtons = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                WrapContents = false,
+                Anchor = AnchorStyles.Right,
+                Margin = new Padding(8, 0, 0, 0)
+            };
+
+            _btnAutoDetectApps = new Button
+            {
+                Text = "自动检测",
+                AutoSize = true,
+                Margin = new Padding(0, 0, 6, 0)
+            };
+            _toolTip.SetToolTip(_btnAutoDetectApps, "立即扫描本机安装目录、MSIX 商店包、注册表、桌面/开始菜单快捷方式及运行中进程，自动检测三个受控软件并同步 WFP");
+            _btnAutoDetectApps.Click += (s, e) => DetectAppsAsync(true);
+
+            _btnManagePaths = new Button
+            {
+                Text = "路径管理...",
+                AutoSize = true,
+                Margin = new Padding(0)
+            };
+            _toolTip.SetToolTip(_btnManagePaths, "查看本机已自动发现的受控程序与 MSIX 包，或手动添加绿色版目录、自定义 .exe（应对软件更新改名或换电脑）");
+            _btnManagePaths.Click += OnManagePathsClick;
+
+            targetAppsButtons.Controls.Add(_btnAutoDetectApps);
+            targetAppsButtons.Controls.Add(_btnManagePaths);
+
+            _lblAppDetectStatus = new Label
+            {
+                Text = "自动检测: 正在检测 Antigravity / ChatGPT / Claude...",
+                AutoSize = true,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 4, 0, 0)
+            };
+
             targetAppsFlow.Controls.Add(_chkGuardAntigravity);
             targetAppsFlow.Controls.Add(_chkGuardChatGPT);
             targetAppsFlow.Controls.Add(_chkGuardClaude);
 
             targetAppsPanel.Controls.Add(lblTargetApps, 0, 0);
             targetAppsPanel.Controls.Add(targetAppsFlow, 1, 0);
+            targetAppsPanel.Controls.Add(targetAppsButtons, 2, 0);
+            targetAppsPanel.Controls.Add(_lblAppDetectStatus, 0, 1);
+            targetAppsPanel.SetColumnSpan(_lblAppDetectStatus, 3);
             root.Controls.Add(targetAppsPanel, 0, 0);
+            UpdateManagePathsButtonText();
 
             // Row 1: WFP kernel kill switch settings
             TableLayoutPanel wfpPanel = new TableLayoutPanel
@@ -9401,7 +13802,106 @@ namespace TunGuard
             wfpPanel.SetColumnSpan(_lblWfpStatus, 2);
             root.Controls.Add(wfpPanel, 0, 1);
 
-            // Row 2: Enable node guard checkbox
+            // Row 2: On-screen alert popup & logging directory settings
+            TableLayoutPanel alertLogPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 5,
+                RowCount = 2,
+                Margin = new Padding(0, 0, 0, 8),
+                BackColor = Color.FromArgb(245, 247, 250),
+                Padding = new Padding(10, 7, 10, 7)
+            };
+            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            alertLogPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            alertLogPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            Label lblAlertHeader = new Label
+            {
+                Text = "弹窗提示:",
+                AutoSize = true,
+                Font = _boldHeaderFont,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 3, 12, 4)
+            };
+
+            _chkPopupOnBlock = new CheckBox
+            {
+                Text = "未匹配节点或 TUN 关闭时打开受控软件，在屏幕弹出置顶提示",
+                AutoSize = true,
+                Checked = cfg.PopupOnBlock,
+                Margin = new Padding(0, 2, 0, 4)
+            };
+            _toolTip.SetToolTip(_chkPopupOnBlock, "在节点不匹配或 TUN 关闭状态下打开受控应用（或运行中被拦截）时，在屏幕上方弹出醒目的置顶提示卡片，不再仅依赖易被系统屏蔽的托盘气泡。");
+
+            Label lblLogDirHeader = new Label
+            {
+                Text = "日志目录:",
+                AutoSize = true,
+                Font = _boldHeaderFont,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 12, 2)
+            };
+
+            _txtLogDir = new TextBox
+            {
+                ReadOnly = true,
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Margin = new Padding(0, 2, 6, 2)
+            };
+
+            _btnChangeLogDir = new Button
+            {
+                Text = "修改目录...",
+                AutoSize = true,
+                Margin = new Padding(0, 1, 6, 1)
+            };
+            _btnChangeLogDir.Click += OnBrowseLogDirClick;
+
+            _btnResetLogDir = new Button
+            {
+                Text = "恢复默认",
+                AutoSize = true,
+                Margin = new Padding(0, 1, 6, 1)
+            };
+            _btnResetLogDir.Click += (s, e) =>
+            {
+                _draftLogDirectory = string.Empty;
+                UpdateLogDirectoryDisplay();
+            };
+
+            _btnViewLogs = new Button
+            {
+                Text = "查看日志...",
+                AutoSize = true,
+                Margin = new Padding(0, 1, 0, 1)
+            };
+            _btnViewLogs.Click += (s, e) =>
+            {
+                if (_onOpenLogViewer != null)
+                {
+                    _onOpenLogViewer();
+                }
+            };
+
+            alertLogPanel.Controls.Add(lblAlertHeader, 0, 0);
+            alertLogPanel.Controls.Add(_chkPopupOnBlock, 1, 0);
+            alertLogPanel.SetColumnSpan(_chkPopupOnBlock, 4);
+            alertLogPanel.Controls.Add(lblLogDirHeader, 0, 1);
+            alertLogPanel.Controls.Add(_txtLogDir, 1, 1);
+            alertLogPanel.Controls.Add(_btnChangeLogDir, 2, 1);
+            alertLogPanel.Controls.Add(_btnResetLogDir, 3, 1);
+            alertLogPanel.Controls.Add(_btnViewLogs, 4, 1);
+            root.Controls.Add(alertLogPanel, 0, 2);
+            UpdateLogDirectoryDisplay();
+
+            // Row 3: Enable node guard checkbox
             _chkEnabled = new CheckBox
             {
                 Text = "启用 Clash 节点守护（当 Clash 未使用右侧允许节点时，同样立即触发内核断网/拦截）",
@@ -9410,7 +13910,7 @@ namespace TunGuard
                 Margin = new Padding(0, 0, 0, 8)
             };
             _chkEnabled.CheckedChanged += OnRuleInputChanged;
-            root.Controls.Add(_chkEnabled, 0, 2);
+            root.Controls.Add(_chkEnabled, 0, 3);
 
             // Row 3: Live Clash status bar
             TableLayoutPanel statusPanel = new TableLayoutPanel
@@ -9443,7 +13943,7 @@ namespace TunGuard
 
             statusPanel.Controls.Add(_lblClashStatus, 0, 0);
             statusPanel.Controls.Add(_btnRefresh, 1, 0);
-            root.Controls.Add(statusPanel, 0, 3);
+            root.Controls.Add(statusPanel, 0, 4);
 
             // Row 4: Proxy group & match mode
             TableLayoutPanel rulePanel = new TableLayoutPanel
@@ -9525,7 +14025,7 @@ namespace TunGuard
             rulePanel.Controls.Add(matchFlow, 3, 0);
             rulePanel.Controls.Add(lblGroupHint, 0, 1);
             rulePanel.SetColumnSpan(lblGroupHint, 4);
-            root.Controls.Add(rulePanel, 0, 4);
+            root.Controls.Add(rulePanel, 0, 5);
 
             // Row 4: Transfer Box (Left pane | Transfer buttons | Right pane)
             TableLayoutPanel transfer = new TableLayoutPanel
@@ -9773,9 +14273,9 @@ namespace TunGuard
             transfer.Controls.Add(leftPane, 0, 0);
             transfer.Controls.Add(midPanel, 1, 0);
             transfer.Controls.Add(rightPane, 2, 0);
-            root.Controls.Add(transfer, 0, 5);
+            root.Controls.Add(transfer, 0, 6);
 
-            // Row 6: Live preview
+            // Row 7: Live preview
             _lblPreview = new Label
             {
                 Text = "预览: 正在检测...",
@@ -9783,9 +14283,9 @@ namespace TunGuard
                 Dock = DockStyle.Fill,
                 Margin = new Padding(0, 0, 0, 10)
             };
-            root.Controls.Add(_lblPreview, 0, 6);
+            root.Controls.Add(_lblPreview, 0, 7);
 
-            // Row 7: Footer buttons
+            // Row 8: Footer buttons
             FlowLayoutPanel footer = new FlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -9815,7 +14315,7 @@ namespace TunGuard
 
             footer.Controls.Add(_btnCancel);
             footer.Controls.Add(_btnSave);
-            root.Controls.Add(footer, 0, 7);
+            root.Controls.Add(footer, 0, 8);
 
             Controls.Add(root);
             CancelButton = _btnCancel;
@@ -9828,6 +14328,7 @@ namespace TunGuard
                 }
                 RebuildTransferLists();
                 UpdatePreview();
+                DetectAppsAsync(true);
                 RefreshCatalogAsync();
             };
         }
@@ -9928,7 +14429,61 @@ namespace TunGuard
             {
                 _suppressAppToggleEvents = false;
             }
+            UpdateAppDetectStatusDisplay();
             UpdatePreview();
+        }
+
+        public void SyncLogDirectory(string configuredDir)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            _draftLogDirectory = configuredDir != null ? configuredDir.Trim() : string.Empty;
+            UpdateLogDirectoryDisplay();
+        }
+
+        private void UpdateLogDirectoryDisplay()
+        {
+            string effective = AppLogger.ResolveEffectiveDirectory(_draftLogDirectory);
+            bool isDefault = string.IsNullOrWhiteSpace(_draftLogDirectory) ||
+                             AppLogger.PathsEqual(effective, AppLogger.DefaultLogDirectory);
+            _txtLogDir.Text = isDefault ? (effective + "  (默认)") : effective;
+            _btnResetLogDir.Enabled = !isDefault;
+        }
+
+        private void OnBrowseLogDirClick(object sender, EventArgs e)
+        {
+            using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = "请选择 TunGuard 日志文件的存放目录";
+                dlg.ShowNewFolderButton = true;
+                string current = AppLogger.ResolveEffectiveDirectory(_draftLogDirectory);
+                if (Directory.Exists(current))
+                {
+                    dlg.SelectedPath = current;
+                }
+                if (dlg.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dlg.SelectedPath))
+                {
+                    return;
+                }
+                string normalized;
+                string err;
+                if (!AppLogger.TryValidateWritableDirectory(dlg.SelectedPath, out normalized, out err))
+                {
+                    MessageBox.Show(
+                        this,
+                        "所选日志目录不可写或无效：\n" + err,
+                        "目录不可用",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
+                }
+                _draftLogDirectory = AppLogger.PathsEqual(normalized, AppLogger.DefaultLogDirectory)
+                    ? string.Empty
+                    : normalized;
+                UpdateLogDirectoryDisplay();
+            }
         }
 
         public void UpdateWfpStatus(TunStatus status)
@@ -9979,7 +14534,238 @@ namespace TunGuard
             {
                 return;
             }
+            UpdateAppDetectStatusDisplay();
             UpdatePreview();
+        }
+
+        private void DetectAppsAsync(bool rescan)
+        {
+            if (_pathDiagnosticsProvider == null)
+            {
+                return;
+            }
+            if (Interlocked.CompareExchange(ref _detectingApps, 1, 0) != 0)
+            {
+                return;
+            }
+
+            _btnAutoDetectApps.Enabled = false;
+            _btnAutoDetectApps.Text = "检测中...";
+            _lblAppDetectStatus.ForeColor = Color.FromArgb(100, 116, 139);
+            _lblAppDetectStatus.Text = "自动检测: 正在扫描 Antigravity / ChatGPT / Claude（安装目录、MSIX、注册表、快捷方式与进程）...";
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                AppPathDiagnostics diag = null;
+                try
+                {
+                    diag = _pathDiagnosticsProvider(rescan);
+                }
+                catch
+                {
+                    diag = new AppPathDiagnostics { ScannedAt = DateTime.Now };
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _detectingApps, 0);
+                }
+
+                if (IsDisposed)
+                {
+                    return;
+                }
+                try
+                {
+                    BeginInvoke((Action)(() =>
+                    {
+                        if (IsDisposed)
+                        {
+                            return;
+                        }
+                        _btnAutoDetectApps.Enabled = true;
+                        _btnAutoDetectApps.Text = "自动检测";
+                        _lastAppDiagnostics = diag ?? new AppPathDiagnostics { ScannedAt = DateTime.Now };
+                        UpdateAppDetectStatusDisplay();
+                        if (_statusProvider != null)
+                        {
+                            UpdateWfpStatus(_statusProvider());
+                        }
+                    }));
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        private void UpdateAppDetectStatusDisplay()
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            if (_lastAppDiagnostics == null)
+            {
+                return;
+            }
+
+            AppPathDiagnostics diag = _lastAppDiagnostics;
+            int antiCustom = CountExistingDraftCustomEntries("antigravity");
+            int chatCustom = CountExistingDraftCustomEntries("chatgpt");
+            int claudeCustom = CountExistingDraftCustomEntries("claude");
+
+            bool antiFound = diag.AntigravityExes.Count > 0 || antiCustom > 0;
+            bool chatFound = diag.ChatGptExes.Count > 0 || diag.ChatGptPackages.Count > 0 || chatCustom > 0;
+            bool claudeFound = diag.ClaudeExes.Count > 0 || diag.ClaudePackages.Count > 0 || claudeCustom > 0;
+
+            string antiText = FormatSingleAppDetectSummary("Antigravity", diag.AntigravityExes.Count, 0, antiCustom, (diag.RunningApps & GuardedAppFlags.Antigravity) != 0);
+            string chatText = FormatSingleAppDetectSummary("ChatGPT", diag.ChatGptExes.Count, diag.ChatGptPackages.Count, chatCustom, (diag.RunningApps & GuardedAppFlags.ChatGPT) != 0);
+            string claudeText = FormatSingleAppDetectSummary("Claude", diag.ClaudeExes.Count, diag.ClaudePackages.Count, claudeCustom, (diag.RunningApps & GuardedAppFlags.Claude) != 0);
+
+            bool missingChecked =
+                (_chkGuardAntigravity.Checked && !antiFound) ||
+                (_chkGuardChatGPT.Checked && !chatFound) ||
+                (_chkGuardClaude.Checked && !claudeFound);
+
+            string summary = "自动检测: " + antiText + "  |  " + chatText + "  |  " + claudeText;
+            if (missingChecked)
+            {
+                _lblAppDetectStatus.ForeColor = Color.FromArgb(180, 83, 9);
+                _lblAppDetectStatus.Text = summary + "（有已勾选应用未发现，可点「路径管理...」手动添加）";
+            }
+            else if (antiFound || chatFound || claudeFound)
+            {
+                _lblAppDetectStatus.ForeColor = Color.FromArgb(21, 128, 61);
+                _lblAppDetectStatus.Text = summary;
+            }
+            else
+            {
+                _lblAppDetectStatus.ForeColor = Color.FromArgb(100, 116, 139);
+                _lblAppDetectStatus.Text = summary;
+            }
+
+            _toolTip.SetToolTip(_lblAppDetectStatus, BuildAppDetectTooltip(diag));
+        }
+
+        private int CountExistingDraftCustomEntries(string key)
+        {
+            if (_draftCustomAppPaths == null)
+            {
+                return 0;
+            }
+            List<string> list;
+            if (!_draftCustomAppPaths.TryGetValue(key, out list) || list == null)
+            {
+                return 0;
+            }
+            int count = 0;
+            for (int i = 0; i < list.Count; i++)
+            {
+                string p = list[i];
+                if (string.IsNullOrEmpty(p)) continue;
+                bool exists = p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    ? File.Exists(p)
+                    : Directory.Exists(p);
+                if (exists)
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private static string FormatSingleAppDetectSummary(string name, int exeCount, int pkgCount, int customCount, bool running)
+        {
+            if (exeCount == 0 && pkgCount == 0 && customCount == 0)
+            {
+                return name + " ✗ 未发现";
+            }
+
+            List<string> parts = new List<string>(3);
+            if (exeCount > 0) parts.Add(exeCount + "程序");
+            if (pkgCount > 0) parts.Add(pkgCount + "MSIX");
+            if (exeCount == 0 && pkgCount == 0 && customCount > 0) parts.Add(customCount + "自定义");
+            string detail = string.Join("+", parts.ToArray());
+            if (running)
+            {
+                detail += "·运行中";
+            }
+            return string.Format("{0} ✓ ({1})", name, detail);
+        }
+
+        private static string BuildAppDetectTooltip(AppPathDiagnostics diag)
+        {
+            StringBuilder sb = new StringBuilder(512);
+            string timeText = diag.ScannedAt != DateTime.MinValue ? diag.ScannedAt.ToString("HH:mm:ss") : "刚刚";
+            sb.AppendFormat("最近自动检测时间: {0}\n", timeText);
+            AppendAppTooltipSection(sb, "Antigravity", diag.AntigravityExes, null, (diag.RunningApps & GuardedAppFlags.Antigravity) != 0);
+            AppendAppTooltipSection(sb, "ChatGPT 桌面端", diag.ChatGptExes, diag.ChatGptPackages, (diag.RunningApps & GuardedAppFlags.ChatGPT) != 0);
+            AppendAppTooltipSection(sb, "Claude 桌面端", diag.ClaudeExes, diag.ClaudePackages, (diag.RunningApps & GuardedAppFlags.Claude) != 0);
+            return sb.ToString().TrimEnd();
+        }
+
+        private static void AppendAppTooltipSection(StringBuilder sb, string title, List<string> exes, List<string> pkgs, bool running)
+        {
+            sb.Append("\n[").Append(title).Append(running ? " · 运行中]" : "]").Append('\n');
+            int shown = 0;
+            if (pkgs != null)
+            {
+                for (int i = 0; i < pkgs.Count; i++)
+                {
+                    sb.Append("  MSIX: ").Append(pkgs[i]).Append('\n');
+                    shown++;
+                }
+            }
+            if (exes != null)
+            {
+                int limit = Math.Min(exes.Count, 5);
+                for (int i = 0; i < limit; i++)
+                {
+                    sb.Append("  ").Append(exes[i]).Append('\n');
+                    shown++;
+                }
+                if (exes.Count > limit)
+                {
+                    sb.AppendFormat("  ... 其余 {0} 个程序（点击「路径管理...」查看全部）\n", exes.Count - limit);
+                }
+            }
+            if (shown == 0)
+            {
+                sb.Append("  (未检测到，可点击「路径管理...」手动添加目录或 .exe)\n");
+            }
+        }
+
+        private void UpdateManagePathsButtonText()
+        {
+            int count = 0;
+            if (_draftCustomAppPaths != null)
+            {
+                foreach (KeyValuePair<string, List<string>> kv in _draftCustomAppPaths)
+                {
+                    if (kv.Value != null)
+                    {
+                        count += kv.Value.Count;
+                    }
+                }
+            }
+            _btnManagePaths.Text = count > 0
+                ? string.Format("路径管理 ({0})...", count)
+                : "路径管理...";
+        }
+
+        private void OnManagePathsClick(object sender, EventArgs e)
+        {
+            using (CustomAppPathsForm dlg = new CustomAppPathsForm(_draftCustomAppPaths, _pathDiagnosticsProvider, Icon))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK && dlg.ResultCustomPaths != null)
+                {
+                    _draftCustomAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                    NodeGuardConfig.CopyNormalizedAppPathMap(dlg.ResultCustomPaths, _draftCustomAppPaths);
+                    UpdateManagePathsButtonText();
+                    UpdatePreview();
+                }
+            }
+            DetectAppsAsync(false);
         }
 
         public NodeGuardConfig BuildDraftConfig()
@@ -9992,6 +14778,9 @@ namespace TunGuard
             draft.WfpEnabled = _chkWfpEnabled.Checked;
             draft.WfpKillOnBlock = _chkWfpKillOnBlock.Checked;
             draft.WfpBlockNonTunDns = _chkWfpBlockNonTunDns.Checked;
+            draft.PopupOnBlock = _chkPopupOnBlock.Checked;
+            draft.LogDirectory = _draftLogDirectory ?? string.Empty;
+            NodeGuardConfig.CopyNormalizedAppPathMap(_draftCustomAppPaths, draft.CustomAppPaths);
             if (_preservedDiscoveredPaths != null)
             {
                 foreach (KeyValuePair<string, List<string>> kv in _preservedDiscoveredPaths)
@@ -10562,6 +15351,48 @@ namespace TunGuard
                 }
             }
 
+            string currentEffectiveLogDir = AppLogger.EffectiveLogDirectory;
+            string targetEffectiveLogDir;
+            string logDirErr;
+            if (!AppLogger.TryValidateWritableDirectory(draft.LogDirectory, out targetEffectiveLogDir, out logDirErr))
+            {
+                MessageBox.Show(
+                    this,
+                    "日志存放目录不可用：\n" + logDirErr,
+                    "配置无效",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+            draft.LogDirectory = AppLogger.PathsEqual(targetEffectiveLogDir, AppLogger.DefaultLogDirectory)
+                ? string.Empty
+                : targetEffectiveLogDir;
+
+            bool logDirChanged = !AppLogger.PathsEqual(currentEffectiveLogDir, targetEffectiveLogDir);
+            bool migrateLogs = false;
+            if (logDirChanged)
+            {
+                int oldCount = AppLogger.CountLogFiles(currentEffectiveLogDir);
+                if (oldCount > 0)
+                {
+                    DialogResult ans = MessageBox.Show(
+                        this,
+                        string.Format(
+                            "日志目录即将从：\n{0}\n修改为：\n{1}\n\n原目录中有 {2} 个历史日志文件，是否一并迁移到新目录？",
+                            currentEffectiveLogDir,
+                            targetEffectiveLogDir,
+                            oldCount),
+                        "迁移历史日志",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+                    if (ans == DialogResult.Cancel)
+                    {
+                        return;
+                    }
+                    migrateLogs = (ans == DialogResult.Yes);
+                }
+            }
+
             try
             {
                 NodeGuardConfigStore.Save(_configPath, draft);
@@ -10577,6 +15408,14 @@ namespace TunGuard
                 return;
             }
 
+            if (logDirChanged)
+            {
+                int unusedMigrated;
+                string unusedEff;
+                string switchErr;
+                AppLogger.SetLogDirectory(draft.LogDirectory, migrateLogs, out unusedMigrated, out unusedEff, out switchErr);
+            }
+
             ResultConfig = draft;
             DialogResult = DialogResult.OK;
             Close();
@@ -10586,6 +15425,7 @@ namespace TunGuard
     internal sealed class TrayApplication : ApplicationContext
     {
         private static readonly long AccessDeniedNotifyCooldownTicks = TimeSpan.FromSeconds(10).Ticks;
+        private static readonly long AlertDismissCooldownTicks = TimeSpan.FromMilliseconds(1500).Ticks;
 
         private readonly SynchronizationContext _uiSync;
         private readonly TunMonitor _monitor;
@@ -10597,6 +15437,7 @@ namespace TunGuard
         private readonly ToolStripMenuItem _nodeRuleItem;
         private readonly ToolStripMenuItem _lastKillItem;
         private readonly ToolStripMenuItem _nodeSettingsItem;
+        private readonly ToolStripMenuItem _logViewerItem;
         private readonly ToolStripMenuItem _guardedAppsMenu;
         private readonly ToolStripMenuItem _guardAntigravityItem;
         private readonly ToolStripMenuItem _guardChatGPTItem;
@@ -10614,10 +15455,15 @@ namespace TunGuard
         private readonly Thread _pingThread;
 
         private NodeSettingsForm _settingsForm;
+        private LogViewerForm _logViewerForm;
+        private GuardAlertForm _alertForm;
         private int _totalKills;
         private int _autoStartRefreshing;
         private int _autoStartToggling;
         private long _lastAccessDeniedNotifyTicks;
+        private long _lastAlertDismissedTicks;
+        private GuardedAppFlags _lastAlertDismissedApps;
+        private GuardedAppFlags _currentAlertApps;
         private volatile bool _disposed;
 
         public TrayApplication(string pingEventName)
@@ -10643,6 +15489,9 @@ namespace TunGuard
             _boldMenuFont = new Font(_nodeSettingsItem.Font, FontStyle.Bold);
             _nodeSettingsItem.Font = _boldMenuFont;
             _nodeSettingsItem.Click += OnNodeSettingsClick;
+
+            _logViewerItem = new ToolStripMenuItem("查看日志...");
+            _logViewerItem.Click += OnLogViewerClick;
 
             _guardAntigravityItem = new ToolStripMenuItem("Antigravity") { Checked = true };
             _guardAntigravityItem.Click += (s, e) => OnToggleGuardedAppClick(GuardedAppFlags.Antigravity);
@@ -10675,6 +15524,7 @@ namespace TunGuard
             _menu.Items.Add(_lastKillItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_nodeSettingsItem);
+            _menu.Items.Add(_logViewerItem);
             _menu.Items.Add(_guardedAppsMenu);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_toggleMonitorItem);
@@ -10698,6 +15548,7 @@ namespace TunGuard
             _monitor.StatusChanged += OnMonitorStatusChanged;
             _monitor.ProcessesKilled += OnProcessesKilled;
             _monitor.WfpBlocked += OnWfpBlocked;
+            _monitor.GuardedAppLaunchedWhileBlocked += OnGuardedAppLaunchedWhileBlocked;
             _monitor.AccessDenied += OnAccessDenied;
             _monitor.NodeConfigChanged += OnNodeConfigChanged;
             _monitor.Start();
@@ -10754,6 +15605,7 @@ namespace TunGuard
                 {
                     break;
                 }
+                AppLogger.Info("APP", "收到重复启动唤醒信号，弹出托盘状态气泡");
                 PostToUi(() => ShowStatusBalloon("Clash TUN 守护已在后台运行"));
             }
         }
@@ -10774,6 +15626,11 @@ namespace TunGuard
                     if (_settingsForm != null && !_settingsForm.IsDisposed)
                     {
                         _settingsForm.SyncGuardedApps(config);
+                        _settingsForm.SyncLogDirectory(config.LogDirectory);
+                    }
+                    if (_logViewerForm != null && !_logViewerForm.IsDisposed)
+                    {
+                        _logViewerForm.SyncLogDirectoryChanged();
                     }
                     UpdateTrayUi(_monitor.CurrentStatus);
                 }
@@ -10816,6 +15673,7 @@ namespace TunGuard
             }
             catch (Exception ex)
             {
+                AppLogger.Error("CONFIG", "通过托盘切换受控应用保存失败: " + ex.Message);
                 _trayIcon.ShowBalloonTip(3000, "保存受控应用设置失败", ex.Message, ToolTipIcon.Error);
                 return;
             }
@@ -10844,6 +15702,28 @@ namespace TunGuard
                 ? ("Clash 节点不匹配 — 已终止 " + killedNames)
                 : ("TUN 已关闭 — 已终止 " + killedNames);
             string detailReason = isNodeTrigger ? status.NodeReason : status.Reason;
+            NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
+
+            GuardAlertPayload alert = new GuardAlertPayload
+            {
+                Title = isNodeTrigger
+                    ? ("未匹配允许节点 — 已拦截 " + killedNames)
+                    : ("TUN 未开启 — 已拦截 " + killedNames),
+                AppNames = killedNames,
+                Reason = detailReason,
+                ActiveChain = isNodeTrigger
+                    ? (!string.IsNullOrEmpty(status.ActiveNodeChain) ? status.ActiveNodeChain : status.ActiveNodeName)
+                    : string.Empty,
+                AllowedNodesText = isNodeTrigger ? FormatAllowedNodesSummary(cfg) : string.Empty,
+                ActionText = string.Format("已终止 {0} 共 {1} 个进程（首轮耗时 {2:F2} ms）", killedNames, result.KilledCount, result.FirstPassMs),
+                HintText = isNodeTrigger
+                    ? "请在 Clash Verge 中切换到允许的节点后，再重新打开该软件。"
+                    : "请在 Clash Verge 中开启 TUN 模式后，再重新打开该软件。",
+                IsSevere = true,
+                IsKillEvent = true,
+                KilledDelta = result.KilledCount,
+                FirstPassMs = result.FirstPassMs
+            };
 
             PostToUi(() =>
             {
@@ -10853,19 +15733,41 @@ namespace TunGuard
                     balloonTitle,
                     string.Format("触发源: {0}\n原因: {1}\n已终止 {2} 共 {3} 个进程，首轮耗时 {4:F2} ms (累计拦截 {5} 次)", trigger, detailReason, killedNames, result.KilledCount, result.FirstPassMs, count),
                     ToolTipIcon.Warning);
+                ShowGuardAlertPopup(alert, result.KilledApps);
             });
         }
 
-        private void OnWfpBlocked(string trigger, TunStatus status)
+        private void OnWfpBlocked(GuardedAppFlags runningApps, string trigger, TunStatus status)
         {
             string timeText = DateTime.Now.ToString("HH:mm:ss");
             bool isNodeTrigger = status.IsTunActive && status.NodeGuardEnabled && !status.IsNodeAllowed;
             NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
-            string appNames = cfg != null ? GuardedAppHelper.FormatNames(cfg.GetGuardedAppFlags()) : "受控应用";
+            string appNames = runningApps != GuardedAppFlags.None
+                ? GuardedAppHelper.FormatNames(runningApps)
+                : (cfg != null ? GuardedAppHelper.FormatNames(cfg.GetGuardedAppFlags()) : "受控应用");
             string title = isNodeTrigger
                 ? "Clash 节点不匹配 — WFP 已断网"
                 : "TUN 已关闭 — WFP 已断网";
             string detailReason = isNodeTrigger ? status.NodeReason : status.Reason;
+
+            GuardAlertPayload alert = new GuardAlertPayload
+            {
+                Title = isNodeTrigger
+                    ? ("未匹配允许节点 — 已阻断 " + appNames + " 联网")
+                    : ("TUN 未开启 — 已阻断 " + appNames + " 联网"),
+                AppNames = appNames,
+                Reason = detailReason,
+                ActiveChain = isNodeTrigger
+                    ? (!string.IsNullOrEmpty(status.ActiveNodeChain) ? status.ActiveNodeChain : status.ActiveNodeName)
+                    : string.Empty,
+                AllowedNodesText = isNodeTrigger ? FormatAllowedNodesSummary(cfg) : string.Empty,
+                ActionText = string.Format("已通过 WFP 内核阻断 {0} 出站联网（进程已保留，不丢失内容）", appNames),
+                HintText = isNodeTrigger
+                    ? "请在 Clash Verge 切换至允许节点，合规后将自动恢复联网。"
+                    : "请在 Clash Verge 开启 TUN 模式，恢复后将自动恢复联网。",
+                IsSevere = true,
+                IsKillEvent = false
+            };
 
             PostToUi(() =>
             {
@@ -10875,6 +15777,53 @@ namespace TunGuard
                     title,
                     string.Format("触发源: {0}\n原因: {1}\n已通过 WFP 内核阻断 {2} 联网（进程保留，恢复合规后自动恢复联网）", trigger, detailReason, appNames),
                     ToolTipIcon.Warning);
+                if (runningApps != GuardedAppFlags.None)
+                {
+                    ShowGuardAlertPopup(alert, runningApps);
+                }
+            });
+        }
+
+        private void OnGuardedAppLaunchedWhileBlocked(GuardedAppFlags launchedApps, TunStatus status)
+        {
+            string timeText = DateTime.Now.ToString("HH:mm:ss");
+            bool isNodeTrigger = status.IsTunActive && status.NodeGuardEnabled && !status.IsNodeAllowed;
+            NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
+            string appNames = GuardedAppHelper.FormatNames(launchedApps);
+            string appShortNames = GuardedAppHelper.FormatShortNames(launchedApps);
+            string detailReason = isNodeTrigger ? status.NodeReason : status.Reason;
+            string balloonTitle = isNodeTrigger
+                ? ("未匹配允许节点 — 已阻断 " + appNames)
+                : ("TUN 未开启 — 已阻断 " + appNames);
+
+            GuardAlertPayload alert = new GuardAlertPayload
+            {
+                Title = isNodeTrigger
+                    ? ("未匹配允许节点 — 已阻断 " + appNames + " 联网")
+                    : ("TUN 未开启 — 已阻断 " + appNames + " 联网"),
+                AppNames = appNames,
+                Reason = detailReason,
+                ActiveChain = isNodeTrigger
+                    ? (!string.IsNullOrEmpty(status.ActiveNodeChain) ? status.ActiveNodeChain : status.ActiveNodeName)
+                    : string.Empty,
+                AllowedNodesText = isNodeTrigger ? FormatAllowedNodesSummary(cfg) : string.Empty,
+                ActionText = string.Format("检测到您打开了 {0}，当前已由 WFP 内核阻断出站联网（进程已保留）", appNames),
+                HintText = isNodeTrigger
+                    ? "请在 Clash Verge 切换至允许节点后即可恢复联网使用。"
+                    : "请在 Clash Verge 开启 TUN 模式后即可恢复联网使用。",
+                IsSevere = true,
+                IsKillEvent = false
+            };
+
+            PostToUi(() =>
+            {
+                _lastKillItem.Text = string.Format("上次拦截: {0} (启动 {1}，WFP 断网)", timeText, appShortNames);
+                _trayIcon.ShowBalloonTip(
+                    2500,
+                    balloonTitle,
+                    string.Format("原因: {0}\n检测到启动 {1}，已由 WFP 内核阻断出站联网。", detailReason, appNames),
+                    ToolTipIcon.Warning);
+                ShowGuardAlertPopup(alert, launchedApps);
             });
         }
 
@@ -10895,6 +15844,19 @@ namespace TunGuard
             string appNames = deniedApps != GuardedAppFlags.None
                 ? GuardedAppHelper.FormatNames(deniedApps)
                 : "受控应用";
+            GuardAlertPayload alert = new GuardAlertPayload
+            {
+                Title = "权限不足 — 无法终止 " + appNames,
+                AppNames = appNames,
+                Reason = string.Format("触发源: {0}，检测到 {1} 个 {2} 进程但无权终止", trigger, deniedCount, appNames),
+                ActiveChain = string.Empty,
+                AllowedNodesText = string.Empty,
+                ActionText = "当前未具备足够权限终止目标高权限进程",
+                HintText = "请关闭后以管理员身份运行 TunGuard，或开启开机自启计划任务。",
+                IsSevere = false,
+                IsKillEvent = false
+            };
+
             PostToUi(() =>
             {
                 _lastKillItem.Text = string.Format("权限不足: {0} ({1}进程无法终止)", timeText, deniedCount);
@@ -10903,7 +15865,98 @@ namespace TunGuard
                     "权限不足 — 无法终止 " + appNames,
                     string.Format("触发源: {0}\n检测到 {1} 个 {2} 进程但无权终止，请以管理员身份运行 TunGuard。", trigger, deniedCount, appNames),
                     ToolTipIcon.Error);
+                ShowGuardAlertPopup(alert, deniedApps);
             });
+        }
+
+        private static string FormatAllowedNodesSummary(NodeGuardConfig cfg)
+        {
+            if (cfg == null || !cfg.Enabled)
+            {
+                return string.Empty;
+            }
+            if (cfg.AllowedNodes == null || cfg.AllowedNodes.Count == 0)
+            {
+                return "未配置任何允许节点";
+            }
+            string modeLabel = string.Equals(cfg.MatchMode, "contains", StringComparison.OrdinalIgnoreCase)
+                ? "关键词"
+                : "精确";
+            int showCount = Math.Min(cfg.AllowedNodes.Count, 3);
+            List<string> preview = new List<string>(showCount);
+            for (int i = 0; i < showCount; i++)
+            {
+                preview.Add(cfg.AllowedNodes[i]);
+            }
+            string joined = string.Join("、", preview.ToArray());
+            if (cfg.AllowedNodes.Count > showCount)
+            {
+                return string.Format("{0} 等 {1} 项 ({2}匹配)", joined, cfg.AllowedNodes.Count, modeLabel);
+            }
+            return string.Format("{0} ({1}匹配)", joined, modeLabel);
+        }
+
+        private void ShowGuardAlertPopup(GuardAlertPayload payload, GuardedAppFlags affectedApps)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
+            if (cfg != null && !cfg.PopupOnBlock)
+            {
+                return;
+            }
+
+            if (_alertForm != null && !_alertForm.IsDisposed)
+            {
+                _currentAlertApps |= affectedApps;
+                _alertForm.ShowOrUpdate(payload, true);
+                return;
+            }
+
+            long nowTicks = DateTime.UtcNow.Ticks;
+            if (nowTicks - _lastAlertDismissedTicks < AlertDismissCooldownTicks &&
+                affectedApps != GuardedAppFlags.None &&
+                (affectedApps & _lastAlertDismissedApps) == affectedApps)
+            {
+                return;
+            }
+
+            GuardAlertForm form = new GuardAlertForm(
+                () => OpenNodeSettingsWindow(),
+                () => OpenLogViewerWindow());
+            _alertForm = form;
+            _currentAlertApps = affectedApps;
+            form.FormClosed += (s, args) =>
+            {
+                if (ReferenceEquals(_alertForm, form))
+                {
+                    if (form.DismissedByUser)
+                    {
+                        _lastAlertDismissedTicks = DateTime.UtcNow.Ticks;
+                        _lastAlertDismissedApps = _currentAlertApps;
+                    }
+                    _alertForm = null;
+                    _currentAlertApps = GuardedAppFlags.None;
+                }
+                form.Dispose();
+            };
+            form.ShowOrUpdate(payload, false);
+        }
+
+        private void CloseGuardAlertPopupIfOpen()
+        {
+            if (_alertForm != null && !_alertForm.IsDisposed)
+            {
+                try
+                {
+                    _alertForm.Close();
+                }
+                catch
+                {
+                }
+            }
         }
 
         private static string TruncateNotifyText(string text)
@@ -10935,6 +15988,7 @@ namespace TunGuard
 
             if (!_monitor.MonitoringEnabled)
             {
+                CloseGuardAlertPopupIfOpen();
                 string detail = !status.IsTunActive
                     ? status.Reason
                     : (status.NodeGuardEnabled ? status.NodeReason : status.Reason);
@@ -10946,6 +16000,7 @@ namespace TunGuard
 
             if (status.IsGuardSafe)
             {
+                CloseGuardAlertPopupIfOpen();
                 _trayIcon.Icon = _iconSafe;
                 string wfpTag = status.WfpActive ? " [WFP]" : string.Empty;
                 if (status.NodeGuardEnabled)
@@ -10982,6 +16037,11 @@ namespace TunGuard
 
         private void OnNodeSettingsClick(object sender, EventArgs e)
         {
+            OpenNodeSettingsWindow();
+        }
+
+        private void OpenNodeSettingsWindow()
+        {
             if (_disposed)
             {
                 return;
@@ -11002,6 +16062,8 @@ namespace TunGuard
                 _monitor.NodeConfigPath,
                 () => _monitor.QueryClashCatalog(),
                 () => _monitor.CurrentStatus,
+                rescan => _monitor.GetAppPathDiagnostics(rescan),
+                () => OpenLogViewerWindow(),
                 _iconSafe);
             _settingsForm = form;
             form.FormClosed += (s, args) =>
@@ -11013,12 +16075,87 @@ namespace TunGuard
                 if (!_disposed && form.DialogResult == DialogResult.OK && form.ResultConfig != null)
                 {
                     _monitor.ApplyNodeGuardConfig(form.ResultConfig);
+                    if (_logViewerForm != null && !_logViewerForm.IsDisposed)
+                    {
+                        _logViewerForm.SyncLogDirectoryChanged();
+                    }
                     UpdateTrayUi(_monitor.CurrentStatus);
                 }
                 form.Dispose();
             };
             form.Show();
             form.Activate();
+        }
+
+        private void OnLogViewerClick(object sender, EventArgs e)
+        {
+            OpenLogViewerWindow();
+        }
+
+        private void OpenLogViewerWindow()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            if (_logViewerForm != null && !_logViewerForm.IsDisposed)
+            {
+                if (_logViewerForm.WindowState == FormWindowState.Minimized)
+                {
+                    _logViewerForm.WindowState = FormWindowState.Normal;
+                }
+                _logViewerForm.Activate();
+                _logViewerForm.BringToFront();
+                return;
+            }
+
+            LogViewerForm form = new LogViewerForm(HandleLogDirectoryChangeFromViewer, _iconSafe);
+            _logViewerForm = form;
+            form.FormClosed += (s, args) =>
+            {
+                if (ReferenceEquals(_logViewerForm, form))
+                {
+                    _logViewerForm = null;
+                }
+                form.Dispose();
+            };
+            form.Show();
+            form.Activate();
+        }
+
+        private bool HandleLogDirectoryChangeFromViewer(
+            string newConfiguredDir,
+            bool migrateExisting,
+            out int migratedCount,
+            out string effectiveDir,
+            out string error)
+        {
+            if (!AppLogger.SetLogDirectory(newConfiguredDir, migrateExisting, out migratedCount, out effectiveDir, out error))
+            {
+                return false;
+            }
+
+            NodeGuardConfig current = _monitor.CurrentNodeConfig ?? new NodeGuardConfig();
+            NodeGuardConfig next = current.CloneNormalized();
+            next.LogDirectory = AppLogger.IsUsingDefaultDirectory ? string.Empty : effectiveDir;
+
+            try
+            {
+                NodeGuardConfigStore.Save(_monitor.NodeConfigPath, next);
+            }
+            catch (Exception ex)
+            {
+                error = "目录已切换，但写入配置文件失败: " + ex.Message;
+                AppLogger.Error("CONFIG", error);
+                return false;
+            }
+
+            _monitor.ApplyNodeGuardConfig(next);
+            if (_settingsForm != null && !_settingsForm.IsDisposed)
+            {
+                _settingsForm.SyncLogDirectory(next.LogDirectory);
+            }
+            return true;
         }
 
         private void OnTrayDoubleClick(object sender, EventArgs e)
@@ -11104,6 +16241,14 @@ namespace TunGuard
                 {
                     bool ok = StartupManager.SetAutoStart(target);
                     bool actual = StartupManager.IsAutoStartEnabled();
+                    if (ok)
+                    {
+                        AppLogger.Info("STARTUP", target ? "已开启开机自动启动计划任务" : "已关闭开机自动启动计划任务");
+                    }
+                    else
+                    {
+                        AppLogger.Error("STARTUP", (target ? "开启" : "关闭") + "开机自动启动失败（可能缺少管理员权限）");
+                    }
                     PostToUi(() =>
                     {
                         _autoStartItem.Checked = actual;
@@ -11123,6 +16268,7 @@ namespace TunGuard
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
+            AppLogger.Info("APP", "收到系统关机/注销事件，正在退出 TunGuard");
             if (SynchronizationContext.Current == _uiSync)
             {
                 ExitCleanly();
@@ -11135,6 +16281,7 @@ namespace TunGuard
 
         private void OnExitClick(object sender, EventArgs e)
         {
+            AppLogger.Info("APP", "用户点击退出 TunGuard");
             ExitCleanly();
         }
 
@@ -11177,6 +16324,32 @@ namespace TunGuard
                     _pingStop.Set();
                     _monitor.Dispose();
 
+                    if (_alertForm != null && !_alertForm.IsDisposed)
+                    {
+                        try
+                        {
+                            _alertForm.Close();
+                            _alertForm.Dispose();
+                        }
+                        catch
+                        {
+                        }
+                        _alertForm = null;
+                    }
+
+                    if (_logViewerForm != null && !_logViewerForm.IsDisposed)
+                    {
+                        try
+                        {
+                            _logViewerForm.Close();
+                            _logViewerForm.Dispose();
+                        }
+                        catch
+                        {
+                        }
+                        _logViewerForm = null;
+                    }
+
                     if (_settingsForm != null && !_settingsForm.IsDisposed)
                     {
                         try
@@ -11189,6 +16362,9 @@ namespace TunGuard
                         }
                         _settingsForm = null;
                     }
+
+                    AppLogger.Info("APP", "TunGuard 资源已清理完毕，退出运行");
+                    AppLogger.Shutdown();
 
                     bool pingExited = true;
                     if (_pingThread != null && _pingThread.IsAlive)

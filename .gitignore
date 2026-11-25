@@ -6,3 +6,5 @@ TunGuard.config.json
 *.ico
 *.pdb
 *.lnk
+logs/
+*.log
