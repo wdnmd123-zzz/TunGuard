@@ -13,11 +13,11 @@
 
 ## 核心亮点
 
-- **零外部依赖 · 单文件 ~210 KB**：纯 C# + Win32 P/Invoke（`iphlpapi.dll` / `fwpuclnt.dll` / `userenv.dll`），直接利用 Windows 内置 `.NET Framework 4.x`（`csc.exe`）编译为单个原生 x64 可执行文件。
+- **零外部依赖 · 单文件 ~236 KB**：纯 C# + Win32 P/Invoke（`iphlpapi.dll` / `fwpuclnt.dll` / `userenv.dll`），直接利用 Windows 内置 `.NET Framework 4.x`（`csc.exe`）编译为单个原生 x64 可执行文件。
 - **内核级零漏包兜底（WFP）**：在 Windows 内核 `ALE_AUTH_CONNECT`（IPv4 + IPv6）层常驻受控应用出站规则——仅放行 TUN 虚拟网卡与 Loopback，TUN 掉线瞬间**零时间窗**丢弃物理网卡直连流量；支持**纯内核断网保留进程**或**内核断网 + 强杀双重兜底**。
 - **免配置直连 Clash 内核**：自动探测并复用 Clash Verge 的 Windows Named Pipe（`\\.\pipe\verge-mihomo-*`），**无需开启外部 HTTP 控制器**即可读取实时节点链路（支持自动回退 TCP 外部控制器）。
 - **极低后台开销**：事件驱动 + HTTP/1.1 Keep-Alive 单组定向查询 + 零反射轻量 JSON 提取，单次节点巡检 `< 0.5 ms`。
-- **开箱即用 · 完整可视化管理**：提供受控应用自动识别与自定义路径管理、全订阅节点左右穿梭框、屏幕置顶拦截提醒卡片、异步日志系统与分级日志查看器。
+- **开箱即用 · 完整可视化管理与一键更新**：提供受控应用自动识别与自定义路径管理、全订阅节点左右穿梭框、屏幕置顶拦截提醒卡片、异步分级日志查看器，以及内置 GitHub Releases 检查更新与 SHA-256 校验一键原地升级。
 
 ---
 
@@ -27,7 +27,7 @@
   <img src="docs/control-panel.png" alt="TunGuard 控制面板运行截图" width="820" />
 </p>
 
-> 控制面板集中提供受控应用自动检测与路径管理、WFP 内核策略开关、置顶弹窗与日志目录配置，以及按订阅筛选的节点穿梭框与保存前实时命中预览。
+> 控制面板集中提供受控应用自动检测与路径管理、WFP 内核策略开关、置顶弹窗与日志目录配置、按订阅筛选的节点穿梭框与保存前实时命中预览，以及底部的 GitHub 仓库入口、版本检测与一键更新。
 
 ---
 
@@ -123,7 +123,15 @@ TunGuard 支持三种防护执行模式，可在控制面板随时切换：
 | **红色** | 已拦截 | TUN 未开启或当前节点不匹配，已通过 WFP 内核阻断出站（及按配置终止受控进程） |
 | **灰色** | 已暂停 | 已临时暂停监控与拦截，自动清空 WFP 内核规则并跳过节点轮询 |
 
-### 5. 单实例保护 & 原生开机自启
+### 5. 内置版本检测与一键安全自更新
+
+控制面板底部栏内置 GitHub 图标直达仓库主页、当前版本展示与在线更新能力：
+
+- **双通道版本检测**：打开控制面板时后台静默检测更新（内置 `10 min` 缓存），也可点击 **「检查更新」** 强制刷新；优先请求 GitHub Releases API，遇到接口限流（HTTP `403 / 429`）或异常时自动回退至 `releases/latest` 重定向 `HEAD` 解析。
+- **完整校验链与可取消下载**：发现新版本后展示绿色 **「一键更新 vX.Y.Z」** 按钮与变更摘要；下载前预检目录写权限、实时反馈进度并支持中途取消，下载完成后依次通过**文件体积核对 → PE 头 (`MZ`) 校验 → `SHA256SUMS.txt` SHA-256 哈希验证**。
+- **原位热替换与失败自动回滚**：将运行中的旧版备份为 `.old` 后把已校验的新版本移入原路径（替换失败自动回滚旧版，绝不丢失程序文件），随后干净释放单实例互斥锁与 WFP 动态会话并自动重启新版本，启动后后台异步清理残留的 `.old*` / `.new*` 临时文件；若因网络或权限受限更新失败，可一键打开 GitHub Releases 页面手动下载。
+
+### 6. 单实例保护 & 原生开机自启
 
 - **单实例互斥锁**：重复启动不会多开后台进程，而是唤醒已有实例通过托盘气泡展示当前守护与 WFP 内核状态。
 - **原生 Task Scheduler 2.0 COM 自启**：右键勾选 **「开机自动启动」**，直接通过 `Schedule.Service` COM API 注册计划任务 `ClashTunGuard`（`<RunLevel>HighestAvailable</RunLevel>` 自动提权激活 WFP、支持电池供电、无 72 小时超时限制、不拉起隐藏 `schtasks.exe`）。
@@ -141,7 +149,7 @@ TunGuard 支持三种防护执行模式，可在控制面板随时切换：
 
 ### 1. 获取程序（下载 Release 或本地编译）
 
-- **方式一（推荐）**：直接前往 [GitHub Releases](https://github.com/wdnmd123-zzz/TunGuard/releases) 下载最新构建的 `TunGuard.exe`（或 `TunGuard-vX.Y.Z-win-x64.zip`）与 `SHA256SUMS.txt`；每次推送源码更新到 `main` 分支都会由 GitHub Actions 自动构建并发布新版本。
+- **方式一（推荐）**：直接前往 [GitHub Releases](https://github.com/wdnmd123-zzz/TunGuard/releases) 下载最新构建的 `TunGuard.exe`（或 `TunGuard-vX.Y.Z-win-x64.zip`）与 `SHA256SUMS.txt`；每次推送源码更新到 `main` 分支都会由 GitHub Actions 自动构建并发布新版本。后续升级可直接在控制面板左下角点击 **「检查更新」 → 「一键更新」** 自动完成校验替换与重启。
 - **方式二（本地编译）**：在项目根目录运行：
 
 ```powershell
@@ -277,7 +285,7 @@ Select-String -Path .\wfp_filters.xml -Pattern "TunGuard WFP Kill Switch"
 
 | 文件 / 目录 | 说明 |
 | --- | --- |
-| [`TunGuard.cs`](TunGuard.cs) | 完整单文件源码（WFP 内核 Kill Switch、三层应用路径与 MSIX 包解析器、四重 TUN 监测、Mihomo Keep-Alive IPC 客户端、全订阅解析器、Win32 毫秒级进程守护、置顶拦截弹窗、异步日志与查看器、Task Scheduler COM 自启管理、系统托盘与控制面板 UI） |
+| [`TunGuard.cs`](TunGuard.cs) | 完整单文件源码（WFP 内核 Kill Switch、三层应用路径与 MSIX 包解析器、四重 TUN 监测、Mihomo Keep-Alive IPC 客户端、全订阅解析器、Win32 毫秒级进程守护、置顶拦截弹窗、异步日志与查看器、GitHub 在线检测与 SHA-256 一键自更新、Task Scheduler COM 自启管理、系统托盘与控制面板 UI） |
 | [`build.ps1`](build.ps1) | 生成盾牌图标 `TunGuard.ico` 并调用 `csc.exe` 编译 `TunGuard.exe` 的构建脚本 |
 | [`app.manifest`](app.manifest) | Windows 应用程序清单（`highestAvailable` 权限与 Per-Monitor V2 DPI 感知） |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | GitHub Actions 自动构建、版本递增与 Release 发布工作流（附带 `SHA256SUMS.txt`） |
