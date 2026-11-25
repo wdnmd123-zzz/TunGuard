@@ -45,6 +45,7 @@ namespace TunGuard
             try
             {
                 AppUpdater.CleanupStaleUpdateFilesAsync();
+                TargetProcessKiller.TryEnableDebugPrivilege();
 
                 try
                 {
@@ -5121,7 +5122,36 @@ namespace TunGuard
         private const uint TH32CS_SNAPPROCESS = 0x00000002;
         private const uint PROCESS_TERMINATE = 0x0001;
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const uint SYNCHRONIZE = 0x00100000;
+        private const uint STILL_ACTIVE = 259;
+        private const uint WAIT_OBJECT_0 = 0x00000000;
+        private const uint TERMINATING_WAIT_MS = 150;
         private const int ERROR_ACCESS_DENIED = 5;
+        private const int ERROR_INVALID_PARAMETER = 87;
+        private const uint TOKEN_QUERY = 0x0008;
+        private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+        private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID_AND_ATTRIBUTES
+        {
+            public LUID Luid;
+            public uint Attributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TOKEN_PRIVILEGES
+        {
+            public uint PrivilegeCount;
+            public LUID_AND_ATTRIBUTES Privileges;
+        }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct PROCESSENTRY32W
@@ -5138,6 +5168,9 @@ namespace TunGuard
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
             public string szExeFile;
         }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
@@ -5160,6 +5193,12 @@ namespace TunGuard
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool QueryFullProcessImageNameW(
             IntPtr hProcess,
@@ -5170,7 +5209,153 @@ namespace TunGuard
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool LookupPrivilegeValueW(string lpSystemName, string lpName, out LUID lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(
+            IntPtr TokenHandle,
+            bool DisableAllPrivileges,
+            ref TOKEN_PRIVILEGES NewState,
+            uint BufferLength,
+            IntPtr PreviousState,
+            IntPtr ReturnLength);
+
         private static readonly uint SelfPid = (uint)Process.GetCurrentProcess().Id;
+
+        internal static bool TryEnableDebugPrivilege()
+        {
+            IntPtr hToken = IntPtr.Zero;
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out hToken) ||
+                    hToken == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                LUID luid;
+                if (!LookupPrivilegeValueW(null, "SeDebugPrivilege", out luid))
+                {
+                    return false;
+                }
+
+                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES
+                {
+                    PrivilegeCount = 1,
+                    Privileges = new LUID_AND_ATTRIBUTES
+                    {
+                        Luid = luid,
+                        Attributes = SE_PRIVILEGE_ENABLED
+                    }
+                };
+
+                if (!AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+                {
+                    return false;
+                }
+
+                return Marshal.GetLastWin32Error() == 0;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (hToken != IntPtr.Zero)
+                {
+                    CloseHandle(hToken);
+                }
+            }
+        }
+
+        internal static bool IsCurrentProcessElevated()
+        {
+            try
+            {
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                {
+                    if (identity == null)
+                    {
+                        return false;
+                    }
+                    WindowsPrincipal principal = new WindowsPrincipal(identity);
+                    return principal.IsInRole(WindowsBuiltInRole.Administrator);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsProcessHandleExited(IntPtr hQuery)
+        {
+            if (hQuery == IntPtr.Zero)
+            {
+                return false;
+            }
+            uint exitCode;
+            return GetExitCodeProcess(hQuery, out exitCode) && exitCode != STILL_ACTIVE;
+        }
+
+        private static bool IsProcessExitedOrTerminating(uint pid, IntPtr hQuery, bool allowShortWait)
+        {
+            if (IsProcessHandleExited(hQuery))
+            {
+                return true;
+            }
+
+            if (allowShortWait)
+            {
+                IntPtr hSync = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hSync != IntPtr.Zero)
+                {
+                    try
+                    {
+                        if (WaitForSingleObject(hSync, TERMINATING_WAIT_MS) == WAIT_OBJECT_0)
+                        {
+                            return true;
+                        }
+                        return IsProcessHandleExited(hSync);
+                    }
+                    finally
+                    {
+                        CloseHandle(hSync);
+                    }
+                }
+                if (Marshal.GetLastWin32Error() == ERROR_INVALID_PARAMETER)
+                {
+                    return true;
+                }
+            }
+
+            if (hQuery == IntPtr.Zero)
+            {
+                IntPtr hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hCheck != IntPtr.Zero)
+                {
+                    try
+                    {
+                        return IsProcessHandleExited(hCheck);
+                    }
+                    finally
+                    {
+                        CloseHandle(hCheck);
+                    }
+                }
+                if (Marshal.GetLastWin32Error() == ERROR_INVALID_PARAMETER)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         // Reusable buffers (used exclusively by the single TunMonitor evaluation thread)
         private readonly StringBuilder _pathBuf = new StringBuilder(2048);
@@ -5832,14 +6017,12 @@ namespace TunGuard
             {
                 if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
                 {
-                    accessDenied++;
-                    deniedApps |= appFlag;
-                    if (MatchedImagePathCallback != null)
+                    IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                    if (hQuery != IntPtr.Zero)
                     {
-                        IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-                        if (hQuery != IntPtr.Zero)
+                        try
                         {
-                            try
+                            if (MatchedImagePathCallback != null)
                             {
                                 string deniedPath = QueryImagePath(hQuery);
                                 if (deniedPath != null)
@@ -5847,11 +6030,21 @@ namespace TunGuard
                                     NotifyMatchedImagePath(deniedPath);
                                 }
                             }
-                            finally
+                            if (!IsProcessHandleExited(hQuery))
                             {
-                                CloseHandle(hQuery);
+                                accessDenied++;
+                                deniedApps |= appFlag;
                             }
                         }
+                        finally
+                        {
+                            CloseHandle(hQuery);
+                        }
+                    }
+                    else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                    {
+                        accessDenied++;
+                        deniedApps |= appFlag;
                     }
                 }
                 return;
@@ -5864,7 +6057,8 @@ namespace TunGuard
                     killed++;
                     killedApps |= appFlag;
                 }
-                else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED &&
+                         !IsProcessExitedOrTerminating(pid, canQuery ? hProc : IntPtr.Zero, true))
                 {
                     accessDenied++;
                     deniedApps |= appFlag;
@@ -5916,7 +6110,8 @@ namespace TunGuard
                             killed++;
                             killedApps |= matched;
                         }
-                        else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                        else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED &&
+                                 !IsProcessExitedOrTerminating(pid, hProc, true))
                         {
                             accessDenied++;
                             deniedApps |= matched;
@@ -5948,9 +6143,12 @@ namespace TunGuard
                             GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps, rules);
                             if (matched != GuardedAppFlags.None)
                             {
-                                accessDenied++;
-                                deniedApps |= matched;
                                 NotifyMatchedImagePath(fullPath);
+                                if (!IsProcessHandleExited(hQuery))
+                                {
+                                    accessDenied++;
+                                    deniedApps |= matched;
+                                }
                             }
                             else
                             {
@@ -10034,10 +10232,13 @@ namespace TunGuard
                     AppLogger.Error(
                         "GUARD",
                         string.Format(
-                            "权限不足无法终止进程 [{0}] | 应用: {1} ({2} 个进程，请以管理员身份运行)",
+                            "权限不足无法终止进程 [{0}] | 应用: {1} ({2} 个进程，{3})",
                             triggerSource,
                             GuardedAppHelper.FormatNames(killRes.DeniedApps),
-                            killRes.AccessDeniedCount));
+                            killRes.AccessDeniedCount,
+                            TargetProcessKiller.IsCurrentProcessElevated()
+                                ? "当前已为管理员权限，目标可能受系统/服务保护"
+                                : "请以管理员身份运行"));
                 }
 
                 Action<int, GuardedAppFlags, string> deniedHandler = AccessDenied;
@@ -12876,7 +13077,6 @@ namespace TunGuard
 
     internal sealed class GuardAlertForm : Form
     {
-        private const int AutoCloseSeconds = 10;
         private const int CS_DROPSHADOW = 0x00020000;
         private const int WS_EX_TOPMOST = 0x00000008;
         private const int WS_EX_TOOLWINDOW = 0x00000080;
@@ -12909,7 +13109,6 @@ namespace TunGuard
         private readonly Font _boldLabelFont;
         private readonly Font _hintFont;
         private readonly Font _closeXFont;
-        private readonly System.Windows.Forms.Timer _countdownTimer;
 
         private readonly Panel _badgePanel;
         private readonly Label _lblTitle;
@@ -12926,7 +13125,6 @@ namespace TunGuard
         private readonly Button _btnAck;
 
         private Color _accentColor = Color.FromArgb(220, 38, 38);
-        private int _remainingSeconds = AutoCloseSeconds;
         private int _burstKilledTotal;
         private bool _positionedOnce;
         private bool _dismissedByUser;
@@ -13165,7 +13363,7 @@ namespace TunGuard
 
             _btnAck = new Button
             {
-                Text = "知道了 (10s)",
+                Text = "确认",
                 AutoSize = true,
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(220, 38, 38),
@@ -13191,9 +13389,6 @@ namespace TunGuard
                     DismissByUser();
                 }
             };
-
-            _countdownTimer = new System.Windows.Forms.Timer { Interval = 1000 };
-            _countdownTimer.Tick += OnCountdownTick;
         }
 
         private Label CreateCaptionLabel(string text)
@@ -13313,11 +13508,6 @@ namespace TunGuard
 
             _lblHint.Text = payload.HintText ?? string.Empty;
 
-            _remainingSeconds = AutoCloseSeconds;
-            UpdateAckButtonText();
-            _countdownTimer.Stop();
-            _countdownTimer.Start();
-
             PerformLayout();
             _badgePanel.Invalidate();
             Invalidate();
@@ -13355,37 +13545,9 @@ namespace TunGuard
             }
         }
 
-        private void OnCountdownTick(object sender, EventArgs e)
-        {
-            if (IsDisposed || !Visible)
-            {
-                _countdownTimer.Stop();
-                return;
-            }
-            // Pause auto-close while cursor is hovering over the popup
-            if (Bounds.Contains(Cursor.Position))
-            {
-                return;
-            }
-            _remainingSeconds--;
-            if (_remainingSeconds <= 0)
-            {
-                _countdownTimer.Stop();
-                Close();
-                return;
-            }
-            UpdateAckButtonText();
-        }
-
-        private void UpdateAckButtonText()
-        {
-            _btnAck.Text = string.Format("知道了 ({0}s)", _remainingSeconds);
-        }
-
         private void DismissByUser()
         {
             _dismissedByUser = true;
-            _countdownTimer.Stop();
             Close();
         }
 
@@ -13393,11 +13555,6 @@ namespace TunGuard
         {
             if (disposing)
             {
-                if (_countdownTimer != null)
-                {
-                    _countdownTimer.Stop();
-                    _countdownTimer.Dispose();
-                }
                 if (_titleFont != null) _titleFont.Dispose();
                 if (_boldLabelFont != null) _boldLabelFont.Dispose();
                 if (_hintFont != null) _hintFont.Dispose();
@@ -17706,6 +17863,7 @@ namespace TunGuard
             string appNames = deniedApps != GuardedAppFlags.None
                 ? GuardedAppHelper.FormatNames(deniedApps)
                 : "受控应用";
+            bool isElevated = TargetProcessKiller.IsCurrentProcessElevated();
             GuardAlertPayload alert = new GuardAlertPayload
             {
                 Title = "权限不足 — 无法终止 " + appNames,
@@ -17713,8 +17871,12 @@ namespace TunGuard
                 Reason = string.Format("触发源: {0}，检测到 {1} 个 {2} 进程但无权终止", trigger, deniedCount, appNames),
                 ActiveChain = string.Empty,
                 AllowedNodesText = string.Empty,
-                ActionText = "当前未具备足够权限终止目标高权限进程",
-                HintText = "请关闭后以管理员身份运行 TunGuard，或开启开机自启计划任务。",
+                ActionText = isElevated
+                    ? "当前已以管理员身份运行，但目标进程受系统保护无法终止"
+                    : "当前未具备足够权限终止目标高权限进程",
+                HintText = isElevated
+                    ? "目标进程可能受系统保护或由受保护服务托管；WFP 内核断网仍可拦截其联网。"
+                    : "请关闭后以管理员身份运行 TunGuard，或开启开机自启计划任务。",
                 IsSevere = false,
                 IsKillEvent = false
             };
@@ -17725,7 +17887,13 @@ namespace TunGuard
                 _trayIcon.ShowBalloonTip(
                     3000,
                     "权限不足 — 无法终止 " + appNames,
-                    string.Format("触发源: {0}\n检测到 {1} 个 {2} 进程但无权终止，请以管理员身份运行 TunGuard。", trigger, deniedCount, appNames),
+                    string.Format(
+                        isElevated
+                            ? "触发源: {0}\n检测到 {1} 个 {2} 进程受系统保护无法终止（已启用管理员权限）。"
+                            : "触发源: {0}\n检测到 {1} 个 {2} 进程但无权终止，请以管理员身份运行 TunGuard。",
+                        trigger,
+                        deniedCount,
+                        appNames),
                     ToolTipIcon.Error);
                 ShowGuardAlertPopup(alert, deniedApps);
             });
