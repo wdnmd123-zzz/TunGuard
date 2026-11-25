@@ -5,10 +5,12 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.IO.Pipes;
+using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -28,6 +30,7 @@ namespace TunGuard
     {
         private const string MutexName = "Local\\ClashVergeTunGuard_SingleInstance_v1";
         private const string PingEventName = "Local\\ClashVergeTunGuard_Ping_v1";
+        internal static volatile string PendingRestartExePath;
 
         [STAThread]
         private static void Main()
@@ -39,8 +42,10 @@ namespace TunGuard
                 return;
             }
 
-            using (mutex)
+            try
             {
+                AppUpdater.CleanupStaleUpdateFilesAsync();
+
                 try
                 {
                     Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
@@ -64,6 +69,23 @@ namespace TunGuard
                 {
                     AppLogger.Shutdown();
                 }
+            }
+            finally
+            {
+                try
+                {
+                    mutex.ReleaseMutex();
+                }
+                catch
+                {
+                }
+                mutex.Dispose();
+            }
+
+            string restartPath = PendingRestartExePath;
+            if (!string.IsNullOrEmpty(restartPath))
+            {
+                AppUpdater.LaunchRestartedProcess(restartPath);
             }
         }
 
@@ -11492,6 +11514,1349 @@ namespace TunGuard
                 }
             }
         }
+
+        public static void DrawGitHubMark(Graphics g, float x, float y, float size, Color color)
+        {
+            if (g == null || size <= 0f)
+            {
+                return;
+            }
+
+            GraphicsState state = g.Save();
+            try
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TranslateTransform(x, y);
+                float scale = size / 16f;
+                g.ScaleTransform(scale, scale);
+
+                using (GraphicsPath path = CreateGitHubMarkPath())
+                using (SolidBrush brush = new SolidBrush(color))
+                {
+                    g.FillPath(brush, path);
+                }
+            }
+            finally
+            {
+                g.Restore(state);
+            }
+        }
+
+        private static GraphicsPath CreateGitHubMarkPath()
+        {
+            // Official 16x16 GitHub Octocat mark contour
+            GraphicsPath path = new GraphicsPath();
+            path.AddArc(0f, 0f, 16f, 16f, -90f, 161.43f);
+            path.AddBezier(10.55f, 15.59f, 10.15f, 15.67f, 10.00f, 15.42f, 10.00f, 15.21f);
+            path.AddBezier(10.00f, 15.21f, 10.00f, 14.94f, 10.01f, 14.08f, 10.01f, 13.01f);
+            path.AddBezier(10.01f, 13.01f, 10.01f, 12.26f, 9.76f, 11.78f, 9.47f, 11.53f);
+            path.AddBezier(9.47f, 11.53f, 11.25f, 11.33f, 13.12f, 10.65f, 13.12f, 7.58f);
+            path.AddBezier(13.12f, 7.58f, 13.12f, 6.70f, 12.81f, 5.99f, 12.30f, 5.43f);
+            path.AddBezier(12.30f, 5.43f, 12.38f, 5.23f, 12.66f, 4.41f, 12.22f, 3.31f);
+            path.AddBezier(12.22f, 3.31f, 12.22f, 3.31f, 11.55f, 3.09f, 10.02f, 4.13f);
+            path.AddBezier(10.02f, 4.13f, 9.38f, 3.95f, 8.70f, 3.86f, 8.02f, 3.86f);
+            path.AddBezier(8.02f, 3.86f, 7.34f, 3.86f, 6.66f, 3.95f, 6.02f, 4.13f);
+            path.AddBezier(6.02f, 4.13f, 4.49f, 3.10f, 3.82f, 3.31f, 3.82f, 3.31f);
+            path.AddBezier(3.82f, 3.31f, 3.38f, 4.41f, 3.66f, 5.23f, 3.74f, 5.43f);
+            path.AddBezier(3.74f, 5.43f, 3.23f, 5.99f, 2.92f, 6.71f, 2.92f, 7.58f);
+            path.AddBezier(2.92f, 7.58f, 2.92f, 10.64f, 4.78f, 11.33f, 6.56f, 11.53f);
+            path.AddBezier(6.56f, 11.53f, 6.33f, 11.73f, 6.12f, 12.08f, 6.05f, 12.60f);
+            path.AddBezier(6.05f, 12.60f, 5.59f, 12.81f, 4.44f, 13.15f, 3.72f, 11.94f);
+            path.AddBezier(3.72f, 11.94f, 3.57f, 11.70f, 3.12f, 11.11f, 2.49f, 11.12f);
+            path.AddBezier(2.49f, 11.12f, 1.82f, 11.13f, 2.22f, 11.50f, 2.50f, 11.65f);
+            path.AddBezier(2.50f, 11.65f, 2.84f, 11.84f, 3.23f, 12.55f, 3.32f, 12.78f);
+            path.AddBezier(3.32f, 12.78f, 3.48f, 13.23f, 4.00f, 14.09f, 6.01f, 13.72f);
+            path.AddBezier(6.01f, 13.72f, 6.01f, 14.39f, 6.02f, 15.02f, 6.02f, 15.21f);
+            path.AddBezier(6.02f, 15.21f, 6.02f, 15.42f, 5.87f, 15.66f, 5.47f, 15.59f);
+            path.AddArc(0f, 0f, 16f, 16f, 108.57f, 161.43f);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    internal sealed class GitHubIconButton : Control
+    {
+        private bool _hovered;
+        private bool _pressed;
+
+        public GitHubIconButton()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw |
+                ControlStyles.UserPaint |
+                ControlStyles.Selectable |
+                ControlStyles.SupportsTransparentBackColor,
+                true);
+            BackColor = Color.Transparent;
+            Cursor = Cursors.Hand;
+            TabStop = true;
+            AccessibleName = "GitHub";
+            Size = new Size(28, 26);
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            _hovered = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            _hovered = false;
+            _pressed = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left)
+            {
+                _pressed = true;
+                Focus();
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (_pressed)
+            {
+                _pressed = false;
+                Invalidate();
+            }
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter)
+            {
+                e.Handled = true;
+                OnClick(EventArgs.Empty);
+            }
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            if (_pressed || _hovered)
+            {
+                Color bg = _pressed
+                    ? Color.FromArgb(203, 213, 225)
+                    : Color.FromArgb(226, 232, 240);
+                using (GraphicsPath pill = CreateRoundedRectPath(1f, 1f, Width - 3f, Height - 3f, 5f))
+                using (SolidBrush brush = new SolidBrush(bg))
+                {
+                    g.FillPath(brush, pill);
+                }
+            }
+
+            if (Focused)
+            {
+                using (GraphicsPath focusRect = CreateRoundedRectPath(1f, 1f, Width - 3f, Height - 3f, 5f))
+                using (Pen pen = new Pen(Color.FromArgb(148, 163, 184), 1f))
+                {
+                    g.DrawPath(pen, focusRect);
+                }
+            }
+
+            float iconSize = Math.Max(15f, Math.Min(Width, Height) * 0.68f);
+            float ix = (Width - iconSize) * 0.5f;
+            float iy = (Height - iconSize) * 0.5f;
+            Color iconColor = (_hovered || _pressed)
+                ? Color.FromArgb(15, 23, 42)
+                : Color.FromArgb(51, 65, 85);
+            TrayIconFactory.DrawGitHubMark(g, ix, iy, iconSize, iconColor);
+        }
+
+        private static GraphicsPath CreateRoundedRectPath(float x, float y, float w, float h, float r)
+        {
+            GraphicsPath gp = new GraphicsPath();
+            float d = r * 2f;
+            if (w <= d || h <= d)
+            {
+                gp.AddRectangle(new RectangleF(x, y, Math.Max(1f, w), Math.Max(1f, h)));
+                return gp;
+            }
+            gp.AddArc(x, y, d, d, 180f, 90f);
+            gp.AddArc(x + w - d, y, d, d, 270f, 90f);
+            gp.AddArc(x + w - d, y + h - d, d, d, 0f, 90f);
+            gp.AddArc(x, y + h - d, d, d, 90f, 90f);
+            gp.CloseFigure();
+            return gp;
+        }
+    }
+
+    internal sealed class UpdateCheckResult
+    {
+        public bool Success;
+        public bool HasUpdate;
+        public Version CurrentVersion;
+        public Version LatestVersion;
+        public string LatestTag;
+        public string ReleasePageUrl;
+        public string DownloadUrl;
+        public string ChecksumUrl;
+        public bool ChecksumAssetPresent;
+        public long ExpectedSize;
+        public string ReleaseNotes;
+        public string ErrorMessage;
+        public bool UsedRedirectFallback;
+    }
+
+    internal static class AppUpdater
+    {
+        public const string RepoOwner = "wdnmd123-zzz";
+        public const string RepoName = "TunGuard";
+        public const string RepoUrl = "https://github.com/wdnmd123-zzz/TunGuard";
+        public const string ReleasesUrl = "https://github.com/wdnmd123-zzz/TunGuard/releases";
+
+        private const string LatestReleaseApiUrl = "https://api.github.com/repos/wdnmd123-zzz/TunGuard/releases/latest";
+        private const string LatestReleaseWebUrl = "https://github.com/wdnmd123-zzz/TunGuard/releases/latest";
+        private const string ReleaseAssetExeName = "TunGuard.exe";
+        private const string ReleaseAssetChecksumName = "SHA256SUMS.txt";
+        private const int ApiTimeoutMs = 10000;
+        private const int DownloadTimeoutMs = 20000;
+        private const long MinValidExeBytes = 16 * 1024;
+        private const long MaxValidExeBytes = 64 * 1024 * 1024;
+        private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
+
+        private static readonly object CacheLock = new object();
+        private static UpdateCheckResult _cachedResult;
+        private static DateTime _cachedAtUtc = DateTime.MinValue;
+        private static int _tlsInitialized;
+
+        public static Version GetCurrentVersion()
+        {
+            try
+            {
+                Version v = Assembly.GetExecutingAssembly().GetName().Version;
+                if (v != null)
+                {
+                    return new Version(
+                        Math.Max(0, v.Major),
+                        Math.Max(0, v.Minor),
+                        Math.Max(0, v.Build));
+                }
+            }
+            catch
+            {
+            }
+            return new Version(1, 0, 0);
+        }
+
+        public static string GetCurrentVersionText()
+        {
+            Version v = GetCurrentVersion();
+            return string.Format("v{0}.{1}.{2}", v.Major, v.Minor, v.Build);
+        }
+
+        public static string GetCurrentExecutablePath()
+        {
+            try
+            {
+                string path = Application.ExecutablePath;
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    return Path.GetFullPath(path);
+                }
+            }
+            catch
+            {
+            }
+            return Path.GetFullPath(Assembly.GetExecutingAssembly().Location);
+        }
+
+        public static bool TryParseVersionTag(string rawTag, out Version version)
+        {
+            version = null;
+            if (string.IsNullOrWhiteSpace(rawTag))
+            {
+                return false;
+            }
+
+            string s = rawTag.Trim();
+            while (s.Length > 0 && (s[0] == 'v' || s[0] == 'V'))
+            {
+                s = s.Substring(1);
+            }
+
+            int suffixIdx = s.IndexOfAny(new char[] { '-', '+' });
+            if (suffixIdx > 0)
+            {
+                s = s.Substring(0, suffixIdx);
+            }
+
+            string[] parts = s.Split('.');
+            if (parts.Length < 2 || parts.Length > 4)
+            {
+                return false;
+            }
+
+            int major;
+            int minor;
+            int patch = 0;
+            if (!int.TryParse(parts[0], out major) || major < 0)
+            {
+                return false;
+            }
+            if (!int.TryParse(parts[1], out minor) || minor < 0)
+            {
+                return false;
+            }
+            if (parts.Length >= 3)
+            {
+                if (!int.TryParse(parts[2], out patch) || patch < 0)
+                {
+                    return false;
+                }
+            }
+
+            version = new Version(major, minor, patch);
+            return true;
+        }
+
+        public static UpdateCheckResult CheckForUpdates(bool forceRefresh)
+        {
+            if (!forceRefresh)
+            {
+                lock (CacheLock)
+                {
+                    if (_cachedResult != null &&
+                        _cachedResult.Success &&
+                        (DateTime.UtcNow - _cachedAtUtc) < CacheTtl)
+                    {
+                        return _cachedResult;
+                    }
+                }
+            }
+
+            EnsureTlsEnabled();
+            Version current = GetCurrentVersion();
+            string apiError;
+            bool shouldFallback;
+            UpdateCheckResult result;
+
+            if (TryCheckViaGitHubApi(current, out result, out apiError, out shouldFallback))
+            {
+                StoreCache(result);
+                AppLogger.Info("UPDATER", string.Format(
+                    "更新检测完成: 当前 {0}，最新 {1} ({2})",
+                    GetCurrentVersionText(),
+                    result.LatestTag,
+                    result.HasUpdate ? "有新版本" : "已是最新"));
+                return result;
+            }
+
+            if (shouldFallback)
+            {
+                string fallbackError;
+                if (TryCheckViaLatestRedirect(current, out result, out fallbackError))
+                {
+                    StoreCache(result);
+                    AppLogger.Info("UPDATER", string.Format(
+                        "更新检测完成 (直连回退): 当前 {0}，最新 {1} ({2})",
+                        GetCurrentVersionText(),
+                        result.LatestTag,
+                        result.HasUpdate ? "有新版本" : "已是最新"));
+                    return result;
+                }
+                if (!string.IsNullOrEmpty(fallbackError))
+                {
+                    apiError = apiError + "；回退检测失败: " + fallbackError;
+                }
+            }
+
+            AppLogger.Warn("UPDATER", "检查更新失败: " + apiError);
+            return new UpdateCheckResult
+            {
+                Success = false,
+                HasUpdate = false,
+                CurrentVersion = current,
+                ReleasePageUrl = ReleasesUrl,
+                ErrorMessage = apiError
+            };
+        }
+
+        public static bool DownloadAndVerifyUpdate(
+            UpdateCheckResult info,
+            Func<bool> isCancelled,
+            Action<int, long, long, string> onProgress,
+            out string stagedExePath,
+            out string error)
+        {
+            stagedExePath = null;
+            error = null;
+
+            if (info == null || string.IsNullOrWhiteSpace(info.DownloadUrl))
+            {
+                error = "未找到可用的更新包下载地址";
+                return false;
+            }
+
+            EnsureTlsEnabled();
+            string currentExePath = GetCurrentExecutablePath();
+            string appDir = Path.GetDirectoryName(currentExePath);
+            if (string.IsNullOrEmpty(appDir) || !Directory.Exists(appDir))
+            {
+                error = "无法定位当前程序目录";
+                return false;
+            }
+
+            string tempPath = currentExePath + ".new." + Process.GetCurrentProcess().Id;
+            try
+            {
+                if (File.Exists(tempPath))
+                {
+                    File.Delete(tempPath);
+                }
+
+                // Pre-check directory write permission before downloading
+                using (FileStream probe = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    probe.Flush();
+                }
+            }
+            catch (Exception ex)
+            {
+                TryDeleteFileQuiet(tempPath);
+                error = "无法写入程序目录（可能需要以管理员权限运行）: " + ex.Message;
+                return false;
+            }
+
+            bool downloadOk = false;
+            try
+            {
+                ReportProgressSafe(onProgress, 0, 0, info.ExpectedSize, "正在连接 GitHub 下载更新...");
+                HttpWebRequest req = CreateWebRequest(info.DownloadUrl, DownloadTimeoutMs, true);
+                req.Accept = "application/octet-stream, */*";
+
+                long downloadedBytes = 0;
+                long totalBytes = info.ExpectedSize;
+                long lastReportTicks = 0;
+                long reportIntervalTicks = TimeSpan.FromMilliseconds(80).Ticks;
+
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    if (resp.ContentLength > 0)
+                    {
+                        totalBytes = resp.ContentLength;
+                    }
+
+                    using (Stream respStream = resp.GetResponseStream())
+                    using (FileStream fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 16384))
+                    {
+                        if (respStream == null)
+                        {
+                            error = "下载响应流为空";
+                            return false;
+                        }
+
+                        byte[] buffer = new byte[16384];
+                        int read;
+                        while ((read = respStream.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            if (isCancelled != null && isCancelled())
+                            {
+                                error = "已取消更新";
+                                return false;
+                            }
+
+                            downloadedBytes += read;
+                            if (downloadedBytes > MaxValidExeBytes)
+                            {
+                                error = "下载文件体积异常，已中止更新";
+                                return false;
+                            }
+
+                            fs.Write(buffer, 0, read);
+
+                            long nowTicks = DateTime.UtcNow.Ticks;
+                            if (nowTicks - lastReportTicks >= reportIntervalTicks)
+                            {
+                                lastReportTicks = nowTicks;
+                                int pct = totalBytes > 0
+                                    ? (int)Math.Min(99L, (downloadedBytes * 100L) / totalBytes)
+                                    : -1;
+                                ReportProgressSafe(onProgress, pct, downloadedBytes, totalBytes, null);
+                            }
+                        }
+                        fs.Flush();
+                    }
+                }
+
+                if (isCancelled != null && isCancelled())
+                {
+                    error = "已取消更新";
+                    return false;
+                }
+
+                ReportProgressSafe(onProgress, 100, downloadedBytes, totalBytes > 0 ? totalBytes : downloadedBytes, "正在校验文件完整性...");
+
+                if (downloadedBytes < MinValidExeBytes)
+                {
+                    error = "下载的文件过小或无效 (" + downloadedBytes + " 字节)";
+                    return false;
+                }
+
+                if (info.ExpectedSize > 0 && downloadedBytes != info.ExpectedSize)
+                {
+                    error = string.Format("文件大小不匹配 (预期 {0} 字节，实际 {1} 字节)", info.ExpectedSize, downloadedBytes);
+                    return false;
+                }
+
+                if (!HasValidPeHeader(tempPath))
+                {
+                    error = "下载的文件不是有效的 Windows 可执行程序";
+                    return false;
+                }
+
+                if (!string.IsNullOrWhiteSpace(info.ChecksumUrl))
+                {
+                    ReportProgressSafe(onProgress, 100, downloadedBytes, totalBytes, "正在校验 SHA-256...");
+                    string expectedHash;
+                    bool checksumNotFound;
+                    string checksumErr;
+                    if (TryFetchExpectedExeSha256(info.ChecksumUrl, out expectedHash, out checksumNotFound, out checksumErr))
+                    {
+                        string actualHash = ComputeFileSha256Hex(tempPath);
+                        if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+                        {
+                            error = "SHA-256 校验失败，文件可能已损坏，已取消更新";
+                            AppLogger.Error("UPDATER", string.Format("SHA-256 校验不匹配: 预期={0}, 实际={1}", expectedHash, actualHash));
+                            return false;
+                        }
+                        AppLogger.Info("UPDATER", "更新文件 SHA-256 校验通过: " + actualHash);
+                    }
+                    else if (checksumNotFound && !info.ChecksumAssetPresent)
+                    {
+                        AppLogger.Warn("UPDATER", "该 Release 未提供 SHA256SUMS.txt，已通过 PE 头与体积校验");
+                    }
+                    else
+                    {
+                        error = "SHA-256 校验文件获取失败: " + checksumErr;
+                        return false;
+                    }
+                }
+
+                stagedExePath = tempPath;
+                downloadOk = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (isCancelled != null && isCancelled())
+                {
+                    error = "已取消更新";
+                }
+                else
+                {
+                    error = FormatNetworkError(ex);
+                }
+                return false;
+            }
+            finally
+            {
+                if (!downloadOk)
+                {
+                    TryDeleteFileQuiet(tempPath);
+                }
+            }
+        }
+
+        public static bool SwapExecutableInPlace(string stagedExePath, out string currentExePath, out string error)
+        {
+            currentExePath = GetCurrentExecutablePath();
+            error = null;
+
+            if (string.IsNullOrWhiteSpace(stagedExePath) || !File.Exists(stagedExePath))
+            {
+                error = "未找到已下载的更新文件";
+                return false;
+            }
+
+            string backupPath = currentExePath + ".old";
+            if (File.Exists(backupPath))
+            {
+                try
+                {
+                    File.Delete(backupPath);
+                }
+                catch
+                {
+                    backupPath = currentExePath + ".old." + Process.GetCurrentProcess().Id;
+                    TryDeleteFileQuiet(backupPath);
+                }
+            }
+
+            bool movedCurrent = false;
+            Exception moveEx = null;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    File.Move(currentExePath, backupPath);
+                    movedCurrent = true;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    moveEx = ex;
+                    Thread.Sleep(120);
+                }
+            }
+
+            if (!movedCurrent)
+            {
+                TryDeleteFileQuiet(stagedExePath);
+                error = "无法替换当前程序文件: " + (moveEx != null ? moveEx.Message : "文件被占用");
+                return false;
+            }
+
+            try
+            {
+                File.Move(stagedExePath, currentExePath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // Roll back so the user is never left without TunGuard.exe
+                try
+                {
+                    if (!File.Exists(currentExePath) && File.Exists(backupPath))
+                    {
+                        File.Move(backupPath, currentExePath);
+                    }
+                }
+                catch
+                {
+                }
+                TryDeleteFileQuiet(stagedExePath);
+                error = "写入新版本文件失败（已回滚旧版本）: " + ex.Message;
+                return false;
+            }
+        }
+
+        public static void LaunchRestartedProcess(string exePath)
+        {
+            if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+            {
+                return;
+            }
+
+            string workDir = Path.GetDirectoryName(exePath);
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    WorkingDirectory = !string.IsNullOrEmpty(workDir) ? workDir : AppDomain.CurrentDomain.BaseDirectory,
+                    UseShellExecute = true
+                };
+                Process.Start(psi);
+            }
+            catch
+            {
+                try
+                {
+                    ProcessStartInfo fallback = new ProcessStartInfo
+                    {
+                        FileName = exePath,
+                        WorkingDirectory = !string.IsNullOrEmpty(workDir) ? workDir : AppDomain.CurrentDomain.BaseDirectory,
+                        UseShellExecute = false
+                    };
+                    Process.Start(fallback);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        public static void CleanupStaleUpdateFilesAsync()
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    string exePath = GetCurrentExecutablePath();
+                    string dir = Path.GetDirectoryName(exePath);
+                    string exeName = Path.GetFileName(exePath);
+                    if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(exeName) || !Directory.Exists(dir))
+                    {
+                        return;
+                    }
+
+                    Thread.Sleep(1500);
+                    bool anyRemaining = DeleteMatchingFiles(dir, exeName + ".old*") | DeleteMatchingFiles(dir, exeName + ".new*");
+                    if (anyRemaining)
+                    {
+                        Thread.Sleep(3000);
+                        DeleteMatchingFiles(dir, exeName + ".old*");
+                        DeleteMatchingFiles(dir, exeName + ".new*");
+                    }
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        public static void OpenUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return;
+            }
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Warn("APP", "无法打开浏览器链接 (" + url + "): " + ex.Message);
+            }
+        }
+
+        public static string FormatReleaseNotesPreview(string rawBody, int maxLines, int maxChars)
+        {
+            if (string.IsNullOrWhiteSpace(rawBody))
+            {
+                return string.Empty;
+            }
+
+            string normalized = rawBody.Replace("\r\n", "\n").Replace('\r', '\n');
+            string[] lines = normalized.Split('\n');
+            StringBuilder sb = new StringBuilder(256);
+            int added = 0;
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+                if (line.StartsWith("### 校验信息", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("## 校验信息", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("**Full Changelog**", StringComparison.OrdinalIgnoreCase) ||
+                    line == "---")
+                {
+                    break;
+                }
+                if (line.StartsWith("## TunGuard", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("### 变更内容", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("Windows x64 独立可执行文件", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                line = line.Replace("`", string.Empty);
+                while (line.StartsWith("#"))
+                {
+                    line = line.Substring(1).TrimStart();
+                }
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                if (added >= maxLines || sb.Length + line.Length + 2 > maxChars)
+                {
+                    sb.AppendLine("...");
+                    break;
+                }
+
+                sb.AppendLine(line);
+                added++;
+            }
+
+            return sb.ToString().Trim();
+        }
+
+        public static string FormatBytesShort(long bytes)
+        {
+            if (bytes < 1024)
+            {
+                return bytes + " B";
+            }
+            if (bytes < 1024 * 1024)
+            {
+                return string.Format("{0:F0} KB", bytes / 1024.0);
+            }
+            return string.Format("{0:F2} MB", bytes / (1024.0 * 1024.0));
+        }
+
+        internal static bool TryParseSha256SumsForFile(string content, string targetFileName, out string sha256Hex)
+        {
+            sha256Hex = null;
+            if (string.IsNullOrWhiteSpace(content) || string.IsNullOrWhiteSpace(targetFileName))
+            {
+                return false;
+            }
+
+            string[] lines = content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.Length < 66)
+                {
+                    continue;
+                }
+
+                int wsIdx = line.IndexOfAny(new char[] { ' ', '\t' });
+                if (wsIdx != 64)
+                {
+                    continue;
+                }
+
+                string hashPart = line.Substring(0, 64);
+                string filePart = line.Substring(wsIdx).Trim().TrimStart('*').Trim();
+                if (string.Equals(filePart, targetFileName, StringComparison.OrdinalIgnoreCase) &&
+                    IsHexString(hashPart))
+                {
+                    sha256Hex = hashPart.ToLowerInvariant();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool TryCheckViaGitHubApi(
+            Version current,
+            out UpdateCheckResult result,
+            out string error,
+            out bool shouldFallback)
+        {
+            result = null;
+            error = null;
+            shouldFallback = false;
+
+            try
+            {
+                HttpWebRequest req = CreateWebRequest(LatestReleaseApiUrl, ApiTimeoutMs, true);
+                req.Accept = "application/vnd.github+json";
+
+                string json;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (Stream s = resp.GetResponseStream())
+                using (StreamReader sr = new StreamReader(s, Encoding.UTF8))
+                {
+                    json = sr.ReadToEnd();
+                }
+
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                serializer.MaxJsonLength = 2 * 1024 * 1024;
+                Dictionary<string, object> obj = serializer.DeserializeObject(json) as Dictionary<string, object>;
+                if (obj == null)
+                {
+                    error = "GitHub 返回数据格式无效";
+                    shouldFallback = true;
+                    return false;
+                }
+
+                string tagName = GetDictString(obj, "tag_name");
+                Version remoteVersion;
+                if (!TryParseVersionTag(tagName, out remoteVersion))
+                {
+                    error = "无法解析最新版本号 (" + (tagName ?? "空") + ")";
+                    shouldFallback = true;
+                    return false;
+                }
+
+                string htmlUrl = GetDictString(obj, "html_url");
+                if (string.IsNullOrWhiteSpace(htmlUrl))
+                {
+                    htmlUrl = RepoUrl + "/releases/tag/" + Uri.EscapeDataString(tagName);
+                }
+
+                string body = GetDictString(obj, "body") ?? string.Empty;
+                string exeUrl = null;
+                long exeSize = 0;
+                string checksumUrl = null;
+                bool checksumAssetPresent = false;
+
+                object assetsVal;
+                if (TryGetDictValue(obj, "assets", out assetsVal) && assetsVal != null)
+                {
+                    System.Collections.IEnumerable assetList = assetsVal as System.Collections.IEnumerable;
+                    if (assetList != null)
+                    {
+                        foreach (object item in assetList)
+                        {
+                            Dictionary<string, object> asset = item as Dictionary<string, object>;
+                            if (asset == null)
+                            {
+                                continue;
+                            }
+                            string name = GetDictString(asset, "name");
+                            string dlUrl = GetDictString(asset, "browser_download_url");
+                            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(dlUrl))
+                            {
+                                continue;
+                            }
+
+                            if (string.Equals(name, ReleaseAssetExeName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                exeUrl = dlUrl;
+                                exeSize = GetDictLong(asset, "size");
+                            }
+                            else if (string.Equals(name, ReleaseAssetChecksumName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                checksumUrl = dlUrl;
+                                checksumAssetPresent = true;
+                            }
+                        }
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(exeUrl))
+                {
+                    exeUrl = BuildDeterministicAssetUrl(tagName, ReleaseAssetExeName);
+                }
+
+                result = new UpdateCheckResult
+                {
+                    Success = true,
+                    HasUpdate = remoteVersion > current,
+                    CurrentVersion = current,
+                    LatestVersion = remoteVersion,
+                    LatestTag = tagName.Trim(),
+                    ReleasePageUrl = htmlUrl,
+                    DownloadUrl = exeUrl,
+                    ChecksumUrl = checksumUrl,
+                    ChecksumAssetPresent = checksumAssetPresent,
+                    ExpectedSize = exeSize,
+                    ReleaseNotes = body,
+                    UsedRedirectFallback = false
+                };
+                return true;
+            }
+            catch (WebException wex)
+            {
+                HttpWebResponse httpResp = wex.Response as HttpWebResponse;
+                if (httpResp != null)
+                {
+                    int code = (int)httpResp.StatusCode;
+                    if (code == 403 || code == 429 || code >= 500)
+                    {
+                        shouldFallback = true;
+                        error = "GitHub API 请求受限 (HTTP " + code + ")";
+                        return false;
+                    }
+                    if (code == 404)
+                    {
+                        error = "仓库暂未发布任何 Release";
+                        return false;
+                    }
+                    error = "GitHub API 返回 HTTP " + code;
+                    return false;
+                }
+                error = FormatNetworkError(wex);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                shouldFallback = true;
+                return false;
+            }
+        }
+
+        private static bool TryCheckViaLatestRedirect(
+            Version current,
+            out UpdateCheckResult result,
+            out string error)
+        {
+            result = null;
+            error = null;
+
+            try
+            {
+                HttpWebRequest req = CreateWebRequest(LatestReleaseWebUrl, ApiTimeoutMs, false);
+                req.Method = "HEAD";
+
+                string location = null;
+                try
+                {
+                    using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                    {
+                        location = resp.Headers["Location"];
+                    }
+                }
+                catch (WebException wex)
+                {
+                    HttpWebResponse httpResp = wex.Response as HttpWebResponse;
+                    if (httpResp != null)
+                    {
+                        location = httpResp.Headers["Location"];
+                    }
+                    else
+                    {
+                        error = FormatNetworkError(wex);
+                        return false;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(location))
+                {
+                    error = "未获取到 Release 重定向地址";
+                    return false;
+                }
+
+                const string marker = "/releases/tag/";
+                int idx = location.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                {
+                    error = "仓库暂未发布可用版本";
+                    return false;
+                }
+
+                string tag = location.Substring(idx + marker.Length);
+                int qIdx = tag.IndexOfAny(new char[] { '?', '#', '/' });
+                if (qIdx >= 0)
+                {
+                    tag = tag.Substring(0, qIdx);
+                }
+                tag = Uri.UnescapeDataString(tag).Trim();
+
+                Version remoteVersion;
+                if (!TryParseVersionTag(tag, out remoteVersion))
+                {
+                    error = "无法解析版本号: " + tag;
+                    return false;
+                }
+
+                result = new UpdateCheckResult
+                {
+                    Success = true,
+                    HasUpdate = remoteVersion > current,
+                    CurrentVersion = current,
+                    LatestVersion = remoteVersion,
+                    LatestTag = tag,
+                    ReleasePageUrl = RepoUrl + "/releases/tag/" + Uri.EscapeDataString(tag),
+                    DownloadUrl = BuildDeterministicAssetUrl(tag, ReleaseAssetExeName),
+                    ChecksumUrl = BuildDeterministicAssetUrl(tag, ReleaseAssetChecksumName),
+                    ChecksumAssetPresent = false,
+                    ExpectedSize = 0,
+                    ReleaseNotes = string.Empty,
+                    UsedRedirectFallback = true
+                };
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = FormatNetworkError(ex);
+                return false;
+            }
+        }
+
+        private static bool TryFetchExpectedExeSha256(
+            string checksumUrl,
+            out string expectedHash,
+            out bool notFound,
+            out string error)
+        {
+            expectedHash = null;
+            notFound = false;
+            error = null;
+
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    HttpWebRequest req = CreateWebRequest(checksumUrl, ApiTimeoutMs, true);
+                    using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                    using (Stream s = resp.GetResponseStream())
+                    using (StreamReader sr = new StreamReader(s, Encoding.UTF8))
+                    {
+                        string content = sr.ReadToEnd();
+                        if (TryParseSha256SumsForFile(content, ReleaseAssetExeName, out expectedHash))
+                        {
+                            return true;
+                        }
+                        error = "SHA256SUMS.txt 中未找到 " + ReleaseAssetExeName + " 的校验项";
+                        return false;
+                    }
+                }
+                catch (WebException wex)
+                {
+                    HttpWebResponse httpResp = wex.Response as HttpWebResponse;
+                    if (httpResp != null && (int)httpResp.StatusCode == 404)
+                    {
+                        notFound = true;
+                        error = "未找到校验文件 (HTTP 404)";
+                        return false;
+                    }
+                    error = FormatNetworkError(wex);
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+            }
+            return false;
+        }
+
+        private static string ComputeFileSha256Hex(string filePath)
+        {
+            using (SHA256 sha = SHA256.Create())
+            using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                byte[] hash = sha.ComputeHash(fs);
+                StringBuilder sb = new StringBuilder(hash.Length * 2);
+                for (int i = 0; i < hash.Length; i++)
+                {
+                    sb.Append(hash[i].ToString("x2"));
+                }
+                return sb.ToString();
+            }
+        }
+
+        private static bool HasValidPeHeader(string filePath)
+        {
+            try
+            {
+                using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    if (fs.Length < 64)
+                    {
+                        return false;
+                    }
+                    int b0 = fs.ReadByte();
+                    int b1 = fs.ReadByte();
+                    return b0 == 'M' && b1 == 'Z';
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsHexString(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+            {
+                return false;
+            }
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!ok)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static string BuildDeterministicAssetUrl(string tag, string assetName)
+        {
+            return RepoUrl + "/releases/download/" + Uri.EscapeDataString(tag) + "/" + Uri.EscapeDataString(assetName);
+        }
+
+        private static HttpWebRequest CreateWebRequest(string url, int timeoutMs, bool allowAutoRedirect)
+        {
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.UserAgent = "TunGuard/" + GetCurrentVersionText();
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.AllowAutoRedirect = allowAutoRedirect;
+            req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+            return req;
+        }
+
+        private static void EnsureTlsEnabled()
+        {
+            if (Interlocked.CompareExchange(ref _tlsInitialized, 1, 0) != 0)
+            {
+                return;
+            }
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            }
+            catch
+            {
+            }
+            try
+            {
+                // TLS 1.3 (12288) if supported by the host OS / .NET Framework patch level
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)12288;
+            }
+            catch
+            {
+            }
+        }
+
+        private static void StoreCache(UpdateCheckResult result)
+        {
+            if (result == null || !result.Success)
+            {
+                return;
+            }
+            lock (CacheLock)
+            {
+                _cachedResult = result;
+                _cachedAtUtc = DateTime.UtcNow;
+            }
+        }
+
+        private static bool DeleteMatchingFiles(string dir, string pattern)
+        {
+            bool remaining = false;
+            try
+            {
+                string[] files = Directory.GetFiles(dir, pattern, SearchOption.TopDirectoryOnly);
+                for (int i = 0; i < files.Length; i++)
+                {
+                    try
+                    {
+                        File.Delete(files[i]);
+                    }
+                    catch
+                    {
+                        remaining = true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return remaining;
+        }
+
+        private static void TryDeleteFileQuiet(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return;
+            }
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ReportProgressSafe(Action<int, long, long, string> onProgress, int percent, long bytesRead, long totalBytes, string phase)
+        {
+            if (onProgress == null)
+            {
+                return;
+            }
+            try
+            {
+                onProgress(percent, bytesRead, totalBytes, phase);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string FormatNetworkError(Exception ex)
+        {
+            WebException wex = ex as WebException;
+            if (wex != null)
+            {
+                HttpWebResponse resp = wex.Response as HttpWebResponse;
+                if (resp != null)
+                {
+                    return "HTTP " + (int)resp.StatusCode + " " + resp.StatusDescription;
+                }
+                if (wex.Status == WebExceptionStatus.Timeout)
+                {
+                    return "连接 GitHub 超时";
+                }
+                if (wex.Status == WebExceptionStatus.NameResolutionFailure)
+                {
+                    return "无法解析 GitHub 域名";
+                }
+                if (wex.Status == WebExceptionStatus.ConnectFailure)
+                {
+                    return "无法连接到 GitHub";
+                }
+            }
+            return ex != null ? ex.Message : "网络错误";
+        }
+
+        private static bool TryGetDictValue(Dictionary<string, object> dict, string key, out object value)
+        {
+            if (dict.TryGetValue(key, out value))
+            {
+                return true;
+            }
+            foreach (KeyValuePair<string, object> kv in dict)
+            {
+                if (string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = kv.Value;
+                    return true;
+                }
+            }
+            value = null;
+            return false;
+        }
+
+        private static string GetDictString(Dictionary<string, object> dict, string key)
+        {
+            object val;
+            if (TryGetDictValue(dict, key, out val) && val != null)
+            {
+                return val.ToString();
+            }
+            return null;
+        }
+
+        private static long GetDictLong(Dictionary<string, object> dict, string key)
+        {
+            object val;
+            if (!TryGetDictValue(dict, key, out val) || val == null)
+            {
+                return 0;
+            }
+            try
+            {
+                return Convert.ToInt64(val);
+            }
+            catch
+            {
+                return 0;
+            }
+        }
     }
 
     internal struct GuardAlertPayload
@@ -13469,11 +14834,14 @@ namespace TunGuard
             }
         }
 
+        public delegate bool ApplyUpdateCallback(string stagedExePath, string targetVersionTag, out string error);
+
         private readonly string _configPath;
         private readonly Func<ClashCatalogData> _catalogProvider;
         private readonly Func<TunStatus> _statusProvider;
         private readonly Func<bool, AppPathDiagnostics> _pathDiagnosticsProvider;
         private readonly Action _onOpenLogViewer;
+        private readonly ApplyUpdateCallback _onApplyUpdate;
         private readonly Dictionary<string, List<string>> _preservedDiscoveredPaths;
         private Dictionary<string, List<string>> _draftCustomAppPaths;
 
@@ -13523,6 +14891,11 @@ namespace TunGuard
         private readonly Button _btnAddCustom;
 
         private readonly Label _lblPreview;
+        private readonly GitHubIconButton _btnGitHub;
+        private readonly Label _lblVersion;
+        private readonly Button _btnCheckUpdate;
+        private readonly Button _btnOneClickUpdate;
+        private readonly Label _lblUpdateStatus;
         private readonly Button _btnSave;
         private readonly Button _btnCancel;
 
@@ -13533,9 +14906,13 @@ namespace TunGuard
         private ClashCatalogData _catalog;
         private ClashSnapshot _lastSnapshot;
         private AppPathDiagnostics _lastAppDiagnostics;
+        private UpdateCheckResult _latestUpdate;
         private string _lastActiveLeafNode = string.Empty;
         private int _refreshing;
         private int _detectingApps;
+        private int _checkingUpdate;
+        private int _updating;
+        private int _cancelUpdate;
         private bool _suppressFilterEvents;
         private bool _suppressAppToggleEvents;
         private bool _suppressNodeToggleEvents;
@@ -13550,6 +14927,7 @@ namespace TunGuard
             Func<TunStatus> statusProvider,
             Func<bool, AppPathDiagnostics> pathDiagnosticsProvider,
             Action onOpenLogViewer,
+            ApplyUpdateCallback onApplyUpdate,
             Icon windowIcon)
         {
             _configPath = configPath;
@@ -13557,6 +14935,7 @@ namespace TunGuard
             _statusProvider = statusProvider;
             _pathDiagnosticsProvider = pathDiagnosticsProvider;
             _onOpenLogViewer = onOpenLogViewer;
+            _onApplyUpdate = onApplyUpdate;
             _toolTip = new ToolTip();
             _searchDebounceTimer = new System.Windows.Forms.Timer { Interval = 80 };
             _searchDebounceTimer.Tick += (s, e) =>
@@ -14289,13 +15668,86 @@ namespace TunGuard
             };
             root.Controls.Add(_lblPreview, 0, 7);
 
-            // Row 8: Footer buttons
-            FlowLayoutPanel footer = new FlowLayoutPanel
+            // Row 8: Footer (left: GitHub icon, version & update actions; right: Save / Cancel)
+            TableLayoutPanel footerPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
+                ColumnCount = 6,
+                RowCount = 1,
+                Margin = new Padding(0)
+            };
+            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 0: GitHub icon
+            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 1: Version label
+            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 2: Check update button
+            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 3: One-click update button
+            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));// 4: Update status text
+            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 5: Save / Cancel buttons
+            footerPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            _btnGitHub = new GitHubIconButton
+            {
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 1, 4, 1)
+            };
+            _toolTip.SetToolTip(_btnGitHub, "访问 GitHub 项目主页\n" + AppUpdater.RepoUrl);
+            _btnGitHub.Click += (s, e) => AppUpdater.OpenUrl(AppUpdater.RepoUrl);
+
+            _lblVersion = new Label
+            {
+                Text = AppUpdater.GetCurrentVersionText(),
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 0, 8, 0)
+            };
+            _toolTip.SetToolTip(_lblVersion, "当前版本: " + AppUpdater.GetCurrentVersionText());
+
+            _btnCheckUpdate = new Button
+            {
+                Text = "检查更新",
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Padding = new Padding(8, 2, 8, 2),
+                Margin = new Padding(0, 0, 6, 0)
+            };
+            _toolTip.SetToolTip(_btnCheckUpdate, "从 GitHub Releases 检查最新版本");
+            _btnCheckUpdate.Click += (s, e) => CheckForUpdatesAsync(true);
+
+            _btnOneClickUpdate = new Button
+            {
+                Text = "一键更新",
+                AutoSize = true,
+                Visible = false,
+                Anchor = AnchorStyles.Left,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(22, 163, 74),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Padding = new Padding(10, 2, 10, 2),
+                Margin = new Padding(0, 0, 8, 0)
+            };
+            _btnOneClickUpdate.FlatAppearance.BorderSize = 0;
+            _btnOneClickUpdate.FlatAppearance.MouseOverBackColor = Color.FromArgb(21, 128, 61);
+            _btnOneClickUpdate.FlatAppearance.MouseDownBackColor = Color.FromArgb(22, 101, 52);
+            _btnOneClickUpdate.Click += OnOneClickUpdateClick;
+
+            _lblUpdateStatus = new Label
+            {
+                Text = string.Empty,
+                Dock = DockStyle.Fill,
+                AutoEllipsis = true,
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 0, 10, 0)
+            };
+
+            FlowLayoutPanel footerRight = new FlowLayoutPanel
+            {
+                AutoSize = true,
                 FlowDirection = FlowDirection.RightToLeft,
                 WrapContents = false,
+                Anchor = AnchorStyles.Right,
                 Margin = new Padding(0)
             };
 
@@ -14317,9 +15769,16 @@ namespace TunGuard
             };
             _btnSave.Click += OnSaveClick;
 
-            footer.Controls.Add(_btnCancel);
-            footer.Controls.Add(_btnSave);
-            root.Controls.Add(footer, 0, 8);
+            footerRight.Controls.Add(_btnCancel);
+            footerRight.Controls.Add(_btnSave);
+
+            footerPanel.Controls.Add(_btnGitHub, 0, 0);
+            footerPanel.Controls.Add(_lblVersion, 1, 0);
+            footerPanel.Controls.Add(_btnCheckUpdate, 2, 0);
+            footerPanel.Controls.Add(_btnOneClickUpdate, 3, 0);
+            footerPanel.Controls.Add(_lblUpdateStatus, 4, 0);
+            footerPanel.Controls.Add(footerRight, 5, 0);
+            root.Controls.Add(footerPanel, 0, 8);
 
             Controls.Add(root);
             CancelButton = _btnCancel;
@@ -14334,6 +15793,7 @@ namespace TunGuard
                 UpdatePreview();
                 DetectAppsAsync(true);
                 RefreshCatalogAsync();
+                CheckForUpdatesAsync(false);
             };
         }
 
@@ -15457,6 +16917,371 @@ namespace TunGuard
             DialogResult = DialogResult.OK;
             Close();
         }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            Volatile.Write(ref _cancelUpdate, 1);
+            base.OnFormClosing(e);
+        }
+
+        private void CheckForUpdatesAsync(bool manual)
+        {
+            if (Volatile.Read(ref _updating) != 0)
+            {
+                return;
+            }
+            if (Interlocked.CompareExchange(ref _checkingUpdate, 1, 0) != 0)
+            {
+                return;
+            }
+
+            _btnCheckUpdate.Enabled = false;
+            if (manual)
+            {
+                _btnCheckUpdate.Text = "检查中...";
+                _lblUpdateStatus.ForeColor = Color.FromArgb(100, 116, 139);
+                _lblUpdateStatus.Text = "正在检查更新...";
+                _toolTip.SetToolTip(_lblUpdateStatus, "正在连接 GitHub Releases 检测最新版本");
+            }
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                UpdateCheckResult result;
+                try
+                {
+                    result = AppUpdater.CheckForUpdates(manual);
+                }
+                catch (Exception ex)
+                {
+                    result = new UpdateCheckResult
+                    {
+                        Success = false,
+                        HasUpdate = false,
+                        CurrentVersion = AppUpdater.GetCurrentVersion(),
+                        ReleasePageUrl = AppUpdater.ReleasesUrl,
+                        ErrorMessage = ex.Message
+                    };
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _checkingUpdate, 0);
+                }
+
+                if (IsDisposed)
+                {
+                    return;
+                }
+                try
+                {
+                    BeginInvoke((Action)(() => ApplyUpdateCheckResult(result, manual)));
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        private void ApplyUpdateCheckResult(UpdateCheckResult result, bool manual)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            bool isUpdating = Volatile.Read(ref _updating) != 0;
+            _btnCheckUpdate.Enabled = !isUpdating;
+            _btnCheckUpdate.Text = "检查更新";
+
+            if (result == null)
+            {
+                return;
+            }
+
+            if (!result.Success)
+            {
+                if (manual)
+                {
+                    string err = string.IsNullOrEmpty(result.ErrorMessage) ? "网络请求失败" : result.ErrorMessage;
+                    _lblUpdateStatus.ForeColor = Color.FromArgb(180, 83, 9);
+                    _lblUpdateStatus.Text = "检查失败: " + err;
+                    _toolTip.SetToolTip(_lblUpdateStatus, "检查更新失败:\n" + err);
+                }
+                return;
+            }
+
+            _latestUpdate = result;
+
+            if (result.HasUpdate)
+            {
+                string tag = !string.IsNullOrEmpty(result.LatestTag)
+                    ? result.LatestTag
+                    : string.Format("v{0}.{1}.{2}", result.LatestVersion.Major, result.LatestVersion.Minor, result.LatestVersion.Build);
+                SetOneClickUpdateButtonReady(tag);
+
+                string notes = AppUpdater.FormatReleaseNotesPreview(result.ReleaseNotes, 6, 320);
+                string tip = "发现新版本 " + tag + "（当前 " + AppUpdater.GetCurrentVersionText() + "），点击一键下载校验并重启更新";
+                if (!string.IsNullOrEmpty(notes))
+                {
+                    tip += "\n\n变更摘要:\n" + notes;
+                }
+                _toolTip.SetToolTip(_btnOneClickUpdate, tip);
+
+                if (!isUpdating)
+                {
+                    _lblUpdateStatus.ForeColor = Color.FromArgb(21, 128, 61);
+                    _lblUpdateStatus.Text = result.ExpectedSize > 0
+                        ? ("发现新版本 (" + AppUpdater.FormatBytesShort(result.ExpectedSize) + ")")
+                        : "发现新版本";
+                    _toolTip.SetToolTip(_lblUpdateStatus, tip);
+                }
+            }
+            else
+            {
+                if (!isUpdating)
+                {
+                    _btnOneClickUpdate.Visible = false;
+                    _lblUpdateStatus.ForeColor = manual
+                        ? Color.FromArgb(21, 128, 61)
+                        : Color.FromArgb(100, 116, 139);
+                    _lblUpdateStatus.Text = manual ? "已是最新版本" : "已是最新";
+                    string latestLabel = !string.IsNullOrEmpty(result.LatestTag) ? result.LatestTag : AppUpdater.GetCurrentVersionText();
+                    _toolTip.SetToolTip(_lblUpdateStatus, "当前版本 " + AppUpdater.GetCurrentVersionText() + " 已是最新（GitHub 最新: " + latestLabel + "）");
+                }
+            }
+        }
+
+        private void SetOneClickUpdateButtonReady(string tag)
+        {
+            _btnOneClickUpdate.Text = "一键更新 " + tag;
+            _btnOneClickUpdate.BackColor = Color.FromArgb(22, 163, 74);
+            _btnOneClickUpdate.FlatAppearance.MouseOverBackColor = Color.FromArgb(21, 128, 61);
+            _btnOneClickUpdate.FlatAppearance.MouseDownBackColor = Color.FromArgb(22, 101, 52);
+            _btnOneClickUpdate.Enabled = true;
+            _btnOneClickUpdate.Visible = true;
+        }
+
+        private void SetOneClickUpdateButtonCancellingMode()
+        {
+            _btnOneClickUpdate.Text = "取消更新";
+            _btnOneClickUpdate.BackColor = Color.FromArgb(100, 116, 139);
+            _btnOneClickUpdate.FlatAppearance.MouseOverBackColor = Color.FromArgb(71, 85, 105);
+            _btnOneClickUpdate.FlatAppearance.MouseDownBackColor = Color.FromArgb(51, 65, 85);
+            _btnOneClickUpdate.Enabled = true;
+            _btnOneClickUpdate.Visible = true;
+        }
+
+        private void OnOneClickUpdateClick(object sender, EventArgs e)
+        {
+            if (Volatile.Read(ref _updating) != 0)
+            {
+                Volatile.Write(ref _cancelUpdate, 1);
+                _btnOneClickUpdate.Enabled = false;
+                _lblUpdateStatus.ForeColor = Color.FromArgb(100, 116, 139);
+                _lblUpdateStatus.Text = "正在取消更新...";
+                return;
+            }
+
+            UpdateCheckResult info = _latestUpdate;
+            if (info == null || !info.HasUpdate)
+            {
+                return;
+            }
+
+            string targetTag = !string.IsNullOrEmpty(info.LatestTag)
+                ? info.LatestTag
+                : string.Format("v{0}.{1}.{2}", info.LatestVersion.Major, info.LatestVersion.Minor, info.LatestVersion.Build);
+
+            StringBuilder msg = new StringBuilder(384);
+            msg.AppendFormat("发现新版本：{0}  →  {1}\n", AppUpdater.GetCurrentVersionText(), targetTag);
+            if (info.ExpectedSize > 0)
+            {
+                msg.AppendFormat("更新包大小：约 {0}\n", AppUpdater.FormatBytesShort(info.ExpectedSize));
+            }
+            string notes = AppUpdater.FormatReleaseNotesPreview(info.ReleaseNotes, 8, 420);
+            if (!string.IsNullOrEmpty(notes))
+            {
+                msg.AppendLine();
+                msg.AppendLine("主要变更：");
+                msg.AppendLine(notes);
+            }
+            msg.AppendLine();
+            msg.Append("点击「是」将自动下载新版本、校验 SHA-256、替换当前程序并重启 TunGuard（重启期间防护将短暂中断约 1~2 秒）。");
+
+            DialogResult ans = MessageBox.Show(
+                this,
+                msg.ToString(),
+                "一键更新 TunGuard",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button1);
+            if (ans != DialogResult.Yes)
+            {
+                return;
+            }
+
+            StartDownloadAndApplyUpdate(info, targetTag);
+        }
+
+        private void StartDownloadAndApplyUpdate(UpdateCheckResult info, string targetTag)
+        {
+            if (Interlocked.CompareExchange(ref _updating, 1, 0) != 0)
+            {
+                return;
+            }
+            Volatile.Write(ref _cancelUpdate, 0);
+
+            _btnCheckUpdate.Enabled = false;
+            _btnSave.Enabled = false;
+            SetOneClickUpdateButtonCancellingMode();
+            _lblUpdateStatus.ForeColor = Color.FromArgb(37, 99, 235);
+            _lblUpdateStatus.Text = "正在连接 GitHub 下载 " + targetTag + "...";
+            _toolTip.SetToolTip(_lblUpdateStatus, "正在下载 " + targetTag);
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string stagedPath;
+                string err;
+                bool ok = AppUpdater.DownloadAndVerifyUpdate(
+                    info,
+                    () => Volatile.Read(ref _cancelUpdate) != 0 || IsDisposed,
+                    (pct, readBytes, totalBytes, phase) =>
+                    {
+                        if (IsDisposed)
+                        {
+                            return;
+                        }
+                        try
+                        {
+                            BeginInvoke((Action)(() =>
+                            {
+                                if (IsDisposed || Volatile.Read(ref _updating) == 0)
+                                {
+                                    return;
+                                }
+                                if (!string.IsNullOrEmpty(phase))
+                                {
+                                    _lblUpdateStatus.Text = phase;
+                                }
+                                else if (pct >= 0 && totalBytes > 0)
+                                {
+                                    _lblUpdateStatus.Text = string.Format(
+                                        "下载中 {0}% ({1} / {2})",
+                                        pct,
+                                        AppUpdater.FormatBytesShort(readBytes),
+                                        AppUpdater.FormatBytesShort(totalBytes));
+                                }
+                                else
+                                {
+                                    _lblUpdateStatus.Text = "下载中 (" + AppUpdater.FormatBytesShort(readBytes) + ")...";
+                                }
+                            }));
+                        }
+                        catch
+                        {
+                        }
+                    },
+                    out stagedPath,
+                    out err);
+
+                bool wasCancelled = Volatile.Read(ref _cancelUpdate) != 0;
+                if (IsDisposed)
+                {
+                    Interlocked.Exchange(ref _updating, 0);
+                    return;
+                }
+
+                try
+                {
+                    BeginInvoke((Action)(() =>
+                    {
+                        if (IsDisposed)
+                        {
+                            Interlocked.Exchange(ref _updating, 0);
+                            return;
+                        }
+
+                        if (!ok)
+                        {
+                            Interlocked.Exchange(ref _updating, 0);
+                            _btnCheckUpdate.Enabled = true;
+                            _btnSave.Enabled = true;
+                            SetOneClickUpdateButtonReady(targetTag);
+
+                            if (wasCancelled)
+                            {
+                                _lblUpdateStatus.ForeColor = Color.FromArgb(100, 116, 139);
+                                _lblUpdateStatus.Text = "已取消更新";
+                                _toolTip.SetToolTip(_lblUpdateStatus, "已取消下载更新");
+                                return;
+                            }
+
+                            string failMsg = !string.IsNullOrEmpty(err) ? err : "下载或校验失败";
+                            _lblUpdateStatus.ForeColor = Color.FromArgb(185, 28, 28);
+                            _lblUpdateStatus.Text = "更新失败: " + failMsg;
+                            _toolTip.SetToolTip(_lblUpdateStatus, "更新失败:\n" + failMsg);
+
+                            DialogResult openWeb = MessageBox.Show(
+                                this,
+                                "自动更新失败：\n" + failMsg + "\n\n是否打开 GitHub Releases 页面手动下载最新版本？",
+                                "更新失败",
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Warning,
+                                MessageBoxDefaultButton.Button2);
+                            if (openWeb == DialogResult.Yes)
+                            {
+                                AppUpdater.OpenUrl(!string.IsNullOrEmpty(info.ReleasePageUrl) ? info.ReleasePageUrl : AppUpdater.ReleasesUrl);
+                            }
+                            return;
+                        }
+
+                        _btnOneClickUpdate.Enabled = false;
+                        _btnOneClickUpdate.Text = "正在重启...";
+                        _btnCancel.Enabled = false;
+                        _lblUpdateStatus.ForeColor = Color.FromArgb(21, 128, 61);
+                        _lblUpdateStatus.Text = "校验通过，正在替换并重启...";
+
+                        string swapErr = null;
+                        bool applied = _onApplyUpdate != null && _onApplyUpdate(stagedPath, targetTag, out swapErr);
+                        if (applied)
+                        {
+                            // ExitCleanly has closed this form and scheduled process restart
+                            return;
+                        }
+
+                        Interlocked.Exchange(ref _updating, 0);
+                        if (IsDisposed)
+                        {
+                            return;
+                        }
+
+                        _btnCheckUpdate.Enabled = true;
+                        _btnSave.Enabled = true;
+                        _btnCancel.Enabled = true;
+                        SetOneClickUpdateButtonReady(targetTag);
+                        string applyErr = !string.IsNullOrEmpty(swapErr) ? swapErr : "替换程序文件失败";
+                        _lblUpdateStatus.ForeColor = Color.FromArgb(185, 28, 28);
+                        _lblUpdateStatus.Text = "替换失败: " + applyErr;
+                        _toolTip.SetToolTip(_lblUpdateStatus, "替换程序文件失败:\n" + applyErr);
+
+                        DialogResult openRelease = MessageBox.Show(
+                            this,
+                            "替换程序文件失败：\n" + applyErr + "\n\n是否打开 GitHub Releases 页面手动下载覆盖？",
+                            "更新失败",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Error,
+                            MessageBoxDefaultButton.Button2);
+                        if (openRelease == DialogResult.Yes)
+                        {
+                            AppUpdater.OpenUrl(!string.IsNullOrEmpty(info.ReleasePageUrl) ? info.ReleasePageUrl : AppUpdater.ReleasesUrl);
+                        }
+                    }));
+                }
+                catch
+                {
+                    Interlocked.Exchange(ref _updating, 0);
+                }
+            });
+        }
     }
 
     internal sealed class TrayApplication : ApplicationContext
@@ -16101,6 +17926,7 @@ namespace TunGuard
                 () => _monitor.CurrentStatus,
                 rescan => _monitor.GetAppPathDiagnostics(rescan),
                 () => OpenLogViewerWindow(),
+                ApplyUpdateAndRestart,
                 _iconSafe);
             _settingsForm = form;
             form.FormClosed += (s, args) =>
@@ -16122,6 +17948,31 @@ namespace TunGuard
             };
             form.Show();
             form.Activate();
+        }
+
+        private bool ApplyUpdateAndRestart(string stagedExePath, string targetVersionTag, out string error)
+        {
+            error = null;
+            if (_disposed)
+            {
+                error = "应用正在退出";
+                return false;
+            }
+
+            string currentExePath;
+            if (!AppUpdater.SwapExecutableInPlace(stagedExePath, out currentExePath, out error))
+            {
+                AppLogger.Error("UPDATER", "替换程序文件失败: " + error);
+                return false;
+            }
+
+            AppLogger.Info("UPDATER", string.Format(
+                "已完成版本替换 ({0} -> {1})，即将重启 TunGuard",
+                AppUpdater.GetCurrentVersionText(),
+                string.IsNullOrEmpty(targetVersionTag) ? "最新版本" : targetVersionTag));
+            Program.PendingRestartExePath = currentExePath;
+            ExitCleanly();
+            return true;
         }
 
         private void OnLogViewerClick(object sender, EventArgs e)
