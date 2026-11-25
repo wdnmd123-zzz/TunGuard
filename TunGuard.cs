@@ -17,7 +17,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TunGuard")]
-[assembly: AssemblyDescription("Clash Verge TUN and Node Guard for Antigravity")]
+[assembly: AssemblyDescription("Clash Verge TUN and Node Guard for Antigravity, ChatGPT and Claude Desktop")]
 [assembly: AssemblyProduct("TunGuard")]
 [assembly: AssemblyVersion("1.2.0.0")]
 [assembly: AssemblyFileVersion("1.2.0.0")]
@@ -145,12 +145,74 @@ namespace TunGuard
         public string NodeReason;
     }
 
+    [Flags]
+    internal enum GuardedAppFlags
+    {
+        None = 0,
+        Antigravity = 1,
+        ChatGPT = 2,
+        Claude = 4,
+        All = Antigravity | ChatGPT | Claude
+    }
+
+    internal static class GuardedAppHelper
+    {
+        public static string FormatNames(GuardedAppFlags flags)
+        {
+            if (flags == GuardedAppFlags.None)
+            {
+                return "无";
+            }
+
+            List<string> names = new List<string>(3);
+            if ((flags & GuardedAppFlags.Antigravity) != 0)
+            {
+                names.Add("Antigravity");
+            }
+            if ((flags & GuardedAppFlags.ChatGPT) != 0)
+            {
+                names.Add("ChatGPT 桌面端");
+            }
+            if ((flags & GuardedAppFlags.Claude) != 0)
+            {
+                names.Add("Claude 桌面端");
+            }
+            return string.Join("、", names.ToArray());
+        }
+
+        public static string FormatShortNames(GuardedAppFlags flags)
+        {
+            if (flags == GuardedAppFlags.None)
+            {
+                return "无 (均未勾选)";
+            }
+
+            List<string> names = new List<string>(3);
+            if ((flags & GuardedAppFlags.Antigravity) != 0)
+            {
+                names.Add("Antigravity");
+            }
+            if ((flags & GuardedAppFlags.ChatGPT) != 0)
+            {
+                names.Add("ChatGPT");
+            }
+            if ((flags & GuardedAppFlags.Claude) != 0)
+            {
+                names.Add("Claude");
+            }
+            return string.Join("、", names.ToArray());
+        }
+    }
+
     internal sealed class NodeGuardConfig
     {
         public bool Enabled { get; set; }
         public string ProxyGroup { get; set; }
         public string MatchMode { get; set; }
         public List<string> AllowedNodes { get; set; }
+        public bool GuardAntigravity { get; set; }
+        public bool GuardChatGPT { get; set; }
+        public bool GuardClaude { get; set; }
 
         public NodeGuardConfig()
         {
@@ -158,6 +220,18 @@ namespace TunGuard
             ProxyGroup = string.Empty;
             MatchMode = "exact";
             AllowedNodes = new List<string>();
+            GuardAntigravity = true;
+            GuardChatGPT = true;
+            GuardClaude = true;
+        }
+
+        public GuardedAppFlags GetGuardedAppFlags()
+        {
+            GuardedAppFlags flags = GuardedAppFlags.None;
+            if (GuardAntigravity) flags |= GuardedAppFlags.Antigravity;
+            if (GuardChatGPT) flags |= GuardedAppFlags.ChatGPT;
+            if (GuardClaude) flags |= GuardedAppFlags.Claude;
+            return flags;
         }
 
         public NodeGuardConfig CloneNormalized()
@@ -168,6 +242,9 @@ namespace TunGuard
             copy.MatchMode = string.Equals(MatchMode, "contains", StringComparison.OrdinalIgnoreCase)
                 ? "contains"
                 : "exact";
+            copy.GuardAntigravity = GuardAntigravity;
+            copy.GuardChatGPT = GuardChatGPT;
+            copy.GuardClaude = GuardClaude;
 
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (AllowedNodes != null)
@@ -187,6 +264,11 @@ namespace TunGuard
                 }
             }
             return copy;
+        }
+
+        public string GetGuardedAppsSummaryText()
+        {
+            return "受控应用: " + GuardedAppHelper.FormatShortNames(GetGuardedAppFlags());
         }
 
         public string GetSummaryText()
@@ -315,20 +397,10 @@ namespace TunGuard
             }
 
             object val;
-            if (TryGetIgnoreCase(obj, "enabled", out val))
+            bool parsedBool;
+            if (TryGetBoolIgnoreCase(obj, "enabled", out parsedBool))
             {
-                if (val is bool)
-                {
-                    cfg.Enabled = (bool)val;
-                }
-                else if (val is string)
-                {
-                    bool parsed;
-                    if (bool.TryParse((string)val, out parsed))
-                    {
-                        cfg.Enabled = parsed;
-                    }
-                }
+                cfg.Enabled = parsedBool;
             }
 
             if (TryGetIgnoreCase(obj, "proxyGroup", out val) && val != null)
@@ -370,13 +442,33 @@ namespace TunGuard
                 }
             }
 
+            if (TryGetIgnoreCase(obj, "guardedApps", out val) && val != null)
+            {
+                Dictionary<string, object> appsObj = val as Dictionary<string, object>;
+                if (appsObj != null)
+                {
+                    if (TryGetBoolIgnoreCase(appsObj, "antigravity", out parsedBool))
+                    {
+                        cfg.GuardAntigravity = parsedBool;
+                    }
+                    if (TryGetBoolIgnoreCase(appsObj, "chatgpt", out parsedBool))
+                    {
+                        cfg.GuardChatGPT = parsedBool;
+                    }
+                    if (TryGetBoolIgnoreCase(appsObj, "claude", out parsedBool))
+                    {
+                        cfg.GuardClaude = parsedBool;
+                    }
+                }
+            }
+
             return cfg.CloneNormalized();
         }
 
         public static string SerializePretty(NodeGuardConfig config)
         {
             NodeGuardConfig cfg = (config != null ? config : new NodeGuardConfig()).CloneNormalized();
-            StringBuilder sb = new StringBuilder(256);
+            StringBuilder sb = new StringBuilder(320);
             sb.AppendLine("{");
             sb.Append("  \"enabled\": ").Append(cfg.Enabled ? "true" : "false").AppendLine(",");
             sb.Append("  \"proxyGroup\": ").Append(EscapeJsonString(cfg.ProxyGroup)).AppendLine(",");
@@ -396,9 +488,34 @@ namespace TunGuard
                 }
                 sb.Append("  ");
             }
-            sb.AppendLine("]");
+            sb.AppendLine("],");
+            sb.AppendLine("  \"guardedApps\": {");
+            sb.Append("    \"antigravity\": ").Append(cfg.GuardAntigravity ? "true" : "false").AppendLine(",");
+            sb.Append("    \"chatgpt\": ").Append(cfg.GuardChatGPT ? "true" : "false").AppendLine(",");
+            sb.Append("    \"claude\": ").Append(cfg.GuardClaude ? "true" : "false").AppendLine();
+            sb.AppendLine("  }");
             sb.AppendLine("}");
             return sb.ToString();
+        }
+
+        private static bool TryGetBoolIgnoreCase(Dictionary<string, object> dict, string key, out bool result)
+        {
+            result = false;
+            object val;
+            if (!TryGetIgnoreCase(dict, key, out val) || val == null)
+            {
+                return false;
+            }
+            if (val is bool)
+            {
+                result = (bool)val;
+                return true;
+            }
+            if (val is string)
+            {
+                return bool.TryParse((string)val, out result);
+            }
+            return false;
         }
 
         private static string EscapeJsonString(string s)
@@ -3934,11 +4051,13 @@ namespace TunGuard
     {
         public int KilledCount;
         public int AccessDeniedCount;
+        public GuardedAppFlags KilledApps;
+        public GuardedAppFlags DeniedApps;
         public double FirstPassMs;
         public double TotalElapsedMs;
     }
 
-    internal sealed class AntigravityKiller
+    internal sealed class TargetProcessKiller
     {
         private const uint TH32CS_SNAPPROCESS = 0x00000002;
         private const uint PROCESS_TERMINATE = 0x0001;
@@ -3996,7 +4115,7 @@ namespace TunGuard
 
         // Reusable buffers (used exclusively by the single TunMonitor evaluation thread)
         private readonly StringBuilder _pathBuf = new StringBuilder(2048);
-        private readonly List<uint> _langServerCandidates = new List<uint>(16);
+        private readonly List<uint> _pathVerifyCandidates = new List<uint>(32);
         private uint[] _pidBuffer = new uint[1024];
         private uint[] _lastPidSnapshot = new uint[1024];
         private int _lastPidSnapshotCount;
@@ -4004,6 +4123,20 @@ namespace TunGuard
         private HashSet<uint> _prevBenignPids = new HashSet<uint>();
         private HashSet<uint> _nextBenignPids = new HashSet<uint>();
         private bool _benignCacheValid;
+        private GuardedAppFlags _enabledApps = GuardedAppFlags.All;
+
+        // Returns true if any previously disabled target app was newly enabled
+        public bool SetEnabledApps(GuardedAppFlags apps)
+        {
+            if (_enabledApps == apps)
+            {
+                return false;
+            }
+            bool expanded = ((apps & ~_enabledApps) != GuardedAppFlags.None);
+            _enabledApps = apps;
+            InvalidateCache();
+            return expanded;
+        }
 
         public void InvalidateCache()
         {
@@ -4016,9 +4149,16 @@ namespace TunGuard
 
         public KillResult KillAllNow()
         {
+            if (_enabledApps == GuardedAppFlags.None)
+            {
+                return default(KillResult);
+            }
+
             Stopwatch sw = Stopwatch.StartNew();
             int accessDenied;
-            int totalKilled = KillFullPass(true, out accessDenied);
+            GuardedAppFlags killedApps;
+            GuardedAppFlags deniedApps;
+            int totalKilled = KillFullPass(true, out accessDenied, out killedApps, out deniedApps);
             double firstPassMs = sw.Elapsed.TotalMilliseconds;
 
             // If processes were killed, do one rapid sweep 5ms later to catch any racing child spawn.
@@ -4026,8 +4166,12 @@ namespace TunGuard
             {
                 Thread.Sleep(5);
                 int followUpDenied;
-                totalKilled += KillFullPass(true, out followUpDenied);
+                GuardedAppFlags followUpKilledApps;
+                GuardedAppFlags followUpDeniedApps;
+                totalKilled += KillFullPass(true, out followUpDenied, out followUpKilledApps, out followUpDeniedApps);
                 accessDenied += followUpDenied;
+                killedApps |= followUpKilledApps;
+                deniedApps |= followUpDeniedApps;
             }
 
             sw.Stop();
@@ -4035,6 +4179,8 @@ namespace TunGuard
             {
                 KilledCount = totalKilled,
                 AccessDeniedCount = accessDenied,
+                KilledApps = killedApps,
+                DeniedApps = deniedApps,
                 FirstPassMs = firstPassMs,
                 TotalElapsedMs = sw.Elapsed.TotalMilliseconds
             };
@@ -4042,6 +4188,11 @@ namespace TunGuard
 
         public KillResult KillNewProcesses()
         {
+            if (_enabledApps == GuardedAppFlags.None)
+            {
+                return default(KillResult);
+            }
+
             if (!_benignCacheValid)
             {
                 return KillAllNow();
@@ -4075,6 +4226,9 @@ namespace TunGuard
             long startTs = Stopwatch.GetTimestamp();
             int killed = 0;
             int accessDenied = 0;
+            GuardedAppFlags killedApps = GuardedAppFlags.None;
+            GuardedAppFlags deniedApps = GuardedAppFlags.None;
+            GuardedAppFlags enabledApps = _enabledApps;
             _nextBenignPids.Clear();
 
             for (int i = 0; i < pidCount; i++)
@@ -4092,7 +4246,7 @@ namespace TunGuard
                 }
 
                 bool isBenign;
-                InspectAndKillPid(pid, false, true, ref killed, ref accessDenied, out isBenign);
+                InspectAndKillPid(pid, enabledApps, true, ref killed, ref accessDenied, ref killedApps, ref deniedApps, out isBenign);
                 if (isBenign)
                 {
                     _nextBenignPids.Add(pid);
@@ -4125,8 +4279,12 @@ namespace TunGuard
             {
                 Thread.Sleep(5);
                 int followUpDenied;
-                killed += KillFullPass(true, out followUpDenied);
+                GuardedAppFlags followUpKilledApps;
+                GuardedAppFlags followUpDeniedApps;
+                killed += KillFullPass(true, out followUpDenied, out followUpKilledApps, out followUpDeniedApps);
                 accessDenied += followUpDenied;
+                killedApps |= followUpKilledApps;
+                deniedApps |= followUpDeniedApps;
             }
 
             double totalMs = (Stopwatch.GetTimestamp() - startTs) * 1000.0 / Stopwatch.Frequency;
@@ -4134,6 +4292,8 @@ namespace TunGuard
             {
                 KilledCount = killed,
                 AccessDeniedCount = accessDenied,
+                KilledApps = killedApps,
+                DeniedApps = deniedApps,
                 FirstPassMs = firstPassMs,
                 TotalElapsedMs = totalMs
             };
@@ -4162,17 +4322,29 @@ namespace TunGuard
             return false;
         }
 
-        private int KillFullPass(bool updateBenignCache, out int accessDenied)
+        private int KillFullPass(
+            bool updateBenignCache,
+            out int accessDenied,
+            out GuardedAppFlags killedApps,
+            out GuardedAppFlags deniedApps)
         {
             int killed = 0;
             accessDenied = 0;
+            killedApps = GuardedAppFlags.None;
+            deniedApps = GuardedAppFlags.None;
+            GuardedAppFlags enabledApps = _enabledApps;
+            if (enabledApps == GuardedAppFlags.None)
+            {
+                return 0;
+            }
+
             IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
             {
                 return 0;
             }
 
-            _langServerCandidates.Clear();
+            _pathVerifyCandidates.Clear();
             if (updateBenignCache)
             {
                 _nextBenignPids.Clear();
@@ -4188,7 +4360,7 @@ namespace TunGuard
                     return 0;
                 }
 
-                // Pass 1: terminate Antigravity.exe immediately (parent/main before child language servers)
+                // Pass 1: terminate unambiguous desktop app executables immediately before path-verified helpers
                 do
                 {
                     uint pid = pe.th32ProcessID;
@@ -4203,13 +4375,14 @@ namespace TunGuard
                         continue;
                     }
 
-                    if (string.Equals(exe, "Antigravity.exe", StringComparison.OrdinalIgnoreCase))
+                    GuardedAppFlags directApp = MatchDirectExeName(exe, enabledApps);
+                    if (directApp != GuardedAppFlags.None)
                     {
-                        TryTerminateKnownTarget(pid, ref killed, ref accessDenied);
+                        TryTerminateKnownTarget(pid, directApp, ref killed, ref accessDenied, ref killedApps, ref deniedApps);
                     }
-                    else if (IsLanguageServerExeName(exe))
+                    else if (NeedsPathVerification(exe, enabledApps))
                     {
-                        _langServerCandidates.Add(pid);
+                        _pathVerifyCandidates.Add(pid);
                     }
                     else if (updateBenignCache)
                     {
@@ -4223,12 +4396,12 @@ namespace TunGuard
                 CloseHandle(snapshot);
             }
 
-            // Pass 2: verify and terminate language_server*.exe belonging to Antigravity
-            for (int i = 0; i < _langServerCandidates.Count; i++)
+            // Pass 2: verify full image paths for executables shared with non-target tools (e.g. Claude Desktop vs CLI/IDE)
+            for (int i = 0; i < _pathVerifyCandidates.Count; i++)
             {
-                uint pid = _langServerCandidates[i];
+                uint pid = _pathVerifyCandidates[i];
                 bool isBenign;
-                InspectAndKillPid(pid, true, false, ref killed, ref accessDenied, out isBenign);
+                InspectAndKillPid(pid, enabledApps, false, ref killed, ref accessDenied, ref killedApps, ref deniedApps, out isBenign);
                 if (updateBenignCache && isBenign)
                 {
                     _nextBenignPids.Add(pid);
@@ -4247,7 +4420,13 @@ namespace TunGuard
             return killed;
         }
 
-        private void TryTerminateKnownTarget(uint pid, ref int killed, ref int accessDenied)
+        private void TryTerminateKnownTarget(
+            uint pid,
+            GuardedAppFlags appFlag,
+            ref int killed,
+            ref int accessDenied,
+            ref GuardedAppFlags killedApps,
+            ref GuardedAppFlags deniedApps)
         {
             IntPtr hProc = OpenProcess(PROCESS_TERMINATE, false, pid);
             if (hProc == IntPtr.Zero)
@@ -4255,6 +4434,7 @@ namespace TunGuard
                 if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
                 {
                     accessDenied++;
+                    deniedApps |= appFlag;
                 }
                 return;
             }
@@ -4264,10 +4444,12 @@ namespace TunGuard
                 if (TerminateProcess(hProc, 1))
                 {
                     killed++;
+                    killedApps |= appFlag;
                 }
                 else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
                 {
                     accessDenied++;
+                    deniedApps |= appFlag;
                 }
             }
             finally
@@ -4278,10 +4460,12 @@ namespace TunGuard
 
         private void InspectAndKillPid(
             uint pid,
-            bool languageServerPathOnly,
+            GuardedAppFlags enabledApps,
             bool markProtectedAsBenign,
             ref int killed,
             ref int accessDenied,
+            ref GuardedAppFlags killedApps,
+            ref GuardedAppFlags deniedApps,
             out bool isBenign)
         {
             isBenign = false;
@@ -4296,16 +4480,18 @@ namespace TunGuard
                         return;
                     }
 
-                    bool isTarget = languageServerPathOnly ? IsAntigravityPath(fullPath) : IsTargetImagePath(fullPath);
-                    if (isTarget)
+                    GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps);
+                    if (matched != GuardedAppFlags.None)
                     {
                         if (TerminateProcess(hProc, 1))
                         {
                             killed++;
+                            killedApps |= matched;
                         }
                         else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
                         {
                             accessDenied++;
+                            deniedApps |= matched;
                         }
                     }
                     else
@@ -4330,10 +4516,11 @@ namespace TunGuard
                         string fullPath = QueryImagePath(hQuery);
                         if (fullPath != null)
                         {
-                            bool isTarget = languageServerPathOnly ? IsAntigravityPath(fullPath) : IsTargetImagePath(fullPath);
-                            if (isTarget)
+                            GuardedAppFlags matched = MatchTargetImagePath(fullPath, enabledApps);
+                            if (matched != GuardedAppFlags.None)
                             {
                                 accessDenied++;
+                                deniedApps |= matched;
                             }
                             else
                             {
@@ -4365,6 +4552,100 @@ namespace TunGuard
             return _pathBuf.ToString();
         }
 
+        internal static GuardedAppFlags MatchDirectExeName(string exe, GuardedAppFlags enabledApps)
+        {
+            if (enabledApps == GuardedAppFlags.None || string.IsNullOrEmpty(exe))
+            {
+                return GuardedAppFlags.None;
+            }
+
+            if ((enabledApps & GuardedAppFlags.Antigravity) != 0 &&
+                string.Equals(exe, "Antigravity.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return GuardedAppFlags.Antigravity;
+            }
+
+            if ((enabledApps & GuardedAppFlags.ChatGPT) != 0 &&
+                string.Equals(exe, "ChatGPT.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return GuardedAppFlags.ChatGPT;
+            }
+
+            if ((enabledApps & GuardedAppFlags.Claude) != 0 &&
+                IsClaudeDesktopDirectExeName(exe))
+            {
+                return GuardedAppFlags.Claude;
+            }
+
+            return GuardedAppFlags.None;
+        }
+
+        internal static bool NeedsPathVerification(string exe, GuardedAppFlags enabledApps)
+        {
+            if (enabledApps == GuardedAppFlags.None || string.IsNullOrEmpty(exe))
+            {
+                return false;
+            }
+
+            if ((enabledApps & GuardedAppFlags.Antigravity) != 0 && IsLanguageServerExeName(exe))
+            {
+                return true;
+            }
+
+            if ((enabledApps & GuardedAppFlags.ChatGPT) != 0 && IsChatGPTAuxiliaryExeName(exe))
+            {
+                return true;
+            }
+
+            if ((enabledApps & GuardedAppFlags.Claude) != 0 &&
+                string.Equals(exe, "Claude.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        internal static GuardedAppFlags MatchTargetImagePath(string fullPath, GuardedAppFlags enabledApps)
+        {
+            if (enabledApps == GuardedAppFlags.None || string.IsNullOrEmpty(fullPath))
+            {
+                return GuardedAppFlags.None;
+            }
+
+            int lastSlash = fullPath.LastIndexOf('\\');
+            string exe = lastSlash >= 0 ? fullPath.Substring(lastSlash + 1) : fullPath;
+
+            GuardedAppFlags direct = MatchDirectExeName(exe, enabledApps);
+            if (direct != GuardedAppFlags.None)
+            {
+                return direct;
+            }
+
+            if ((enabledApps & GuardedAppFlags.Antigravity) != 0 &&
+                IsLanguageServerExeName(exe) &&
+                IsAntigravityPath(fullPath))
+            {
+                return GuardedAppFlags.Antigravity;
+            }
+
+            if ((enabledApps & GuardedAppFlags.ChatGPT) != 0 &&
+                IsChatGPTAuxiliaryExeName(exe) &&
+                IsChatGPTDesktopPath(fullPath))
+            {
+                return GuardedAppFlags.ChatGPT;
+            }
+
+            if ((enabledApps & GuardedAppFlags.Claude) != 0 &&
+                string.Equals(exe, "Claude.exe", StringComparison.OrdinalIgnoreCase) &&
+                IsClaudeDesktopPath(fullPath))
+            {
+                return GuardedAppFlags.Claude;
+            }
+
+            return GuardedAppFlags.None;
+        }
+
         private static bool IsLanguageServerExeName(string exe)
         {
             return exe.StartsWith("language_server", StringComparison.OrdinalIgnoreCase) &&
@@ -4376,15 +4657,41 @@ namespace TunGuard
             return fullPath.IndexOf("\\antigravity\\", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        private static bool IsTargetImagePath(string fullPath)
+        private static bool IsChatGPTAuxiliaryExeName(string exe)
         {
-            int lastSlash = fullPath.LastIndexOf('\\');
-            string exe = lastSlash >= 0 ? fullPath.Substring(lastSlash + 1) : fullPath;
-            if (string.Equals(exe, "Antigravity.exe", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(exe, "Codex.exe", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
-            return IsLanguageServerExeName(exe) && IsAntigravityPath(fullPath);
+            return exe.StartsWith("ChatGPT", StringComparison.OrdinalIgnoreCase) &&
+                   exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsChatGPTDesktopPath(string fullPath)
+        {
+            return fullPath.IndexOf("\\WindowsApps\\OpenAI.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\OpenAI\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsClaudeDesktopDirectExeName(string exe)
+        {
+            return string.Equals(exe, "ClaudeDesktop.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "Claude Desktop.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "ClaudeCode.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "Claude Code.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsClaudeDesktopPath(string fullPath)
+        {
+            return fullPath.IndexOf("\\WindowsApps\\Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\WindowsApps\\Anthropic.Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\AnthropicClaude\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude-3p\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude Desktop\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude Code\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\ClaudeCode\\", StringComparison.OrdinalIgnoreCase) >= 0;
         }
     }
 
@@ -4479,7 +4786,7 @@ namespace TunGuard
         private FileSystemWatcher _watcher;
 
         // Single-threaded monitor/killer resources owned by Start() -> _watchdogThread
-        private readonly AntigravityKiller _killer = new AntigravityKiller();
+        private readonly TargetProcessKiller _killer = new TargetProcessKiller();
         private IntPtr _ifRowBuffer;
 
         // Lightweight signal state between callbacks and _watchdogThread (held for nanoseconds)
@@ -4542,8 +4849,8 @@ namespace TunGuard
         private readonly AutoResetEvent _wakeEvent = new AutoResetEvent(false);
 
         public event Action<TunStatus> StatusChanged;
-        public event Action<KillResult, string, TunStatus> AntigravityKilled;
-        public event Action<int, string> AccessDenied;
+        public event Action<KillResult, string, TunStatus> ProcessesKilled;
+        public event Action<int, GuardedAppFlags, string> AccessDenied;
         public event Action<NodeGuardConfig> NodeConfigChanged;
 
         public NodeGuardConfig CurrentNodeConfig
@@ -4605,7 +4912,7 @@ namespace TunGuard
             NodeGuardConfig normalized = (config != null ? config : new NodeGuardConfig()).CloneNormalized();
             _nodeConfig = normalized;
             _mihomoClient.InvalidateRulesCache();
-            SignalWake("节点守护设置更新", false, false, false, false, true, true, true, true);
+            SignalWake("守护配置更新", false, false, false, false, true, true, true, true);
         }
 
         public ClashSnapshot QueryLiveClashSnapshot()
@@ -4884,9 +5191,11 @@ namespace TunGuard
                 bool monitoring = _monitoringEnabled;
                 bool safe = _isGuardSafe;
                 bool tunActive = _isTunActive;
+                NodeGuardConfig loopCfg = _nodeConfig;
+                bool hasActiveTargets = loopCfg != null && loopCfg.GetGuardedAppFlags() != GuardedAppFlags.None;
                 int intervalMs = !monitoring
                     ? PAUSED_INTERVAL_MS
-                    : (safe ? ACTIVE_INTERVAL_MS : INACTIVE_GUARD_INTERVAL_MS);
+                    : ((safe || !hasActiveTargets) ? ACTIVE_INTERVAL_MS : INACTIVE_GUARD_INTERVAL_MS);
 
                 int waited;
                 try
@@ -4997,6 +5306,7 @@ namespace TunGuard
                     {
                         recheckNode = true;
                         refreshRules = true;
+                        forceFullScan = true;
                         if (string.IsNullOrEmpty(triggerSource))
                         {
                             triggerSource = "配置文件热更新";
@@ -5123,11 +5433,13 @@ namespace TunGuard
             next.IsGuardSafe = next.IsTunActive && (!next.NodeGuardEnabled || next.IsNodeAllowed);
 
             // Enforce BEFORE firing UI events so zero milliseconds are wasted on UI updates
+            GuardedAppFlags guardedApps = nodeCfg.GetGuardedAppFlags();
+            bool appsExpanded = _killer.SetEnabledApps(guardedApps);
             KillResult killRes = default(KillResult);
-            if (_monitoringEnabled && !next.IsGuardSafe)
+            if (_monitoringEnabled && !next.IsGuardSafe && guardedApps != GuardedAppFlags.None)
             {
                 bool becameUnsafe = wasSafe && !next.IsGuardSafe;
-                if (becameUnsafe || fullProcessScan)
+                if (becameUnsafe || fullProcessScan || appsExpanded)
                 {
                     killRes = _killer.KillAllNow();
                     ranFullScan = true;
@@ -5137,7 +5449,7 @@ namespace TunGuard
                     killRes = _killer.KillNewProcesses();
                 }
             }
-            else if (next.IsGuardSafe && !wasSafe)
+            else if ((next.IsGuardSafe && !wasSafe) || guardedApps == GuardedAppFlags.None)
             {
                 _killer.InvalidateCache();
             }
@@ -5162,7 +5474,7 @@ namespace TunGuard
 
             if (killRes.KilledCount > 0)
             {
-                Action<KillResult, string, TunStatus> killedHandler = AntigravityKilled;
+                Action<KillResult, string, TunStatus> killedHandler = ProcessesKilled;
                 if (killedHandler != null)
                 {
                     killedHandler(killRes, triggerSource, next);
@@ -5171,10 +5483,10 @@ namespace TunGuard
 
             if (killRes.AccessDeniedCount > 0)
             {
-                Action<int, string> deniedHandler = AccessDenied;
+                Action<int, GuardedAppFlags, string> deniedHandler = AccessDenied;
                 if (deniedHandler != null)
                 {
-                    deniedHandler(killRes.AccessDeniedCount, triggerSource);
+                    deniedHandler(killRes.AccessDeniedCount, killRes.DeniedApps, triggerSource);
                 }
             }
 
@@ -6268,7 +6580,7 @@ namespace TunGuard
 @"<?xml version=""1.0"" encoding=""UTF-16""?>
 <Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
   <RegistrationInfo>
-    <Description>Monitor Clash Verge TUN mode and node rules for Antigravity.</Description>
+    <Description>Monitor Clash Verge TUN mode and node rules for Antigravity, ChatGPT and Claude Desktop.</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -6439,6 +6751,9 @@ namespace TunGuard
         private readonly ToolTip _toolTip;
         private readonly Font _boldHeaderFont;
         private readonly System.Windows.Forms.Timer _searchDebounceTimer;
+        private readonly CheckBox _chkGuardAntigravity;
+        private readonly CheckBox _chkGuardChatGPT;
+        private readonly CheckBox _chkGuardClaude;
         private readonly CheckBox _chkEnabled;
         private readonly Label _lblClashStatus;
         private readonly Button _btnRefresh;
@@ -6479,6 +6794,7 @@ namespace TunGuard
         private string _lastActiveLeafNode = string.Empty;
         private int _refreshing;
         private bool _suppressFilterEvents;
+        private bool _suppressAppToggleEvents;
 
         public NodeGuardConfig ResultConfig { get; private set; }
 
@@ -6504,13 +6820,13 @@ namespace TunGuard
                 AddSelectionInternal(cfg.AllowedNodes[i]);
             }
 
-            Text = "允许节点设置 - TunGuard";
+            Text = "控制面板 - TunGuard";
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
             _boldHeaderFont = new Font(Font, FontStyle.Bold);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(860, 600);
-            MinimumSize = new Size(720, 500);
+            ClientSize = new Size(860, 645);
+            MinimumSize = new Size(720, 540);
             MaximizeBox = true;
             MinimizeBox = false;
             if (windowIcon != null)
@@ -6522,29 +6838,99 @@ namespace TunGuard
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 6,
+                RowCount = 7,
                 Padding = new Padding(14)
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Enable switch
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: Live Clash status banner
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2: Proxy group & match mode
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 3: Transfer box
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 4: Live preview
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 5: Footer buttons
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Guarded target apps
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: Enable node guard switch
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2: Live Clash status banner
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Proxy group & match mode
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 4: Transfer box
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 5: Live preview
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 6: Footer buttons
 
-            // Row 0: Enable checkbox
+            // Row 0: Guarded target apps selector
+            TableLayoutPanel targetAppsPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0, 0, 0, 8),
+                BackColor = Color.FromArgb(245, 247, 250),
+                Padding = new Padding(10, 7, 10, 7)
+            };
+            targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            Label lblTargetApps = new Label
+            {
+                Text = "受控应用:",
+                AutoSize = true,
+                Font = _boldHeaderFont,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 3, 12, 3)
+            };
+
+            FlowLayoutPanel targetAppsFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                WrapContents = true,
+                Margin = new Padding(0)
+            };
+
+            _chkGuardAntigravity = new CheckBox
+            {
+                Text = "Antigravity",
+                AutoSize = true,
+                Checked = cfg.GuardAntigravity,
+                Margin = new Padding(0, 2, 18, 2)
+            };
+            _toolTip.SetToolTip(_chkGuardAntigravity, "拦截 Antigravity.exe 及 Antigravity 目录下的 language_server*.exe");
+            _chkGuardAntigravity.CheckedChanged += OnTargetAppCheckedChanged;
+
+            _chkGuardChatGPT = new CheckBox
+            {
+                Text = "ChatGPT 桌面端",
+                AutoSize = true,
+                Checked = cfg.GuardChatGPT,
+                Margin = new Padding(0, 2, 18, 2)
+            };
+            _toolTip.SetToolTip(_chkGuardChatGPT, "拦截 Windows ChatGPT 桌面端（ChatGPT.exe 及 OpenAI 桌面应用组件）");
+            _chkGuardChatGPT.CheckedChanged += OnTargetAppCheckedChanged;
+
+            _chkGuardClaude = new CheckBox
+            {
+                Text = "Claude 桌面端 (Claude Code)",
+                AutoSize = true,
+                Checked = cfg.GuardClaude,
+                Margin = new Padding(0, 2, 0, 2)
+            };
+            _toolTip.SetToolTip(_chkGuardClaude, "拦截 Claude / Claude Code 桌面端（Claude.exe 及桌面端内嵌 claude-code 进程，不影响 VS Code 插件或命令行 CLI）");
+            _chkGuardClaude.CheckedChanged += OnTargetAppCheckedChanged;
+
+            targetAppsFlow.Controls.Add(_chkGuardAntigravity);
+            targetAppsFlow.Controls.Add(_chkGuardChatGPT);
+            targetAppsFlow.Controls.Add(_chkGuardClaude);
+
+            targetAppsPanel.Controls.Add(lblTargetApps, 0, 0);
+            targetAppsPanel.Controls.Add(targetAppsFlow, 1, 0);
+            root.Controls.Add(targetAppsPanel, 0, 0);
+
+            // Row 1: Enable node guard checkbox
             _chkEnabled = new CheckBox
             {
-                Text = "启用 Clash 节点守护（当 Clash 未使用右侧允许节点时，同样立即终止 Antigravity）",
+                Text = "启用 Clash 节点守护（当 Clash 未使用右侧允许节点时，同样立即终止已勾选的受控应用）",
                 AutoSize = true,
                 Checked = cfg.Enabled,
                 Margin = new Padding(0, 0, 0, 8)
             };
             _chkEnabled.CheckedChanged += OnRuleInputChanged;
-            root.Controls.Add(_chkEnabled, 0, 0);
+            root.Controls.Add(_chkEnabled, 0, 1);
 
-            // Row 1: Live Clash status bar
+            // Row 2: Live Clash status bar
             TableLayoutPanel statusPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -6575,9 +6961,9 @@ namespace TunGuard
 
             statusPanel.Controls.Add(_lblClashStatus, 0, 0);
             statusPanel.Controls.Add(_btnRefresh, 1, 0);
-            root.Controls.Add(statusPanel, 0, 1);
+            root.Controls.Add(statusPanel, 0, 2);
 
-            // Row 2: Proxy group & match mode
+            // Row 3: Proxy group & match mode
             TableLayoutPanel rulePanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -6657,9 +7043,9 @@ namespace TunGuard
             rulePanel.Controls.Add(matchFlow, 3, 0);
             rulePanel.Controls.Add(lblGroupHint, 0, 1);
             rulePanel.SetColumnSpan(lblGroupHint, 4);
-            root.Controls.Add(rulePanel, 0, 2);
+            root.Controls.Add(rulePanel, 0, 3);
 
-            // Row 3: Transfer Box (Left pane | Transfer buttons | Right pane)
+            // Row 4: Transfer Box (Left pane | Transfer buttons | Right pane)
             TableLayoutPanel transfer = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -6905,9 +7291,9 @@ namespace TunGuard
             transfer.Controls.Add(leftPane, 0, 0);
             transfer.Controls.Add(midPanel, 1, 0);
             transfer.Controls.Add(rightPane, 2, 0);
-            root.Controls.Add(transfer, 0, 3);
+            root.Controls.Add(transfer, 0, 4);
 
-            // Row 4: Live preview
+            // Row 5: Live preview
             _lblPreview = new Label
             {
                 Text = "预览: 正在检测...",
@@ -6915,9 +7301,9 @@ namespace TunGuard
                 Dock = DockStyle.Fill,
                 Margin = new Padding(0, 0, 0, 10)
             };
-            root.Controls.Add(_lblPreview, 0, 4);
+            root.Controls.Add(_lblPreview, 0, 5);
 
-            // Row 5: Footer buttons
+            // Row 6: Footer buttons
             FlowLayoutPanel footer = new FlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -6947,7 +7333,7 @@ namespace TunGuard
 
             footer.Controls.Add(_btnCancel);
             footer.Controls.Add(_btnSave);
-            root.Controls.Add(footer, 0, 5);
+            root.Controls.Add(footer, 0, 6);
 
             Controls.Add(root);
             CancelButton = _btnCancel;
@@ -7039,10 +7425,42 @@ namespace TunGuard
             _selectedOrder.Clear();
         }
 
+        public void SyncGuardedApps(NodeGuardConfig config)
+        {
+            if (IsDisposed || config == null)
+            {
+                return;
+            }
+            _suppressAppToggleEvents = true;
+            try
+            {
+                _chkGuardAntigravity.Checked = config.GuardAntigravity;
+                _chkGuardChatGPT.Checked = config.GuardChatGPT;
+                _chkGuardClaude.Checked = config.GuardClaude;
+            }
+            finally
+            {
+                _suppressAppToggleEvents = false;
+            }
+            UpdatePreview();
+        }
+
+        private void OnTargetAppCheckedChanged(object sender, EventArgs e)
+        {
+            if (_suppressAppToggleEvents)
+            {
+                return;
+            }
+            UpdatePreview();
+        }
+
         public NodeGuardConfig BuildDraftConfig()
         {
             NodeGuardConfig draft = new NodeGuardConfig();
             draft.Enabled = _chkEnabled.Checked;
+            draft.GuardAntigravity = _chkGuardAntigravity.Checked;
+            draft.GuardChatGPT = _chkGuardChatGPT.Checked;
+            draft.GuardClaude = _chkGuardClaude.Checked;
 
             string rawGroup = _cmbProxyGroup.Text != null ? _cmbProxyGroup.Text.Trim() : string.Empty;
             draft.ProxyGroup = string.Equals(rawGroup, AutoGroupLabel, StringComparison.Ordinal)
@@ -7517,10 +7935,19 @@ namespace TunGuard
         private void UpdatePreview()
         {
             NodeGuardConfig draft = BuildDraftConfig();
+            GuardedAppFlags apps = draft.GetGuardedAppFlags();
+            if (apps == GuardedAppFlags.None)
+            {
+                _lblPreview.ForeColor = Color.FromArgb(180, 83, 9);
+                _lblPreview.Text = "预览: 未勾选任何受控应用（TUN 断开或节点不匹配时不会终止任何进程）";
+                return;
+            }
+
+            string appsText = GuardedAppHelper.FormatNames(apps);
             if (!draft.Enabled)
             {
                 _lblPreview.ForeColor = Color.FromArgb(100, 116, 139);
-                _lblPreview.Text = "预览: 节点守护未启用（仅监控 TUN 模式状态）";
+                _lblPreview.Text = "预览: 节点守护未启用（仅监控 TUN 模式；受控应用: " + appsText + "）";
                 return;
             }
 
@@ -7542,12 +7969,12 @@ namespace TunGuard
             if (eval.IsAllowed)
             {
                 _lblPreview.ForeColor = Color.FromArgb(21, 128, 61);
-                _lblPreview.Text = "预览: 当前命中 — " + eval.ResolutionChain + "（保存后正常放行）";
+                _lblPreview.Text = "预览: 当前命中 — " + eval.ResolutionChain + "（保存后正常放行；受控应用: " + appsText + "）";
             }
             else
             {
                 _lblPreview.ForeColor = Color.FromArgb(185, 28, 28);
-                _lblPreview.Text = "预览: 当前未命中 — " + eval.Reason + "（保存后将立即触发拦截！）";
+                _lblPreview.Text = "预览: 当前未命中 — " + eval.Reason + "（保存后将立即拦截: " + appsText + "！）";
             }
         }
 
@@ -7565,14 +7992,15 @@ namespace TunGuard
                 return;
             }
 
-            if (draft.Enabled && _lastSnapshot != null)
+            GuardedAppFlags apps = draft.GetGuardedAppFlags();
+            if (draft.Enabled && apps != GuardedAppFlags.None && _lastSnapshot != null)
             {
                 NodeEvaluationResult eval = NodeGuardEvaluator.Evaluate(draft, _lastSnapshot);
                 if (!eval.IsAllowed)
                 {
                     DialogResult confirm = MessageBox.Show(
                         this,
-                        "当前 Clash 状态未满足右侧允许节点规则：\n" + eval.Reason + "\n\n保存后将立即触发拦截并终止 Antigravity。\n是否确认保存？",
+                        "当前 Clash 状态未满足右侧允许节点规则：\n" + eval.Reason + "\n\n保存后将立即触发拦截并终止 " + GuardedAppHelper.FormatNames(apps) + "。\n是否确认保存？",
                         "确认保存并触发拦截",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Warning,
@@ -7614,9 +8042,14 @@ namespace TunGuard
         private readonly ContextMenuStrip _menu;
         private readonly NotifyIcon _trayIcon;
         private readonly ToolStripMenuItem _statusItem;
+        private readonly ToolStripMenuItem _guardedAppsSummaryItem;
         private readonly ToolStripMenuItem _nodeRuleItem;
         private readonly ToolStripMenuItem _lastKillItem;
         private readonly ToolStripMenuItem _nodeSettingsItem;
+        private readonly ToolStripMenuItem _guardedAppsMenu;
+        private readonly ToolStripMenuItem _guardAntigravityItem;
+        private readonly ToolStripMenuItem _guardChatGPTItem;
+        private readonly ToolStripMenuItem _guardClaudeItem;
         private readonly ToolStripMenuItem _toggleMonitorItem;
         private readonly ToolStripMenuItem _autoStartItem;
 
@@ -7650,13 +8083,28 @@ namespace TunGuard
             _iconPaused = TrayIconFactory.CreateStatusIcon(Color.FromArgb(107, 114, 128), Color.FromArgb(75, 85, 99));
 
             _statusItem = new ToolStripMenuItem("状态: 正在检测...") { Enabled = false };
+            _guardedAppsSummaryItem = new ToolStripMenuItem("受控应用: Antigravity、ChatGPT、Claude") { Enabled = false };
             _nodeRuleItem = new ToolStripMenuItem("节点守护: 未启用") { Enabled = false };
             _lastKillItem = new ToolStripMenuItem("拦截记录: 暂无") { Enabled = false };
 
-            _nodeSettingsItem = new ToolStripMenuItem("配置允许节点...");
+            _nodeSettingsItem = new ToolStripMenuItem("打开控制面板...");
             _boldMenuFont = new Font(_nodeSettingsItem.Font, FontStyle.Bold);
             _nodeSettingsItem.Font = _boldMenuFont;
             _nodeSettingsItem.Click += OnNodeSettingsClick;
+
+            _guardAntigravityItem = new ToolStripMenuItem("Antigravity") { Checked = true };
+            _guardAntigravityItem.Click += (s, e) => OnToggleGuardedAppClick(GuardedAppFlags.Antigravity);
+
+            _guardChatGPTItem = new ToolStripMenuItem("ChatGPT 桌面端") { Checked = true };
+            _guardChatGPTItem.Click += (s, e) => OnToggleGuardedAppClick(GuardedAppFlags.ChatGPT);
+
+            _guardClaudeItem = new ToolStripMenuItem("Claude 桌面端 (Claude Code)") { Checked = true };
+            _guardClaudeItem.Click += (s, e) => OnToggleGuardedAppClick(GuardedAppFlags.Claude);
+
+            _guardedAppsMenu = new ToolStripMenuItem("受控应用");
+            _guardedAppsMenu.DropDownItems.Add(_guardAntigravityItem);
+            _guardedAppsMenu.DropDownItems.Add(_guardChatGPTItem);
+            _guardedAppsMenu.DropDownItems.Add(_guardClaudeItem);
 
             _toggleMonitorItem = new ToolStripMenuItem("启用实时监控") { Checked = true };
             _toggleMonitorItem.Click += OnToggleMonitorClick;
@@ -7669,10 +8117,12 @@ namespace TunGuard
 
             _menu = new ContextMenuStrip();
             _menu.Items.Add(_statusItem);
+            _menu.Items.Add(_guardedAppsSummaryItem);
             _menu.Items.Add(_nodeRuleItem);
             _menu.Items.Add(_lastKillItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_nodeSettingsItem);
+            _menu.Items.Add(_guardedAppsMenu);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_toggleMonitorItem);
             _menu.Items.Add(_autoStartItem);
@@ -7693,7 +8143,7 @@ namespace TunGuard
             // Start monitoring immediately before any slow shell queries (e.g., schtasks.exe)
             _monitor = new TunMonitor();
             _monitor.StatusChanged += OnMonitorStatusChanged;
-            _monitor.AntigravityKilled += OnAntigravityKilled;
+            _monitor.ProcessesKilled += OnProcessesKilled;
             _monitor.AccessDenied += OnAccessDenied;
             _monitor.NodeConfigChanged += OnNodeConfigChanged;
             _monitor.Start();
@@ -7765,33 +8215,94 @@ namespace TunGuard
             {
                 if (!_disposed && config != null)
                 {
+                    SyncGuardedAppsUi(config);
                     _nodeRuleItem.Text = config.GetSummaryText();
+                    if (_settingsForm != null && !_settingsForm.IsDisposed)
+                    {
+                        _settingsForm.SyncGuardedApps(config);
+                    }
+                    UpdateTrayUi(_monitor.CurrentStatus);
                 }
             });
         }
 
-        private void OnAntigravityKilled(KillResult result, string trigger, TunStatus status)
+        private void SyncGuardedAppsUi(NodeGuardConfig config)
+        {
+            NodeGuardConfig cfg = config ?? new NodeGuardConfig();
+            _guardedAppsSummaryItem.Text = cfg.GetGuardedAppsSummaryText();
+            _guardAntigravityItem.Checked = cfg.GuardAntigravity;
+            _guardChatGPTItem.Checked = cfg.GuardChatGPT;
+            _guardClaudeItem.Checked = cfg.GuardClaude;
+        }
+
+        private void OnToggleGuardedAppClick(GuardedAppFlags appFlag)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            NodeGuardConfig current = _monitor.CurrentNodeConfig ?? new NodeGuardConfig();
+            NodeGuardConfig next = current.CloneNormalized();
+            if (appFlag == GuardedAppFlags.Antigravity)
+            {
+                next.GuardAntigravity = !next.GuardAntigravity;
+            }
+            else if (appFlag == GuardedAppFlags.ChatGPT)
+            {
+                next.GuardChatGPT = !next.GuardChatGPT;
+            }
+            else if (appFlag == GuardedAppFlags.Claude)
+            {
+                next.GuardClaude = !next.GuardClaude;
+            }
+
+            try
+            {
+                NodeGuardConfigStore.Save(_monitor.NodeConfigPath, next);
+            }
+            catch (Exception ex)
+            {
+                _trayIcon.ShowBalloonTip(3000, "保存受控应用设置失败", ex.Message, ToolTipIcon.Error);
+                return;
+            }
+
+            _monitor.ApplyNodeGuardConfig(next);
+            SyncGuardedAppsUi(next);
+            if (_settingsForm != null && !_settingsForm.IsDisposed)
+            {
+                _settingsForm.SyncGuardedApps(next);
+            }
+            UpdateTrayUi(_monitor.CurrentStatus);
+        }
+
+        private void OnProcessesKilled(KillResult result, string trigger, TunStatus status)
         {
             int count = Interlocked.Increment(ref _totalKills);
             string timeText = DateTime.Now.ToString("HH:mm:ss");
             bool isNodeTrigger = status.IsTunActive && status.NodeGuardEnabled && !status.IsNodeAllowed;
+            string killedNames = result.KilledApps != GuardedAppFlags.None
+                ? GuardedAppHelper.FormatNames(result.KilledApps)
+                : "受控应用";
+            string killedShortNames = result.KilledApps != GuardedAppFlags.None
+                ? GuardedAppHelper.FormatShortNames(result.KilledApps)
+                : "受控应用";
             string balloonTitle = isNodeTrigger
-                ? "Clash 节点不匹配 — 已终止 Antigravity"
-                : "TUN 已关闭 — 已终止 Antigravity";
+                ? ("Clash 节点不匹配 — 已终止 " + killedNames)
+                : ("TUN 已关闭 — 已终止 " + killedNames);
             string detailReason = isNodeTrigger ? status.NodeReason : status.Reason;
 
             PostToUi(() =>
             {
-                _lastKillItem.Text = string.Format("上次拦截: {0} ({1}进程, {2:F2}ms)", timeText, result.KilledCount, result.FirstPassMs);
+                _lastKillItem.Text = string.Format("上次拦截: {0} ({1}, {2}进程, {3:F2}ms)", timeText, killedShortNames, result.KilledCount, result.FirstPassMs);
                 _trayIcon.ShowBalloonTip(
                     2500,
                     balloonTitle,
-                    string.Format("触发源: {0}\n原因: {1}\n已终止 {2} 个进程，首轮耗时 {3:F2} ms (累计拦截 {4} 次)", trigger, detailReason, result.KilledCount, result.FirstPassMs, count),
+                    string.Format("触发源: {0}\n原因: {1}\n已终止 {2} 共 {3} 个进程，首轮耗时 {4:F2} ms (累计拦截 {5} 次)", trigger, detailReason, killedNames, result.KilledCount, result.FirstPassMs, count),
                     ToolTipIcon.Warning);
             });
         }
 
-        private void OnAccessDenied(int deniedCount, string trigger)
+        private void OnAccessDenied(int deniedCount, GuardedAppFlags deniedApps, string trigger)
         {
             long nowTicks = DateTime.UtcNow.Ticks;
             long prevTicks = Interlocked.Read(ref _lastAccessDeniedNotifyTicks);
@@ -7805,13 +8316,16 @@ namespace TunGuard
             }
 
             string timeText = DateTime.Now.ToString("HH:mm:ss");
+            string appNames = deniedApps != GuardedAppFlags.None
+                ? GuardedAppHelper.FormatNames(deniedApps)
+                : "受控应用";
             PostToUi(() =>
             {
                 _lastKillItem.Text = string.Format("权限不足: {0} ({1}进程无法终止)", timeText, deniedCount);
                 _trayIcon.ShowBalloonTip(
                     3000,
-                    "权限不足 — 无法终止 Antigravity",
-                    string.Format("触发源: {0}\n检测到 {1} 个目标进程但无权终止，请以管理员身份运行 TunGuard。", trigger, deniedCount),
+                    "权限不足 — 无法终止 " + appNames,
+                    string.Format("触发源: {0}\n检测到 {1} 个 {2} 进程但无权终止，请以管理员身份运行 TunGuard。", trigger, deniedCount, appNames),
                     ToolTipIcon.Error);
             });
         }
@@ -7833,7 +8347,9 @@ namespace TunGuard
             }
 
             NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
+            SyncGuardedAppsUi(cfg);
             _nodeRuleItem.Text = cfg != null ? cfg.GetSummaryText() : "节点守护: 未启用";
+            bool hasTargets = cfg == null || cfg.GetGuardedAppFlags() != GuardedAppFlags.None;
 
             if (!_monitor.MonitoringEnabled)
             {
@@ -7864,13 +8380,17 @@ namespace TunGuard
             else if (!status.IsTunActive)
             {
                 _trayIcon.Icon = _iconAlert;
-                _trayIcon.Text = "Clash TUN 守护 | TUN: 已关闭 (禁止启动)";
+                _trayIcon.Text = hasTargets
+                    ? "Clash TUN 守护 | TUN: 已关闭 (禁止启动)"
+                    : "Clash TUN 守护 | TUN: 已关闭 (未勾选受控应用)";
                 _statusItem.Text = "状态: TUN 已关闭 (" + status.Reason + ")";
             }
             else
             {
                 _trayIcon.Icon = _iconAlert;
-                _trayIcon.Text = "Clash TUN 守护 | 节点不匹配 (禁止启动)";
+                _trayIcon.Text = hasTargets
+                    ? "Clash TUN 守护 | 节点不匹配 (禁止启动)"
+                    : "Clash TUN 守护 | 节点不匹配 (未勾选受控应用)";
                 _statusItem.Text = "状态: 已拦截 (" + status.NodeReason + ")";
             }
         }
@@ -7959,9 +8479,10 @@ namespace TunGuard
                 return;
             }
             TunStatus s = _monitor.CurrentStatus;
+            NodeGuardConfig cfg = _monitor.CurrentNodeConfig ?? new NodeGuardConfig();
             string mode = _monitor.MonitoringEnabled ? "实时监控中" : "已暂停监控";
             string tunLine = s.IsTunActive ? ("TUN: 已开启 (" + s.AdapterAlias + ")") : ("TUN: 已关闭 (" + s.Reason + ")");
-            string body = mode + "\n" + tunLine;
+            string body = mode + "\n" + cfg.GetGuardedAppsSummaryText() + "\n" + tunLine;
             if (s.NodeGuardEnabled)
             {
                 string nodeDetail = !string.IsNullOrEmpty(s.ActiveNodeChain)
