@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("TunGuard")]
 [assembly: AssemblyDescription("Clash Verge TUN and Node Guard for Antigravity, ChatGPT and Claude Desktop")]
 [assembly: AssemblyProduct("TunGuard")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 namespace TunGuard
 {
@@ -133,6 +133,7 @@ namespace TunGuard
         public bool HasDefaultRoute;
         public bool AutoRouteRequired;
         public uint AdapterIndex;
+        public ulong AdapterLuid;
         public string AdapterAlias;
         public string Reason;
 
@@ -143,6 +144,15 @@ namespace TunGuard
         public string ActiveNodeName;
         public string ActiveNodeChain;
         public string NodeReason;
+
+        public bool WfpEnabled;
+        public bool WfpActive;
+        public bool WfpDegraded;
+        public bool WfpBlockingNow;
+        public bool WfpDnsGuardActive;
+        public int WfpExeTargetCount;
+        public int WfpPackageTargetCount;
+        public string WfpStatusText;
     }
 
     [Flags]
@@ -213,6 +223,10 @@ namespace TunGuard
         public bool GuardAntigravity { get; set; }
         public bool GuardChatGPT { get; set; }
         public bool GuardClaude { get; set; }
+        public bool WfpEnabled { get; set; }
+        public bool WfpKillOnBlock { get; set; }
+        public bool WfpBlockNonTunDns { get; set; }
+        public Dictionary<string, List<string>> DiscoveredAppPaths { get; set; }
 
         public NodeGuardConfig()
         {
@@ -223,6 +237,10 @@ namespace TunGuard
             GuardAntigravity = true;
             GuardChatGPT = true;
             GuardClaude = true;
+            WfpEnabled = true;
+            WfpKillOnBlock = true;
+            WfpBlockNonTunDns = false;
+            DiscoveredAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         }
 
         public GuardedAppFlags GetGuardedAppFlags()
@@ -245,6 +263,9 @@ namespace TunGuard
             copy.GuardAntigravity = GuardAntigravity;
             copy.GuardChatGPT = GuardChatGPT;
             copy.GuardClaude = GuardClaude;
+            copy.WfpEnabled = WfpEnabled;
+            copy.WfpKillOnBlock = WfpKillOnBlock;
+            copy.WfpBlockNonTunDns = WfpBlockNonTunDns;
 
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (AllowedNodes != null)
@@ -260,6 +281,40 @@ namespace TunGuard
                     if (seen.Add(trimmed))
                     {
                         copy.AllowedNodes.Add(trimmed);
+                    }
+                }
+            }
+
+            if (DiscoveredAppPaths != null)
+            {
+                string[] knownKeys = new string[] { "antigravity", "chatgpt", "claude" };
+                for (int k = 0; k < knownKeys.Length; k++)
+                {
+                    string key = knownKeys[k];
+                    List<string> srcList;
+                    if (!DiscoveredAppPaths.TryGetValue(key, out srcList) || srcList == null || srcList.Count == 0)
+                    {
+                        continue;
+                    }
+                    HashSet<string> seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    List<string> cleanList = new List<string>();
+                    for (int i = 0; i < srcList.Count; i++)
+                    {
+                        string rawPath = srcList[i];
+                        if (string.IsNullOrWhiteSpace(rawPath))
+                        {
+                            continue;
+                        }
+                        string trimmedPath = rawPath.Trim();
+                        if (seenPaths.Add(trimmedPath))
+                        {
+                            cleanList.Add(trimmedPath);
+                        }
+                    }
+                    if (cleanList.Count > 0)
+                    {
+                        cleanList.Sort(StringComparer.OrdinalIgnoreCase);
+                        copy.DiscoveredAppPaths[key] = cleanList;
                     }
                 }
             }
@@ -462,13 +517,71 @@ namespace TunGuard
                 }
             }
 
+            if (TryGetBoolIgnoreCase(obj, "wfpEnabled", out parsedBool))
+            {
+                cfg.WfpEnabled = parsedBool;
+            }
+            if (TryGetBoolIgnoreCase(obj, "wfpKillOnBlock", out parsedBool))
+            {
+                cfg.WfpKillOnBlock = parsedBool;
+            }
+            if (TryGetBoolIgnoreCase(obj, "wfpBlockNonTunDns", out parsedBool))
+            {
+                cfg.WfpBlockNonTunDns = parsedBool;
+            }
+
+            if (TryGetIgnoreCase(obj, "discoveredAppPaths", out val) && val != null)
+            {
+                Dictionary<string, object> pathsObj = val as Dictionary<string, object>;
+                if (pathsObj != null)
+                {
+                    foreach (KeyValuePair<string, object> kv in pathsObj)
+                    {
+                        if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value == null)
+                        {
+                            continue;
+                        }
+                        List<string> pathList = new List<string>();
+                        object[] arr = kv.Value as object[];
+                        if (arr != null)
+                        {
+                            for (int i = 0; i < arr.Length; i++)
+                            {
+                                if (arr[i] != null)
+                                {
+                                    pathList.Add(arr[i].ToString());
+                                }
+                            }
+                        }
+                        else
+                        {
+                            System.Collections.IList list = kv.Value as System.Collections.IList;
+                            if (list != null)
+                            {
+                                for (int i = 0; i < list.Count; i++)
+                                {
+                                    if (list[i] != null)
+                                    {
+                                        pathList.Add(list[i].ToString());
+                                    }
+                                }
+                            }
+                        }
+                        if (pathList.Count > 0)
+                        {
+                            cfg.DiscoveredAppPaths[kv.Key] = pathList;
+                        }
+                    }
+                }
+            }
+
             return cfg.CloneNormalized();
         }
 
         public static string SerializePretty(NodeGuardConfig config)
         {
             NodeGuardConfig cfg = (config != null ? config : new NodeGuardConfig()).CloneNormalized();
-            StringBuilder sb = new StringBuilder(320);
+            StringBuilder sb = new StringBuilder(512);
             sb.AppendLine("{");
             sb.Append("  \"enabled\": ").Append(cfg.Enabled ? "true" : "false").AppendLine(",");
             sb.Append("  \"proxyGroup\": ").Append(EscapeJsonString(cfg.ProxyGroup)).AppendLine(",");
@@ -493,7 +606,50 @@ namespace TunGuard
             sb.Append("    \"antigravity\": ").Append(cfg.GuardAntigravity ? "true" : "false").AppendLine(",");
             sb.Append("    \"chatgpt\": ").Append(cfg.GuardChatGPT ? "true" : "false").AppendLine(",");
             sb.Append("    \"claude\": ").Append(cfg.GuardClaude ? "true" : "false").AppendLine();
-            sb.AppendLine("  }");
+            sb.AppendLine("  },");
+            sb.Append("  \"wfpEnabled\": ").Append(cfg.WfpEnabled ? "true" : "false").AppendLine(",");
+            sb.Append("  \"wfpKillOnBlock\": ").Append(cfg.WfpKillOnBlock ? "true" : "false").AppendLine(",");
+            sb.Append("  \"wfpBlockNonTunDns\": ").Append(cfg.WfpBlockNonTunDns ? "true" : "false");
+
+            bool hasDiscovered = cfg.DiscoveredAppPaths != null && cfg.DiscoveredAppPaths.Count > 0;
+            if (hasDiscovered)
+            {
+                sb.AppendLine(",");
+                sb.AppendLine("  \"discoveredAppPaths\": {");
+                List<string> keys = new List<string>(cfg.DiscoveredAppPaths.Keys);
+                keys.Sort(StringComparer.OrdinalIgnoreCase);
+                for (int k = 0; k < keys.Count; k++)
+                {
+                    string key = keys[k];
+                    List<string> paths = cfg.DiscoveredAppPaths[key];
+                    sb.Append("    ").Append(EscapeJsonString(key)).Append(": [");
+                    if (paths != null && paths.Count > 0)
+                    {
+                        sb.AppendLine();
+                        for (int i = 0; i < paths.Count; i++)
+                        {
+                            sb.Append("      ").Append(EscapeJsonString(paths[i]));
+                            if (i < paths.Count - 1)
+                            {
+                                sb.Append(",");
+                            }
+                            sb.AppendLine();
+                        }
+                        sb.Append("    ");
+                    }
+                    sb.Append("]");
+                    if (k < keys.Count - 1)
+                    {
+                        sb.Append(",");
+                    }
+                    sb.AppendLine();
+                }
+                sb.AppendLine("  }");
+            }
+            else
+            {
+                sb.AppendLine();
+            }
             sb.AppendLine("}");
             return sb.ToString();
         }
@@ -4125,6 +4281,140 @@ namespace TunGuard
         private bool _benignCacheValid;
         private GuardedAppFlags _enabledApps = GuardedAppFlags.All;
 
+        // Independent fast-path buffers for passive running-path discovery (WFP hot-add)
+        private uint[] _discoverPidBuffer = new uint[1024];
+        private uint[] _discoverLastSnapshot = new uint[1024];
+        private int _discoverLastSnapshotCount;
+        private bool _discoverLastSnapshotValid;
+        private HashSet<uint> _discoverPrevSeenPids = new HashSet<uint>();
+        private HashSet<uint> _discoverNextSeenPids = new HashSet<uint>();
+        private readonly StringBuilder _discoverPathBuf = new StringBuilder(2048);
+
+        public void ResetDiscoveryCache()
+        {
+            _discoverLastSnapshotValid = false;
+            _discoverLastSnapshotCount = 0;
+            _discoverPrevSeenPids.Clear();
+            _discoverNextSeenPids.Clear();
+        }
+
+        // Zero-allocation fast-path scan of newly spawned processes to discover exe paths for WFP
+        public bool DiscoverNewProcessPaths(
+            bool forceFullRescan,
+            Action<string> onImagePathFound)
+        {
+            if (onImagePathFound == null)
+            {
+                return false;
+            }
+
+            if (forceFullRescan)
+            {
+                ResetDiscoveryCache();
+            }
+
+            int pidCount;
+            if (!EnumerateProcessIdsInto(ref _discoverPidBuffer, out pidCount))
+            {
+                return false;
+            }
+
+            if (_discoverLastSnapshotValid && pidCount == _discoverLastSnapshotCount)
+            {
+                bool identical = true;
+                for (int i = 0; i < pidCount; i++)
+                {
+                    if (_discoverPidBuffer[i] != _discoverLastSnapshot[i])
+                    {
+                        identical = false;
+                        break;
+                    }
+                }
+                if (identical)
+                {
+                    return false;
+                }
+            }
+
+            _discoverNextSeenPids.Clear();
+            bool inspectedAny = false;
+            for (int i = 0; i < pidCount; i++)
+            {
+                uint pid = _discoverPidBuffer[i];
+                if (pid == 0 || pid == SelfPid)
+                {
+                    continue;
+                }
+
+                if (_discoverPrevSeenPids.Contains(pid))
+                {
+                    _discoverNextSeenPids.Add(pid);
+                    continue;
+                }
+
+                inspectedAny = true;
+                IntPtr hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hQuery != IntPtr.Zero)
+                {
+                    try
+                    {
+                        _discoverPathBuf.Clear();
+                        uint size = (uint)_discoverPathBuf.Capacity;
+                        if (QueryFullProcessImageNameW(hQuery, 0, _discoverPathBuf, ref size) && size > 0)
+                        {
+                            onImagePathFound(_discoverPathBuf.ToString());
+                        }
+                    }
+                    finally
+                    {
+                        CloseHandle(hQuery);
+                    }
+                    _discoverNextSeenPids.Add(pid);
+                }
+                else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    // Protected/system process we cannot query; skip until PID recycles
+                    _discoverNextSeenPids.Add(pid);
+                }
+            }
+
+            HashSet<uint> swap = _discoverPrevSeenPids;
+            _discoverPrevSeenPids = _discoverNextSeenPids;
+            _discoverNextSeenPids = swap;
+
+            if (_discoverLastSnapshot.Length < pidCount)
+            {
+                _discoverLastSnapshot = new uint[_discoverPidBuffer.Length];
+            }
+            Array.Copy(_discoverPidBuffer, _discoverLastSnapshot, pidCount);
+            _discoverLastSnapshotCount = pidCount;
+            _discoverLastSnapshotValid = true;
+            return inspectedAny;
+        }
+
+        private static bool EnumerateProcessIdsInto(ref uint[] buffer, out int count)
+        {
+            count = 0;
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                uint cb = (uint)(buffer.Length * sizeof(uint));
+                uint needed;
+                if (!K32EnumProcesses(buffer, cb, out needed))
+                {
+                    return false;
+                }
+
+                if (needed < cb || buffer.Length >= 65536)
+                {
+                    count = (int)(needed / sizeof(uint));
+                    return true;
+                }
+
+                buffer = new uint[Math.Min(buffer.Length * 2, 65536)];
+            }
+            return false;
+        }
+
         // Returns true if any previously disabled target app was newly enabled
         public bool SetEnabledApps(GuardedAppFlags apps)
         {
@@ -4695,6 +4985,1807 @@ namespace TunGuard
         }
     }
 
+    internal sealed class GuardedAppPathResolver
+    {
+        private static readonly HashSet<string> SkipDirNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "node_modules", ".git", "cache", "gpucache", "code cache", "locales",
+            "blob_storage", "indexeddb", "local storage", "session storage", "crashpad", "logs"
+        };
+
+        private readonly object _lock = new object();
+        private readonly HashSet<string> _antigravityPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _chatGptPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _claudePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _chatGptPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _claudePackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _mihomoPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private bool _cacheDirty;
+
+        public bool HasDirtyCache
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _cacheDirty;
+                }
+            }
+        }
+
+        public void LoadFromConfigCache(NodeGuardConfig cfg)
+        {
+            if (cfg == null || cfg.DiscoveredAppPaths == null)
+            {
+                return;
+            }
+
+            lock (_lock)
+            {
+                LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "antigravity", GuardedAppFlags.Antigravity, _antigravityPaths);
+                LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "chatgpt", GuardedAppFlags.ChatGPT, _chatGptPaths);
+                LoadCachedKeyLocked(cfg.DiscoveredAppPaths, "claude", GuardedAppFlags.Claude, _claudePaths);
+            }
+        }
+
+        private static void LoadCachedKeyLocked(
+            Dictionary<string, List<string>> map,
+            string key,
+            GuardedAppFlags appFlag,
+            HashSet<string> targetSet)
+        {
+            List<string> list;
+            if (!map.TryGetValue(key, out list) || list == null)
+            {
+                return;
+            }
+            for (int i = 0; i < list.Count; i++)
+            {
+                string norm = NormalizeExistingFile(list[i]);
+                if (norm != null && TargetProcessKiller.MatchTargetImagePath(norm, appFlag) != GuardedAppFlags.None)
+                {
+                    targetSet.Add(norm);
+                }
+            }
+        }
+
+        public void ScanStaticInstallations()
+        {
+            List<string> foundAnti = new List<string>();
+            List<string> foundChat = new List<string>();
+            List<string> foundClaude = new List<string>();
+            List<string> foundChatPkg = new List<string>();
+            List<string> foundClaudePkg = new List<string>();
+            List<string> foundMihomo = new List<string>();
+
+            // 1. MSIX / AppModel registry packages (Claude Desktop & ChatGPT Desktop)
+            ScanAppxPackages(foundChat, foundClaude, foundChatPkg, foundClaudePkg);
+
+            // 2. Standard desktop installation directories
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string progFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string progFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+            string[] antiDirs = new string[]
+            {
+                CombineSafe(localAppData, "Programs\\antigravity"),
+                CombineSafe(localAppData, "Antigravity"),
+                CombineSafe(progFiles, "Antigravity"),
+                CombineSafe(progFilesX86, "Antigravity")
+            };
+            for (int i = 0; i < antiDirs.Length; i++)
+            {
+                ScanDirectoryForApp(antiDirs[i], GuardedAppFlags.Antigravity, 3, foundAnti);
+            }
+
+            string[] chatDirs = new string[]
+            {
+                CombineSafe(localAppData, "Programs\\ChatGPT"),
+                CombineSafe(localAppData, "ChatGPT"),
+                CombineSafe(progFiles, "ChatGPT"),
+                CombineSafe(progFiles, "OpenAI\\ChatGPT")
+            };
+            for (int i = 0; i < chatDirs.Length; i++)
+            {
+                ScanDirectoryForApp(chatDirs[i], GuardedAppFlags.ChatGPT, 3, foundChat);
+            }
+
+            string[] claudeDirs = new string[]
+            {
+                CombineSafe(localAppData, "AnthropicClaude"),
+                CombineSafe(localAppData, "Programs\\Claude"),
+                CombineSafe(localAppData, "Claude"),
+                CombineSafe(progFiles, "Claude"),
+                CombineSafe(progFiles, "AnthropicClaude")
+            };
+            for (int i = 0; i < claudeDirs.Length; i++)
+            {
+                ScanDirectoryForApp(claudeDirs[i], GuardedAppFlags.Claude, 3, foundClaude);
+            }
+
+            string[] clashDirs = new string[]
+            {
+                CombineSafe(progFiles, "Clash Verge"),
+                CombineSafe(progFilesX86, "Clash Verge"),
+                CombineSafe(localAppData, "Programs\\Clash Verge")
+            };
+            for (int i = 0; i < clashDirs.Length; i++)
+            {
+                ScanDirectoryForMihomo(clashDirs[i], foundMihomo);
+            }
+
+            // 3. Uninstall registry entries (captures custom drive installs like D:\Program Files...)
+            ScanUninstallRegistry(foundAnti, foundChat, foundClaude, foundMihomo);
+
+            lock (_lock)
+            {
+                AddRangeMarkDirtyLocked(_antigravityPaths, foundAnti, false);
+                AddRangeMarkDirtyLocked(_chatGptPaths, foundChat, false);
+                AddRangeMarkDirtyLocked(_claudePaths, foundClaude, false);
+                for (int i = 0; i < foundChatPkg.Count; i++) _chatGptPackages.Add(foundChatPkg[i]);
+                for (int i = 0; i < foundClaudePkg.Count; i++) _claudePackages.Add(foundClaudePkg[i]);
+                for (int i = 0; i < foundMihomo.Count; i++) _mihomoPaths.Add(foundMihomo[i]);
+            }
+        }
+
+        public bool RecordRunningImagePath(string fullPath)
+        {
+            string norm = NormalizeExistingFile(fullPath);
+            if (norm == null)
+            {
+                return false;
+            }
+
+            bool changed = false;
+            GuardedAppFlags matched = TargetProcessKiller.MatchTargetImagePath(norm, GuardedAppFlags.All);
+            if (matched != GuardedAppFlags.None)
+            {
+                List<string> siblingAnti = null;
+                if ((matched & GuardedAppFlags.Antigravity) != 0 &&
+                    norm.EndsWith("\\Antigravity.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    string dir = Path.GetDirectoryName(norm);
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        siblingAnti = new List<string>();
+                        ScanDirectoryForApp(Path.Combine(dir, "resources"), GuardedAppFlags.Antigravity, 2, siblingAnti);
+                    }
+                }
+
+                lock (_lock)
+                {
+                    if ((matched & GuardedAppFlags.Antigravity) != 0)
+                    {
+                        if (_antigravityPaths.Add(norm))
+                        {
+                            _cacheDirty = true;
+                            changed = true;
+                        }
+                        if (siblingAnti != null && AddRangeMarkDirtyLocked(_antigravityPaths, siblingAnti, true))
+                        {
+                            changed = true;
+                        }
+                    }
+                    if ((matched & GuardedAppFlags.ChatGPT) != 0 && _chatGptPaths.Add(norm))
+                    {
+                        _cacheDirty = true;
+                        changed = true;
+                    }
+                    if ((matched & GuardedAppFlags.Claude) != 0 && _claudePaths.Add(norm))
+                    {
+                        _cacheDirty = true;
+                        changed = true;
+                    }
+                }
+                return changed;
+            }
+
+            int lastSlash = norm.LastIndexOf('\\');
+            string exe = lastSlash >= 0 ? norm.Substring(lastSlash + 1) : norm;
+            if (IsMihomoExeName(exe))
+            {
+                lock (_lock)
+                {
+                    if (_mihomoPaths.Add(norm))
+                    {
+                        changed = true;
+                    }
+                }
+                return changed;
+            }
+
+            if (string.Equals(exe, "clash-verge.exe", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(exe, "clash-verge-service.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                string dir = Path.GetDirectoryName(norm);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    List<string> nearby = new List<string>();
+                    ScanDirectoryForMihomo(dir, nearby);
+                    if (nearby.Count > 0)
+                    {
+                        lock (_lock)
+                        {
+                            for (int i = 0; i < nearby.Count; i++)
+                            {
+                                if (_mihomoPaths.Add(nearby[i]))
+                                {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return changed;
+        }
+
+        public void BuildTargets(
+            GuardedAppFlags enabledApps,
+            out List<string> exePaths,
+            out List<string> packageFamilies,
+            out List<string> mihomoPaths)
+        {
+            HashSet<string> exeSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> pkgSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> mihomoSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            lock (_lock)
+            {
+                if ((enabledApps & GuardedAppFlags.Antigravity) != 0)
+                {
+                    CopyExistingFilesLocked(_antigravityPaths, exeSet);
+                }
+                if ((enabledApps & GuardedAppFlags.ChatGPT) != 0)
+                {
+                    CopyExistingFilesLocked(_chatGptPaths, exeSet);
+                    foreach (string p in _chatGptPackages) pkgSet.Add(p);
+                }
+                if ((enabledApps & GuardedAppFlags.Claude) != 0)
+                {
+                    CopyExistingFilesLocked(_claudePaths, exeSet);
+                    foreach (string p in _claudePackages) pkgSet.Add(p);
+                }
+                CopyExistingFilesLocked(_mihomoPaths, mihomoSet);
+            }
+
+            exePaths = new List<string>(exeSet);
+            exePaths.Sort(StringComparer.OrdinalIgnoreCase);
+            packageFamilies = new List<string>(pkgSet);
+            packageFamilies.Sort(StringComparer.OrdinalIgnoreCase);
+            mihomoPaths = new List<string>(mihomoSet);
+            mihomoPaths.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+
+        public bool MergeIntoConfig(NodeGuardConfig config, bool clearDirtyFlag)
+        {
+            if (config == null)
+            {
+                return false;
+            }
+            if (config.DiscoveredAppPaths == null)
+            {
+                config.DiscoveredAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            bool addedAny = false;
+            lock (_lock)
+            {
+                if (MergeAppSetLocked(config.DiscoveredAppPaths, "antigravity", _antigravityPaths)) addedAny = true;
+                if (MergeAppSetLocked(config.DiscoveredAppPaths, "chatgpt", _chatGptPaths)) addedAny = true;
+                if (MergeAppSetLocked(config.DiscoveredAppPaths, "claude", _claudePaths)) addedAny = true;
+                if (clearDirtyFlag)
+                {
+                    _cacheDirty = false;
+                }
+            }
+            return addedAny;
+        }
+
+        private static bool MergeAppSetLocked(
+            Dictionary<string, List<string>> targetMap,
+            string key,
+            HashSet<string> source)
+        {
+            if (source.Count == 0)
+            {
+                return false;
+            }
+
+            List<string> existingList;
+            if (!targetMap.TryGetValue(key, out existingList) || existingList == null)
+            {
+                existingList = new List<string>();
+                targetMap[key] = existingList;
+            }
+
+            HashSet<string> existingSet = new HashSet<string>(existingList, StringComparer.OrdinalIgnoreCase);
+            bool added = false;
+            foreach (string path in source)
+            {
+                if (existingSet.Add(path))
+                {
+                    existingList.Add(path);
+                    added = true;
+                }
+            }
+            if (added)
+            {
+                existingList.Sort(StringComparer.OrdinalIgnoreCase);
+            }
+            return added;
+        }
+
+        private static void CopyExistingFilesLocked(HashSet<string> source, HashSet<string> dest)
+        {
+            List<string> stale = null;
+            foreach (string path in source)
+            {
+                if (File.Exists(path))
+                {
+                    dest.Add(path);
+                }
+                else
+                {
+                    if (stale == null) stale = new List<string>();
+                    stale.Add(path);
+                }
+            }
+            if (stale != null)
+            {
+                for (int i = 0; i < stale.Count; i++)
+                {
+                    source.Remove(stale[i]);
+                }
+            }
+        }
+
+        private bool AddRangeMarkDirtyLocked(HashSet<string> target, List<string> items, bool markDirty)
+        {
+            bool changed = false;
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (target.Add(items[i]))
+                {
+                    changed = true;
+                    if (markDirty)
+                    {
+                        _cacheDirty = true;
+                    }
+                }
+            }
+            return changed;
+        }
+
+        private static void ScanAppxPackages(
+            List<string> foundChat,
+            List<string> foundClaude,
+            List<string> foundChatPkg,
+            List<string> foundClaudePkg)
+        {
+            ScanAppxRegistryRoot(
+                Registry.CurrentUser,
+                @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages",
+                "PackageRootFolder",
+                foundChat,
+                foundClaude,
+                foundChatPkg,
+                foundClaudePkg);
+
+            ScanAppxRegistryRoot(
+                Registry.LocalMachine,
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications",
+                "Path",
+                foundChat,
+                foundClaude,
+                foundChatPkg,
+                foundClaudePkg);
+        }
+
+        private static void ScanAppxRegistryRoot(
+            RegistryKey hive,
+            string subKeyPath,
+            string folderValueName,
+            List<string> foundChat,
+            List<string> foundClaude,
+            List<string> foundChatPkg,
+            List<string> foundClaudePkg)
+        {
+            try
+            {
+                using (RegistryKey root = hive.OpenSubKey(subKeyPath, false))
+                {
+                    if (root == null)
+                    {
+                        return;
+                    }
+
+                    string[] names = root.GetSubKeyNames();
+                    for (int i = 0; i < names.Length; i++)
+                    {
+                        string pkgFullName = names[i];
+                        if (string.IsNullOrEmpty(pkgFullName))
+                        {
+                            continue;
+                        }
+
+                        GuardedAppFlags appFlag = ClassifyAppxPackageName(pkgFullName);
+                        if (appFlag == GuardedAppFlags.None)
+                        {
+                            continue;
+                        }
+
+                        string pfn = TryExtractPackageFamilyName(pkgFullName);
+                        if (!string.IsNullOrEmpty(pfn))
+                        {
+                            if ((appFlag & GuardedAppFlags.ChatGPT) != 0) foundChatPkg.Add(pfn);
+                            if ((appFlag & GuardedAppFlags.Claude) != 0) foundClaudePkg.Add(pfn);
+                        }
+
+                        try
+                        {
+                            using (RegistryKey pkgKey = root.OpenSubKey(pkgFullName, false))
+                            {
+                                if (pkgKey == null) continue;
+                                string rawRoot = pkgKey.GetValue(folderValueName) as string;
+                                if (string.IsNullOrEmpty(rawRoot)) continue;
+
+                                // AppxAllUserStore Path points to AppxManifest.xml; strip filename if needed
+                                string folder = rawRoot;
+                                if (folder.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    folder = Path.GetDirectoryName(folder);
+                                }
+                                if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+                                {
+                                    continue;
+                                }
+
+                                if ((appFlag & GuardedAppFlags.ChatGPT) != 0)
+                                {
+                                    ScanDirectoryForApp(folder, GuardedAppFlags.ChatGPT, 3, foundChat);
+                                }
+                                if ((appFlag & GuardedAppFlags.Claude) != 0)
+                                {
+                                    ScanDirectoryForApp(folder, GuardedAppFlags.Claude, 3, foundClaude);
+                                }
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        internal static GuardedAppFlags ClassifyAppxPackageName(string pkgFullName)
+        {
+            if (string.IsNullOrEmpty(pkgFullName))
+            {
+                return GuardedAppFlags.None;
+            }
+            if (pkgFullName.StartsWith("OpenAI.", StringComparison.OrdinalIgnoreCase) ||
+                pkgFullName.StartsWith("ChatGPT", StringComparison.OrdinalIgnoreCase))
+            {
+                return GuardedAppFlags.ChatGPT;
+            }
+            if (pkgFullName.StartsWith("Claude_", StringComparison.OrdinalIgnoreCase) ||
+                pkgFullName.StartsWith("Anthropic.Claude", StringComparison.OrdinalIgnoreCase))
+            {
+                return GuardedAppFlags.Claude;
+            }
+            return GuardedAppFlags.None;
+        }
+
+        internal static string TryExtractPackageFamilyName(string packageFullName)
+        {
+            if (string.IsNullOrEmpty(packageFullName))
+            {
+                return null;
+            }
+            int firstUnderscore = packageFullName.IndexOf('_');
+            int lastDoubleUnderscore = packageFullName.LastIndexOf("__", StringComparison.Ordinal);
+            if (firstUnderscore <= 0 || lastDoubleUnderscore <= firstUnderscore || lastDoubleUnderscore + 2 >= packageFullName.Length)
+            {
+                return null;
+            }
+            string name = packageFullName.Substring(0, firstUnderscore);
+            string publisherId = packageFullName.Substring(lastDoubleUnderscore + 2);
+            return name + "_" + publisherId;
+        }
+
+        private static void ScanUninstallRegistry(
+            List<string> foundAnti,
+            List<string> foundChat,
+            List<string> foundClaude,
+            List<string> foundMihomo)
+        {
+            ScanUninstallRoot(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo);
+            ScanUninstallRoot(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo);
+            ScanUninstallRoot(Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", foundAnti, foundChat, foundClaude, foundMihomo);
+        }
+
+        private static void ScanUninstallRoot(
+            RegistryKey hive,
+            string subKeyPath,
+            List<string> foundAnti,
+            List<string> foundChat,
+            List<string> foundClaude,
+            List<string> foundMihomo)
+        {
+            try
+            {
+                using (RegistryKey root = hive.OpenSubKey(subKeyPath, false))
+                {
+                    if (root == null) return;
+                    string[] subNames = root.GetSubKeyNames();
+                    for (int i = 0; i < subNames.Length; i++)
+                    {
+                        try
+                        {
+                            using (RegistryKey entry = root.OpenSubKey(subNames[i], false))
+                            {
+                                if (entry == null) continue;
+                                string displayName = entry.GetValue("DisplayName") as string;
+                                if (string.IsNullOrEmpty(displayName)) continue;
+
+                                bool isAnti = displayName.IndexOf("Antigravity", StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool isChat = displayName.IndexOf("ChatGPT", StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool isClaude = displayName.IndexOf("Claude", StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool isClash = displayName.IndexOf("Clash Verge", StringComparison.OrdinalIgnoreCase) >= 0;
+                                if (!isAnti && !isChat && !isClaude && !isClash) continue;
+
+                                string dir = ExtractInstallDirectoryFromUninstall(entry);
+                                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+
+                                if (isAnti) ScanDirectoryForApp(dir, GuardedAppFlags.Antigravity, 3, foundAnti);
+                                if (isChat) ScanDirectoryForApp(dir, GuardedAppFlags.ChatGPT, 3, foundChat);
+                                if (isClaude) ScanDirectoryForApp(dir, GuardedAppFlags.Claude, 3, foundClaude);
+                                if (isClash) ScanDirectoryForMihomo(dir, foundMihomo);
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string ExtractInstallDirectoryFromUninstall(RegistryKey entry)
+        {
+            string loc = entry.GetValue("InstallLocation") as string;
+            if (!string.IsNullOrWhiteSpace(loc))
+            {
+                string trimmed = loc.Trim().Trim('"');
+                if (Directory.Exists(trimmed))
+                {
+                    return trimmed;
+                }
+            }
+
+            string icon = entry.GetValue("DisplayIcon") as string;
+            if (!string.IsNullOrWhiteSpace(icon))
+            {
+                string cleaned = icon.Trim().Trim('"');
+                int commaIdx = cleaned.LastIndexOf(',');
+                if (commaIdx > 0)
+                {
+                    cleaned = cleaned.Substring(0, commaIdx).Trim().Trim('"');
+                }
+                if (File.Exists(cleaned))
+                {
+                    return Path.GetDirectoryName(cleaned);
+                }
+            }
+            return null;
+        }
+
+        private static void ScanDirectoryForApp(string rootDir, GuardedAppFlags appFlag, int maxDepth, List<string> output)
+        {
+            if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
+            {
+                return;
+            }
+            ScanDirectoryForAppRecursive(rootDir, appFlag, 0, maxDepth, output);
+        }
+
+        private static void ScanDirectoryForAppRecursive(string dir, GuardedAppFlags appFlag, int depth, int maxDepth, List<string> output)
+        {
+            try
+            {
+                string[] files = Directory.GetFiles(dir, "*.exe", SearchOption.TopDirectoryOnly);
+                for (int i = 0; i < files.Length; i++)
+                {
+                    string norm = NormalizeExistingFile(files[i]);
+                    if (norm != null && TargetProcessKiller.MatchTargetImagePath(norm, appFlag) != GuardedAppFlags.None)
+                    {
+                        output.Add(norm);
+                    }
+                }
+
+                if (depth >= maxDepth)
+                {
+                    return;
+                }
+
+                string[] subDirs = Directory.GetDirectories(dir);
+                for (int i = 0; i < subDirs.Length; i++)
+                {
+                    string name = Path.GetFileName(subDirs[i]);
+                    if (string.IsNullOrEmpty(name) || SkipDirNames.Contains(name))
+                    {
+                        continue;
+                    }
+                    ScanDirectoryForAppRecursive(subDirs[i], appFlag, depth + 1, maxDepth, output);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ScanDirectoryForMihomo(string dir, List<string> output)
+        {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+            {
+                return;
+            }
+            try
+            {
+                string[] files = Directory.GetFiles(dir, "*.exe", SearchOption.TopDirectoryOnly);
+                for (int i = 0; i < files.Length; i++)
+                {
+                    string exe = Path.GetFileName(files[i]);
+                    if (IsMihomoExeName(exe))
+                    {
+                        string norm = NormalizeExistingFile(files[i]);
+                        if (norm != null)
+                        {
+                            output.Add(norm);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        internal static bool IsMihomoExeName(string exe)
+        {
+            if (string.IsNullOrEmpty(exe) || !exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            return exe.StartsWith("verge-mihomo", StringComparison.OrdinalIgnoreCase) ||
+                   exe.StartsWith("mihomo", StringComparison.OrdinalIgnoreCase) ||
+                   exe.StartsWith("clash-meta", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string CombineSafe(string baseDir, string relative)
+        {
+            if (string.IsNullOrEmpty(baseDir))
+            {
+                return null;
+            }
+            try
+            {
+                return Path.Combine(baseDir, relative);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string NormalizeExistingFile(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return null;
+            }
+            try
+            {
+                string full = Path.GetFullPath(path.Trim().Trim('"'));
+                return File.Exists(full) ? full : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    internal struct WfpStateSnapshot
+    {
+        public bool Enabled;
+        public bool Active;
+        public bool Degraded;
+        public bool BlockingNow;
+        public bool DnsGuardActive;
+        public int ExeTargetCount;
+        public int PackageTargetCount;
+        public int ActiveFilterCount;
+        public string StatusText;
+    }
+
+    internal sealed class WfpKillSwitch : IDisposable
+    {
+        // Dedicated TunGuard WFP Provider & Sublayer GUIDs
+        private static readonly Guid ProviderKey = new Guid("8d4c5b2a-7e31-4f90-a6c2-19e84b73f501");
+        private static readonly Guid SubLayerKey = new Guid("3a9f1d6c-52b8-4c17-9e44-7b0c2d81e602");
+
+        // Verified Windows SDK WFP Layer & Condition GUIDs (fwpmu.h)
+        private static readonly Guid FWPM_LAYER_ALE_AUTH_CONNECT_V4 = new Guid("c38d57d1-05a7-4c33-904f-7fbceee60e82");
+        private static readonly Guid FWPM_LAYER_ALE_AUTH_CONNECT_V6 = new Guid("4a72393b-319f-44bc-84c3-ba54dcb3b6b4");
+        private static readonly Guid FWPM_CONDITION_ALE_APP_ID = new Guid("d78e1e87-8644-4ea5-9437-d809ecefc971");
+        private static readonly Guid FWPM_CONDITION_ALE_PACKAGE_ID = new Guid("71bc78fa-f17c-4997-a602-6abb261f351c");
+        private static readonly Guid FWPM_CONDITION_IP_LOCAL_INTERFACE = new Guid("4cd62a49-59c3-4969-b7f3-bda5d32890a4");
+        private static readonly Guid FWPM_CONDITION_FLAGS = new Guid("632ce23b-5167-435c-86d7-e903684aa80c");
+        private static readonly Guid FWPM_CONDITION_IP_REMOTE_PORT = new Guid("c35a604d-d22b-4e1a-91b4-68f674ee674b");
+
+        private const uint RPC_C_AUTHN_WINNT = 10;
+        private const uint FWPM_SESSION_FLAG_DYNAMIC = 0x00000001;
+        private const uint FWPM_TXN_WRITE = 0;
+        private const uint FWP_ACTION_BLOCK = 0x00001001;
+        private const uint FWP_ACTION_PERMIT = 0x00001002;
+        private const uint FWP_CONDITION_FLAG_IS_LOOPBACK = 0x00000001;
+        private const uint ERROR_ACCESS_DENIED = 5;
+        private const uint FWP_E_ALREADY_EXISTS = 0x80320009;
+        private const ushort DNS_PORT = 53;
+
+        // Rule priority weights inside TunGuard Sublayer (higher weight evaluated first)
+        private const byte WEIGHT_BLOCK_LOCAL_PROXY = 14;
+        private const byte WEIGHT_ALLOW_LOOPBACK = 12;
+        private const byte WEIGHT_ALLOW_MIHOMO_DNS = 11;
+        private const byte WEIGHT_ALLOW_TUN = 10;
+        private const byte WEIGHT_BLOCK_ALL = 1;
+
+        private enum FWP_MATCH_TYPE : uint
+        {
+            FWP_MATCH_EQUAL = 0,
+            FWP_MATCH_FLAGS_ALL_SET = 6
+        }
+
+        private enum FWP_DATA_TYPE : uint
+        {
+            FWP_EMPTY = 0,
+            FWP_UINT8 = 1,
+            FWP_UINT16 = 2,
+            FWP_UINT32 = 3,
+            FWP_UINT64 = 4,
+            FWP_BYTE_BLOB_TYPE = 12,
+            FWP_SID = 13
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWP_BYTE_BLOB
+        {
+            public uint size;
+            public IntPtr data;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_DISPLAY_DATA0
+        {
+            public IntPtr name;
+            public IntPtr description;
+        }
+
+        [StructLayout(LayoutKind.Explicit, Size = 16)]
+        private struct FWP_VALUE0
+        {
+            [FieldOffset(0)] public FWP_DATA_TYPE type;
+            [FieldOffset(8)] public byte uint8;
+            [FieldOffset(8)] public ushort uint16;
+            [FieldOffset(8)] public uint uint32;
+            [FieldOffset(8)] public IntPtr uint64Ptr;
+            [FieldOffset(8)] public IntPtr byteBlob;
+            [FieldOffset(8)] public IntPtr sid;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_FILTER_CONDITION0
+        {
+            public Guid fieldKey;
+            public FWP_MATCH_TYPE matchType;
+            public FWP_VALUE0 conditionValue;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_ACTION0
+        {
+            public uint type;
+            public Guid filterType;
+        }
+
+        [StructLayout(LayoutKind.Explicit, Size = 16)]
+        private struct FWPM_FILTER_CONTEXT0
+        {
+            [FieldOffset(0)] public ulong rawContext;
+            [FieldOffset(0)] public Guid providerContextKey;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_SESSION0
+        {
+            public Guid sessionKey;
+            public FWPM_DISPLAY_DATA0 displayData;
+            public uint flags;
+            public uint txnWaitTimeoutInMSec;
+            public uint processId;
+            public IntPtr sid;
+            public IntPtr username;
+            public int kernelMode;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_PROVIDER0
+        {
+            public Guid providerKey;
+            public FWPM_DISPLAY_DATA0 displayData;
+            public uint flags;
+            public FWP_BYTE_BLOB providerData;
+            public IntPtr serviceName;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_SUBLAYER0
+        {
+            public Guid subLayerKey;
+            public FWPM_DISPLAY_DATA0 displayData;
+            public uint flags;
+            public IntPtr providerKey;
+            public FWP_BYTE_BLOB providerData;
+            public ushort weight;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FWPM_FILTER0
+        {
+            public Guid filterKey;
+            public FWPM_DISPLAY_DATA0 displayData;
+            public uint flags;
+            public IntPtr providerKey;
+            public FWP_BYTE_BLOB providerData;
+            public Guid layerKey;
+            public Guid subLayerKey;
+            public FWP_VALUE0 weight;
+            public uint numFilterConditions;
+            public IntPtr filterCondition;
+            public FWPM_ACTION0 action;
+            public FWPM_FILTER_CONTEXT0 context;
+            public IntPtr reserved;
+            public ulong filterId;
+            public FWP_VALUE0 effectiveWeight;
+        }
+
+        private sealed class ResolvedIdentity : IDisposable
+        {
+            public bool IsPackage;
+            public IntPtr Handle;
+
+            public void Dispose()
+            {
+                if (Handle != IntPtr.Zero)
+                {
+                    if (IsPackage)
+                    {
+                        FreeSid(Handle);
+                    }
+                    else
+                    {
+                        IntPtr p = Handle;
+                        FwpmFreeMemory0(ref p);
+                    }
+                    Handle = IntPtr.Zero;
+                }
+            }
+        }
+
+        [DllImport("fwpuclnt.dll", CharSet = CharSet.Unicode)]
+        private static extern uint FwpmEngineOpen0(
+            string serverName,
+            uint authnService,
+            IntPtr authIdentity,
+            ref FWPM_SESSION0 session,
+            out IntPtr engineHandle);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmEngineClose0(IntPtr engineHandle);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmProviderAdd0(IntPtr engineHandle, ref FWPM_PROVIDER0 provider, IntPtr sd);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmSubLayerAdd0(IntPtr engineHandle, ref FWPM_SUBLAYER0 subLayer, IntPtr sd);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmTransactionBegin0(IntPtr engineHandle, uint flags);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmTransactionCommit0(IntPtr engineHandle);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmTransactionAbort0(IntPtr engineHandle);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmFilterAdd0(
+            IntPtr engineHandle,
+            ref FWPM_FILTER0 filter,
+            IntPtr sd,
+            out ulong filterId);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern uint FwpmFilterDeleteById0(IntPtr engineHandle, ulong id);
+
+        [DllImport("fwpuclnt.dll", CharSet = CharSet.Unicode)]
+        private static extern uint FwpmGetAppIdFromFileName0(string fileName, out IntPtr appId);
+
+        [DllImport("fwpuclnt.dll")]
+        private static extern void FwpmFreeMemory0(ref IntPtr p);
+
+        [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+        private static extern int DeriveAppContainerSidFromAppContainerName(string pszAppContainerName, out IntPtr ppsidAppContainerSid);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr FreeSid(IntPtr pSid);
+
+        private readonly object _lock = new object();
+        private IntPtr _engine = IntPtr.Zero;
+        private IntPtr _providerKeyPtr = IntPtr.Zero;
+        private IntPtr _displayNamePtr = IntPtr.Zero;
+        private IntPtr _displayDescPtr = IntPtr.Zero;
+
+        private bool _initialized;
+        private bool _available;
+        private bool _disposed;
+        private string _initFailureReason = string.Empty;
+
+        private List<ulong> _baseFilterIds = new List<ulong>();
+        private List<ulong> _tunPermitFilterIds = new List<ulong>();
+        private List<ulong> _proxyBlockFilterIds = new List<ulong>();
+
+        private string _lastBaseSig = string.Empty;
+        private string _lastTunSig = string.Empty;
+        private string _lastProxyBlockSig = string.Empty;
+
+        private WfpStateSnapshot _snapshot = new WfpStateSnapshot
+        {
+            Enabled = false,
+            Active = false,
+            Degraded = false,
+            BlockingNow = false,
+            DnsGuardActive = false,
+            ExeTargetCount = 0,
+            PackageTargetCount = 0,
+            ActiveFilterCount = 0,
+            StatusText = "未初始化"
+        };
+
+        public bool IsActive
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _available && _snapshot.Active;
+                }
+            }
+        }
+
+        public WfpStateSnapshot GetSnapshot()
+        {
+            lock (_lock)
+            {
+                return _snapshot;
+            }
+        }
+
+        internal static bool VerifyNativeLayouts(out string error)
+        {
+            if (IntPtr.Size != 8)
+            {
+                error = "WFP 仅支持 x64 进程";
+                return false;
+            }
+            if (Marshal.SizeOf(typeof(FWP_BYTE_BLOB)) != 16 ||
+                Marshal.SizeOf(typeof(FWPM_DISPLAY_DATA0)) != 16 ||
+                Marshal.SizeOf(typeof(FWP_VALUE0)) != 16 ||
+                Marshal.SizeOf(typeof(FWPM_FILTER_CONDITION0)) != 40 ||
+                Marshal.SizeOf(typeof(FWPM_ACTION0)) != 20 ||
+                Marshal.SizeOf(typeof(FWPM_FILTER_CONTEXT0)) != 16 ||
+                Marshal.SizeOf(typeof(FWPM_SESSION0)) != 72 ||
+                Marshal.SizeOf(typeof(FWPM_PROVIDER0)) != 64 ||
+                Marshal.SizeOf(typeof(FWPM_SUBLAYER0)) != 72 ||
+                Marshal.SizeOf(typeof(FWPM_FILTER0)) != 200 ||
+                Marshal.OffsetOf(typeof(FWPM_FILTER0), "context").ToInt32() != 152)
+            {
+                error = "WFP x64 结构体内存布局校验失败";
+                return false;
+            }
+            error = null;
+            return true;
+        }
+
+        public bool TryInitialize(out string errorReason)
+        {
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    errorReason = "WFP 引擎已释放";
+                    return false;
+                }
+                if (_initialized)
+                {
+                    errorReason = _initFailureReason;
+                    return _available;
+                }
+                _initialized = true;
+
+                string layoutError;
+                if (!VerifyNativeLayouts(out layoutError))
+                {
+                    _available = false;
+                    _initFailureReason = layoutError;
+                    errorReason = layoutError;
+                    return false;
+                }
+
+                _providerKeyPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Guid)));
+                Marshal.StructureToPtr(ProviderKey, _providerKeyPtr, false);
+                _displayNamePtr = Marshal.StringToHGlobalUni("TunGuard WFP Kill Switch");
+                _displayDescPtr = Marshal.StringToHGlobalUni("Kernel-level outbound tunnel enforcement for TunGuard");
+
+                FWPM_SESSION0 session = new FWPM_SESSION0();
+                session.flags = FWPM_SESSION_FLAG_DYNAMIC;
+                session.displayData.name = _displayNamePtr;
+                session.displayData.description = _displayDescPtr;
+
+                IntPtr handle;
+                uint rc = FwpmEngineOpen0(null, RPC_C_AUTHN_WINNT, IntPtr.Zero, ref session, out handle);
+                if (rc != 0 || handle == IntPtr.Zero)
+                {
+                    _available = false;
+                    _initFailureReason = FormatWfpError("FwpmEngineOpen0", rc);
+                    errorReason = _initFailureReason;
+                    FreeStaticNativeBuffersLocked();
+                    return false;
+                }
+
+                _engine = handle;
+
+                uint txnRc = FwpmTransactionBegin0(_engine, FWPM_TXN_WRITE);
+                if (txnRc != 0)
+                {
+                    FailInitializeCloseEngineLocked(FormatWfpError("FwpmTransactionBegin0", txnRc));
+                    errorReason = _initFailureReason;
+                    return false;
+                }
+
+                FWPM_PROVIDER0 provider = new FWPM_PROVIDER0();
+                provider.providerKey = ProviderKey;
+                provider.displayData.name = _displayNamePtr;
+                provider.displayData.description = _displayDescPtr;
+
+                uint provRc = FwpmProviderAdd0(_engine, ref provider, IntPtr.Zero);
+                if (provRc != 0 && provRc != FWP_E_ALREADY_EXISTS)
+                {
+                    FwpmTransactionAbort0(_engine);
+                    FailInitializeCloseEngineLocked(FormatWfpError("FwpmProviderAdd0", provRc));
+                    errorReason = _initFailureReason;
+                    return false;
+                }
+
+                FWPM_SUBLAYER0 subLayer = new FWPM_SUBLAYER0();
+                subLayer.subLayerKey = SubLayerKey;
+                subLayer.displayData.name = _displayNamePtr;
+                subLayer.displayData.description = _displayDescPtr;
+                subLayer.providerKey = _providerKeyPtr;
+                subLayer.weight = ushort.MaxValue;
+
+                uint subRc = FwpmSubLayerAdd0(_engine, ref subLayer, IntPtr.Zero);
+                if (subRc != 0 && subRc != FWP_E_ALREADY_EXISTS)
+                {
+                    FwpmTransactionAbort0(_engine);
+                    FailInitializeCloseEngineLocked(FormatWfpError("FwpmSubLayerAdd0", subRc));
+                    errorReason = _initFailureReason;
+                    return false;
+                }
+
+                uint commitRc = FwpmTransactionCommit0(_engine);
+                if (commitRc != 0)
+                {
+                    FwpmTransactionAbort0(_engine);
+                    FailInitializeCloseEngineLocked(FormatWfpError("FwpmTransactionCommit0", commitRc));
+                    errorReason = _initFailureReason;
+                    return false;
+                }
+
+                _available = true;
+                _initFailureReason = string.Empty;
+                errorReason = string.Empty;
+                return true;
+            }
+        }
+
+        private static string FormatWfpError(string apiName, uint rc)
+        {
+            if (rc == ERROR_ACCESS_DENIED || rc == 0x80070005u)
+            {
+                return "需管理员权限";
+            }
+            return apiName + " 失败 (0x" + rc.ToString("X8") + ")";
+        }
+
+        private void FailInitializeCloseEngineLocked(string reason)
+        {
+            _available = false;
+            _initFailureReason = reason;
+            if (_engine != IntPtr.Zero)
+            {
+                FwpmEngineClose0(_engine);
+                _engine = IntPtr.Zero;
+            }
+            FreeStaticNativeBuffersLocked();
+        }
+
+        public WfpStateSnapshot SyncState(
+            bool monitoringEnabled,
+            bool wfpEnabled,
+            bool isGuardSafe,
+            ulong tunLuid,
+            List<string> exePaths,
+            List<string> packageFamilies,
+            bool blockNonTunDns,
+            List<string> mihomoPaths,
+            List<ushort> blockedLoopbackPorts)
+        {
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    return _snapshot;
+                }
+
+                if (!wfpEnabled)
+                {
+                    if (_available)
+                    {
+                        ClearAllFiltersLocked();
+                    }
+                    _snapshot = new WfpStateSnapshot
+                    {
+                        Enabled = false,
+                        Active = false,
+                        Degraded = false,
+                        BlockingNow = false,
+                        DnsGuardActive = false,
+                        ExeTargetCount = 0,
+                        PackageTargetCount = 0,
+                        ActiveFilterCount = 0,
+                        StatusText = "未启用"
+                    };
+                    return _snapshot;
+                }
+
+                if (!_initialized)
+                {
+                    string unusedErr;
+                    TryInitialize(out unusedErr);
+                }
+
+                if (!_available)
+                {
+                    _snapshot = new WfpStateSnapshot
+                    {
+                        Enabled = true,
+                        Active = false,
+                        Degraded = true,
+                        BlockingNow = false,
+                        DnsGuardActive = false,
+                        ExeTargetCount = 0,
+                        PackageTargetCount = 0,
+                        ActiveFilterCount = 0,
+                        StatusText = "已降级 (" + _initFailureReason + ")"
+                    };
+                    return _snapshot;
+                }
+
+                if (!monitoringEnabled)
+                {
+                    ClearAllFiltersLocked();
+                    _snapshot = new WfpStateSnapshot
+                    {
+                        Enabled = true,
+                        Active = false,
+                        Degraded = false,
+                        BlockingNow = false,
+                        DnsGuardActive = false,
+                        ExeTargetCount = 0,
+                        PackageTargetCount = 0,
+                        ActiveFilterCount = 0,
+                        StatusText = "已暂停 (规则已清空)"
+                    };
+                    return _snapshot;
+                }
+
+                List<string> safeExes = exePaths ?? new List<string>();
+                List<string> safePkgs = packageFamilies ?? new List<string>();
+                List<string> safeMihomo = mihomoPaths ?? new List<string>();
+                List<ushort> safeProxyPorts = blockedLoopbackPorts ?? new List<ushort>();
+
+                bool hasAnyTargets = safeExes.Count > 0 || safePkgs.Count > 0 || blockNonTunDns;
+                if (!hasAnyTargets)
+                {
+                    ClearAllFiltersLocked();
+                    _snapshot = new WfpStateSnapshot
+                    {
+                        Enabled = true,
+                        Active = true,
+                        Degraded = false,
+                        BlockingNow = !isGuardSafe,
+                        DnsGuardActive = false,
+                        ExeTargetCount = 0,
+                        PackageTargetCount = 0,
+                        ActiveFilterCount = 0,
+                        StatusText = "待命中 (未发现受控目标)"
+                    };
+                    return _snapshot;
+                }
+
+                bool shouldPermitTun = isGuardSafe && tunLuid != 0;
+                bool shouldBlockLocalProxy = !isGuardSafe && safeProxyPorts.Count > 0 && (safeExes.Count > 0 || safePkgs.Count > 0);
+
+                string baseSig = BuildSignature("B", safeExes, safePkgs, blockNonTunDns, safeMihomo, null, 0, false);
+                string tunSig = BuildSignature("T", safeExes, safePkgs, blockNonTunDns, null, null, tunLuid, shouldPermitTun);
+                string proxySig = BuildSignature("P", safeExes, safePkgs, false, null, safeProxyPorts, 0, shouldBlockLocalProxy);
+
+                bool needBase = !string.Equals(baseSig, _lastBaseSig, StringComparison.Ordinal);
+                bool needTun = !string.Equals(tunSig, _lastTunSig, StringComparison.Ordinal);
+                bool needProxy = !string.Equals(proxySig, _lastProxyBlockSig, StringComparison.Ordinal);
+
+                if (needBase || needTun || needProxy)
+                {
+                    List<ResolvedIdentity> targetIds = ResolveTargetIdentities(safeExes, safePkgs);
+                    List<ResolvedIdentity> mihomoIds = (needBase && blockNonTunDns)
+                        ? ResolveExeIdentities(safeMihomo)
+                        : null;
+
+                    try
+                    {
+                        uint txnRc = FwpmTransactionBegin0(_engine, FWPM_TXN_WRITE);
+                        if (txnRc == 0)
+                        {
+                            bool ok = true;
+                            List<ulong> nextBase = _baseFilterIds;
+                            List<ulong> nextTun = _tunPermitFilterIds;
+                            List<ulong> nextProxy = _proxyBlockFilterIds;
+
+                            if (needBase)
+                            {
+                                List<ulong> addedBase = new List<ulong>();
+                                ok = InstallBaseFiltersLocked(targetIds, blockNonTunDns, mihomoIds, addedBase);
+                                if (ok)
+                                {
+                                    DeleteFilterIdsLocked(_baseFilterIds);
+                                    nextBase = addedBase;
+                                }
+                            }
+
+                            if (ok && needTun)
+                            {
+                                List<ulong> addedTun = new List<ulong>();
+                                if (shouldPermitTun)
+                                {
+                                    ok = InstallTunPermitFiltersLocked(targetIds, blockNonTunDns, tunLuid, addedTun);
+                                }
+                                if (ok)
+                                {
+                                    DeleteFilterIdsLocked(_tunPermitFilterIds);
+                                    nextTun = addedTun;
+                                }
+                            }
+
+                            if (ok && needProxy)
+                            {
+                                List<ulong> addedProxy = new List<ulong>();
+                                if (shouldBlockLocalProxy)
+                                {
+                                    ok = InstallLocalProxyBlockFiltersLocked(targetIds, safeProxyPorts, addedProxy);
+                                }
+                                if (ok)
+                                {
+                                    DeleteFilterIdsLocked(_proxyBlockFilterIds);
+                                    nextProxy = addedProxy;
+                                }
+                            }
+
+                            if (ok && FwpmTransactionCommit0(_engine) == 0)
+                            {
+                                _baseFilterIds = nextBase;
+                                _tunPermitFilterIds = nextTun;
+                                _proxyBlockFilterIds = nextProxy;
+                                _lastBaseSig = baseSig;
+                                _lastTunSig = tunSig;
+                                _lastProxyBlockSig = proxySig;
+                            }
+                            else
+                            {
+                                FwpmTransactionAbort0(_engine);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        DisposeIdentities(targetIds);
+                        DisposeIdentities(mihomoIds);
+                    }
+                }
+
+                int totalFilters = _baseFilterIds.Count + _tunPermitFilterIds.Count + _proxyBlockFilterIds.Count;
+                string targetDesc = BuildTargetCountDesc(safeExes.Count, safePkgs.Count, blockNonTunDns);
+                string statusText = shouldPermitTun
+                    ? ("已启用 · 仅放行 TUN (" + targetDesc + ")")
+                    : ("已阻断非本地出站 (" + targetDesc + ")");
+
+                _snapshot = new WfpStateSnapshot
+                {
+                    Enabled = true,
+                    Active = true,
+                    Degraded = false,
+                    BlockingNow = !shouldPermitTun,
+                    DnsGuardActive = blockNonTunDns,
+                    ExeTargetCount = safeExes.Count,
+                    PackageTargetCount = safePkgs.Count,
+                    ActiveFilterCount = totalFilters,
+                    StatusText = statusText
+                };
+                return _snapshot;
+            }
+        }
+
+        private static string BuildTargetCountDesc(int exeCount, int pkgCount, bool dnsGuard)
+        {
+            List<string> parts = new List<string>(3);
+            if (exeCount > 0) parts.Add(exeCount + "程序");
+            if (pkgCount > 0) parts.Add(pkgCount + "MSIX");
+            if (dnsGuard) parts.Add("DNS53");
+            return parts.Count > 0 ? string.Join("+", parts.ToArray()) : "0目标";
+        }
+
+        private void ClearAllFiltersLocked()
+        {
+            if (_baseFilterIds.Count == 0 && _tunPermitFilterIds.Count == 0 && _proxyBlockFilterIds.Count == 0)
+            {
+                _lastBaseSig = string.Empty;
+                _lastTunSig = string.Empty;
+                _lastProxyBlockSig = string.Empty;
+                return;
+            }
+
+            if (_engine == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (FwpmTransactionBegin0(_engine, FWPM_TXN_WRITE) != 0)
+            {
+                return;
+            }
+
+            DeleteFilterIdsLocked(_baseFilterIds);
+            DeleteFilterIdsLocked(_tunPermitFilterIds);
+            DeleteFilterIdsLocked(_proxyBlockFilterIds);
+
+            if (FwpmTransactionCommit0(_engine) == 0)
+            {
+                _baseFilterIds.Clear();
+                _tunPermitFilterIds.Clear();
+                _proxyBlockFilterIds.Clear();
+                _lastBaseSig = string.Empty;
+                _lastTunSig = string.Empty;
+                _lastProxyBlockSig = string.Empty;
+            }
+            else
+            {
+                FwpmTransactionAbort0(_engine);
+            }
+        }
+
+        private bool InstallBaseFiltersLocked(
+            List<ResolvedIdentity> targets,
+            bool blockNonTunDns,
+            List<ResolvedIdentity> mihomoIds,
+            List<ulong> outIds)
+        {
+            for (int i = 0; i < targets.Count; i++)
+            {
+                ResolvedIdentity id = targets[i];
+                FWPM_FILTER_CONDITION0 idCond = MakeIdentityCondition(id);
+                FWPM_FILTER_CONDITION0 loopbackCond = MakeLoopbackCondition();
+
+                // Weight 12: PERMIT Loopback (V4 + V6)
+                if (!AddFilterPairV4V6Locked(FWP_ACTION_PERMIT, WEIGHT_ALLOW_LOOPBACK, new FWPM_FILTER_CONDITION0[] { idCond, loopbackCond }, outIds))
+                {
+                    return false;
+                }
+
+                // Weight 1: BLOCK All interfaces fallback (V4 + V6)
+                if (!AddFilterPairV4V6Locked(FWP_ACTION_BLOCK, WEIGHT_BLOCK_ALL, new FWPM_FILTER_CONDITION0[] { idCond }, outIds))
+                {
+                    return false;
+                }
+            }
+
+            if (blockNonTunDns)
+            {
+                FWPM_FILTER_CONDITION0 dnsPortCond = MakeRemotePortCondition(DNS_PORT);
+                FWPM_FILTER_CONDITION0 loopbackCond = MakeLoopbackCondition();
+
+                // Weight 12: PERMIT Loopback DNS 53 (V4 + V6)
+                if (!AddFilterPairV4V6Locked(FWP_ACTION_PERMIT, WEIGHT_ALLOW_LOOPBACK, new FWPM_FILTER_CONDITION0[] { dnsPortCond, loopbackCond }, outIds))
+                {
+                    return false;
+                }
+
+                // Weight 11: PERMIT Mihomo core DNS 53 (V4 + V6)
+                if (mihomoIds != null)
+                {
+                    for (int i = 0; i < mihomoIds.Count; i++)
+                    {
+                        FWPM_FILTER_CONDITION0 mihomoCond = MakeIdentityCondition(mihomoIds[i]);
+                        if (!AddFilterPairV4V6Locked(FWP_ACTION_PERMIT, WEIGHT_ALLOW_MIHOMO_DNS, new FWPM_FILTER_CONDITION0[] { mihomoCond, dnsPortCond }, outIds))
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                // Weight 1: BLOCK all non-TUN DNS 53 (V4 + V6)
+                if (!AddFilterPairV4V6Locked(FWP_ACTION_BLOCK, WEIGHT_BLOCK_ALL, new FWPM_FILTER_CONDITION0[] { dnsPortCond }, outIds))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private bool InstallTunPermitFiltersLocked(
+            List<ResolvedIdentity> targets,
+            bool blockNonTunDns,
+            ulong tunLuid,
+            List<ulong> outIds)
+        {
+            IntPtr pLuid = Marshal.AllocHGlobal(sizeof(ulong));
+            try
+            {
+                Marshal.WriteInt64(pLuid, unchecked((long)tunLuid));
+                FWPM_FILTER_CONDITION0 tunCond = MakeLocalInterfaceCondition(pLuid);
+
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    FWPM_FILTER_CONDITION0 idCond = MakeIdentityCondition(targets[i]);
+                    // Weight 10: PERMIT TUN interface (V4 + V6)
+                    if (!AddFilterPairV4V6Locked(FWP_ACTION_PERMIT, WEIGHT_ALLOW_TUN, new FWPM_FILTER_CONDITION0[] { idCond, tunCond }, outIds))
+                    {
+                        return false;
+                    }
+                }
+
+                if (blockNonTunDns)
+                {
+                    FWPM_FILTER_CONDITION0 dnsPortCond = MakeRemotePortCondition(DNS_PORT);
+                    if (!AddFilterPairV4V6Locked(FWP_ACTION_PERMIT, WEIGHT_ALLOW_TUN, new FWPM_FILTER_CONDITION0[] { dnsPortCond, tunCond }, outIds))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pLuid);
+            }
+        }
+
+        private bool InstallLocalProxyBlockFiltersLocked(
+            List<ResolvedIdentity> targets,
+            List<ushort> proxyPorts,
+            List<ulong> outIds)
+        {
+            FWPM_FILTER_CONDITION0 loopbackCond = MakeLoopbackCondition();
+            for (int p = 0; p < proxyPorts.Count; p++)
+            {
+                FWPM_FILTER_CONDITION0 portCond = MakeRemotePortCondition(proxyPorts[p]);
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    FWPM_FILTER_CONDITION0 idCond = MakeIdentityCondition(targets[i]);
+                    // Weight 14 (> Loopback 12): BLOCK local Clash proxy port while unsafe
+                    if (!AddFilterPairV4V6Locked(
+                        FWP_ACTION_BLOCK,
+                        WEIGHT_BLOCK_LOCAL_PROXY,
+                        new FWPM_FILTER_CONDITION0[] { idCond, loopbackCond, portCond },
+                        outIds))
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        private bool AddFilterPairV4V6Locked(uint actionType, byte weight, FWPM_FILTER_CONDITION0[] conditions, List<ulong> outIds)
+        {
+            ulong idV4;
+            if (!AddSingleFilterLocked(FWPM_LAYER_ALE_AUTH_CONNECT_V4, actionType, weight, conditions, out idV4))
+            {
+                return false;
+            }
+            outIds.Add(idV4);
+
+            ulong idV6;
+            if (!AddSingleFilterLocked(FWPM_LAYER_ALE_AUTH_CONNECT_V6, actionType, weight, conditions, out idV6))
+            {
+                return false;
+            }
+            outIds.Add(idV6);
+            return true;
+        }
+
+        private bool AddSingleFilterLocked(
+            Guid layerKey,
+            uint actionType,
+            byte weight,
+            FWPM_FILTER_CONDITION0[] conditions,
+            out ulong filterId)
+        {
+            filterId = 0;
+            int condCount = conditions != null ? conditions.Length : 0;
+            int condSize = Marshal.SizeOf(typeof(FWPM_FILTER_CONDITION0));
+            IntPtr condPtr = IntPtr.Zero;
+
+            try
+            {
+                if (condCount > 0)
+                {
+                    condPtr = Marshal.AllocHGlobal(condCount * condSize);
+                    for (int i = 0; i < condCount; i++)
+                    {
+                        IntPtr dst = IntPtr.Add(condPtr, i * condSize);
+                        Marshal.StructureToPtr(conditions[i], dst, false);
+                    }
+                }
+
+                FWPM_FILTER0 filter = new FWPM_FILTER0();
+                filter.filterKey = Guid.NewGuid();
+                filter.displayData.name = _displayNamePtr;
+                filter.displayData.description = _displayDescPtr;
+                filter.flags = 0;
+                filter.providerKey = _providerKeyPtr;
+                filter.layerKey = layerKey;
+                filter.subLayerKey = SubLayerKey;
+                filter.weight.type = FWP_DATA_TYPE.FWP_UINT8;
+                filter.weight.uint8 = weight;
+                filter.numFilterConditions = (uint)condCount;
+                filter.filterCondition = condPtr;
+                filter.action.type = actionType;
+                filter.action.filterType = Guid.Empty;
+
+                uint rc = FwpmFilterAdd0(_engine, ref filter, IntPtr.Zero, out filterId);
+                return rc == 0;
+            }
+            finally
+            {
+                if (condPtr != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(condPtr);
+                }
+            }
+        }
+
+        private void DeleteFilterIdsLocked(List<ulong> ids)
+        {
+            if (ids == null || ids.Count == 0)
+            {
+                return;
+            }
+            for (int i = 0; i < ids.Count; i++)
+            {
+                FwpmFilterDeleteById0(_engine, ids[i]);
+            }
+        }
+
+        private static FWPM_FILTER_CONDITION0 MakeIdentityCondition(ResolvedIdentity id)
+        {
+            FWPM_FILTER_CONDITION0 c = new FWPM_FILTER_CONDITION0();
+            c.matchType = FWP_MATCH_TYPE.FWP_MATCH_EQUAL;
+            if (id.IsPackage)
+            {
+                c.fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID;
+                c.conditionValue.type = FWP_DATA_TYPE.FWP_SID;
+                c.conditionValue.sid = id.Handle;
+            }
+            else
+            {
+                c.fieldKey = FWPM_CONDITION_ALE_APP_ID;
+                c.conditionValue.type = FWP_DATA_TYPE.FWP_BYTE_BLOB_TYPE;
+                c.conditionValue.byteBlob = id.Handle;
+            }
+            return c;
+        }
+
+        private static FWPM_FILTER_CONDITION0 MakeLoopbackCondition()
+        {
+            FWPM_FILTER_CONDITION0 c = new FWPM_FILTER_CONDITION0();
+            c.fieldKey = FWPM_CONDITION_FLAGS;
+            c.matchType = FWP_MATCH_TYPE.FWP_MATCH_FLAGS_ALL_SET;
+            c.conditionValue.type = FWP_DATA_TYPE.FWP_UINT32;
+            c.conditionValue.uint32 = FWP_CONDITION_FLAG_IS_LOOPBACK;
+            return c;
+        }
+
+        private static FWPM_FILTER_CONDITION0 MakeLocalInterfaceCondition(IntPtr luidPtr)
+        {
+            FWPM_FILTER_CONDITION0 c = new FWPM_FILTER_CONDITION0();
+            c.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
+            c.matchType = FWP_MATCH_TYPE.FWP_MATCH_EQUAL;
+            c.conditionValue.type = FWP_DATA_TYPE.FWP_UINT64;
+            c.conditionValue.uint64Ptr = luidPtr;
+            return c;
+        }
+
+        private static FWPM_FILTER_CONDITION0 MakeRemotePortCondition(ushort port)
+        {
+            FWPM_FILTER_CONDITION0 c = new FWPM_FILTER_CONDITION0();
+            c.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+            c.matchType = FWP_MATCH_TYPE.FWP_MATCH_EQUAL;
+            c.conditionValue.type = FWP_DATA_TYPE.FWP_UINT16;
+            c.conditionValue.uint16 = port;
+            return c;
+        }
+
+        private static List<ResolvedIdentity> ResolveTargetIdentities(List<string> exePaths, List<string> packageFamilies)
+        {
+            List<ResolvedIdentity> list = ResolveExeIdentities(exePaths);
+            if (packageFamilies != null)
+            {
+                for (int i = 0; i < packageFamilies.Count; i++)
+                {
+                    string pfn = packageFamilies[i];
+                    if (string.IsNullOrEmpty(pfn)) continue;
+                    IntPtr sid;
+                    if (DeriveAppContainerSidFromAppContainerName(pfn, out sid) == 0 && sid != IntPtr.Zero)
+                    {
+                        list.Add(new ResolvedIdentity { IsPackage = true, Handle = sid });
+                    }
+                }
+            }
+            return list;
+        }
+
+        private static List<ResolvedIdentity> ResolveExeIdentities(List<string> exePaths)
+        {
+            List<ResolvedIdentity> list = new List<ResolvedIdentity>();
+            if (exePaths == null)
+            {
+                return list;
+            }
+            for (int i = 0; i < exePaths.Count; i++)
+            {
+                string path = exePaths[i];
+                if (string.IsNullOrEmpty(path)) continue;
+                IntPtr appId;
+                if (FwpmGetAppIdFromFileName0(path, out appId) == 0 && appId != IntPtr.Zero)
+                {
+                    list.Add(new ResolvedIdentity { IsPackage = false, Handle = appId });
+                }
+            }
+            return list;
+        }
+
+        private static void DisposeIdentities(List<ResolvedIdentity> list)
+        {
+            if (list == null) return;
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] != null)
+                {
+                    list[i].Dispose();
+                }
+            }
+        }
+
+        private static string BuildSignature(
+            string prefix,
+            List<string> exes,
+            List<string> pkgs,
+            bool flagA,
+            List<string> extraPaths,
+            List<ushort> ports,
+            ulong luid,
+            bool flagB)
+        {
+            StringBuilder sb = new StringBuilder(256);
+            sb.Append(prefix).Append('|').Append(flagA ? '1' : '0').Append('|').Append(flagB ? '1' : '0').Append('|').Append(luid);
+            sb.Append("|E:");
+            if (exes != null)
+            {
+                for (int i = 0; i < exes.Count; i++) sb.Append(exes[i]).Append(';');
+            }
+            sb.Append("|P:");
+            if (pkgs != null)
+            {
+                for (int i = 0; i < pkgs.Count; i++) sb.Append(pkgs[i]).Append(';');
+            }
+            if (extraPaths != null)
+            {
+                sb.Append("|M:");
+                for (int i = 0; i < extraPaths.Count; i++) sb.Append(extraPaths[i]).Append(';');
+            }
+            if (ports != null)
+            {
+                sb.Append("|R:");
+                for (int i = 0; i < ports.Count; i++) sb.Append(ports[i]).Append(',');
+            }
+            return sb.ToString();
+        }
+
+        private void FreeStaticNativeBuffersLocked()
+        {
+            if (_providerKeyPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_providerKeyPtr);
+                _providerKeyPtr = IntPtr.Zero;
+            }
+            if (_displayNamePtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_displayNamePtr);
+                _displayNamePtr = IntPtr.Zero;
+            }
+            if (_displayDescPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_displayDescPtr);
+                _displayDescPtr = IntPtr.Zero;
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+                _disposed = true;
+                _available = false;
+                if (_engine != IntPtr.Zero)
+                {
+                    // Closing a DYNAMIC session automatically deletes all filters, sublayer and provider
+                    FwpmEngineClose0(_engine);
+                    _engine = IntPtr.Zero;
+                }
+                _baseFilterIds.Clear();
+                _tunPermitFilterIds.Clear();
+                _proxyBlockFilterIds.Clear();
+                FreeStaticNativeBuffersLocked();
+            }
+        }
+    }
+
     internal sealed class TunMonitor : IDisposable
     {
         private const ushort AF_UNSPEC = 0;
@@ -4704,6 +6795,7 @@ namespace TunGuard
         // Verified x64 Windows MIB_IF_TABLE2 / MIB_IF_ROW2 offsets
         private const int IF_TABLE_ENTRIES_OFFSET = 8;
         private const int IF_ROW_SIZE = 1352;
+        private const int IF_ROW_LUID_OFFSET = 0;
         private const int IF_ROW_INDEX_OFFSET = 8;
         private const int IF_ROW_ALIAS_OFFSET = 28;
         private const int IF_ROW_DESC_OFFSET = 542;
@@ -4730,6 +6822,9 @@ namespace TunGuard
         private const int NODE_CHECK_INTERVAL_INACTIVE_MS = 300;
         private const int INACTIVE_FULL_KILL_SCAN_MS = 3000;
         private const int WATCHER_RETRY_INTERVAL_MS = 5000;
+        private const int PATH_DISCOVERY_INTERVAL_MS = 2000;
+        private const int STATIC_APP_RESCAN_INTERVAL_MS = 300000;
+        private const int CACHE_PERSIST_INTERVAL_MS = 10000;
 
         private static readonly byte[] ZeroIfRowTemplate = new byte[IF_ROW_SIZE];
         private static readonly int[] FileRetryDelaysMs = new int[] { 1, 2, 3, 5, 5 };
@@ -4787,6 +6882,8 @@ namespace TunGuard
 
         // Single-threaded monitor/killer resources owned by Start() -> _watchdogThread
         private readonly TargetProcessKiller _killer = new TargetProcessKiller();
+        private readonly GuardedAppPathResolver _pathResolver = new GuardedAppPathResolver();
+        private readonly WfpKillSwitch _wfp = new WfpKillSwitch();
         private IntPtr _ifRowBuffer;
 
         // Lightweight signal state between callbacks and _watchdogThread (held for nanoseconds)
@@ -4809,9 +6906,16 @@ namespace TunGuard
         private string _clashExternalController;
         private string _clashExternalPipe;
         private string _clashSecret;
+        private ushort _clashMixedPort;
+        private ushort _clashHttpPort;
+        private ushort _clashSocksPort;
         private string _baseExternalController;
         private string _baseExternalPipe;
         private string _baseSecret;
+        private ushort _baseMixedPort;
+        private ushort _baseHttpPort;
+        private ushort _baseSocksPort;
+        private readonly List<ushort> _clashLocalProxyPorts = new List<ushort>(3);
         private bool _vergeStatValid;
         private bool _vergeLastExists;
         private long _vergeLastWriteTicks;
@@ -4850,6 +6954,7 @@ namespace TunGuard
 
         public event Action<TunStatus> StatusChanged;
         public event Action<KillResult, string, TunStatus> ProcessesKilled;
+        public event Action<string, TunStatus> WfpBlocked;
         public event Action<int, GuardedAppFlags, string> AccessDenied;
         public event Action<NodeGuardConfig> NodeConfigChanged;
 
@@ -4910,6 +7015,7 @@ namespace TunGuard
         public void ApplyNodeGuardConfig(NodeGuardConfig config)
         {
             NodeGuardConfig normalized = (config != null ? config : new NodeGuardConfig()).CloneNormalized();
+            _pathResolver.MergeIntoConfig(normalized, false);
             _nodeConfig = normalized;
             _mihomoClient.InvalidateRulesCache();
             SignalWake("守护配置更新", false, false, false, false, true, true, true, true);
@@ -4939,6 +7045,16 @@ namespace TunGuard
             ReadBaseClashYamlSafe(true);
             SyncMihomoConnectionConfig();
             ReadNodeGuardConfigSafe(true);
+
+            // Prepare WFP engine and pre-discovered app paths BEFORE first evaluation
+            _pathResolver.LoadFromConfigCache(_nodeConfig);
+            _pathResolver.ScanStaticInstallations();
+            _killer.DiscoverNewProcessPaths(true, path => _pathResolver.RecordRunningImagePath(path));
+            if (_nodeConfig != null && _nodeConfig.WfpEnabled)
+            {
+                string unusedWfpErr;
+                _wfp.TryInitialize(out unusedWfpErr);
+            }
 
             bool unusedFullScan;
             EvaluateAndEnforce("初始检查", true, true, true, true, true, out unusedFullScan);
@@ -5185,6 +7301,9 @@ namespace TunGuard
             long lastNodeCheckMs = 0;
             long lastFullScanMs = 0;
             long lastWatcherRetryMs = 0;
+            long lastPathDiscoverMs = 0;
+            long lastStaticRescanMs = 0;
+            long lastCachePersistMs = 0;
 
             while (_running)
             {
@@ -5193,9 +7312,11 @@ namespace TunGuard
                 bool tunActive = _isTunActive;
                 NodeGuardConfig loopCfg = _nodeConfig;
                 bool hasActiveTargets = loopCfg != null && loopCfg.GetGuardedAppFlags() != GuardedAppFlags.None;
+                bool needsFastKillGuard = !safe && hasActiveTargets &&
+                                          (loopCfg == null || !loopCfg.WfpEnabled || loopCfg.WfpKillOnBlock || !_wfp.IsActive);
                 int intervalMs = !monitoring
                     ? PAUSED_INTERVAL_MS
-                    : ((safe || !hasActiveTargets) ? ACTIVE_INTERVAL_MS : INACTIVE_GUARD_INTERVAL_MS);
+                    : (needsFastKillGuard ? INACTIVE_GUARD_INTERVAL_MS : ACTIVE_INTERVAL_MS);
 
                 int waited;
                 try
@@ -5281,6 +7402,7 @@ namespace TunGuard
                 if (reloadNodeConfig)
                 {
                     RefreshNodeConfigStatAfterSave();
+                    _pathResolver.LoadFromConfigCache(_nodeConfig);
                     recheckNode = true;
                     refreshRules = true;
                 }
@@ -5304,6 +7426,7 @@ namespace TunGuard
                     }
                     if (nodeCfgChanged)
                     {
+                        _pathResolver.LoadFromConfigCache(_nodeConfig);
                         recheckNode = true;
                         refreshRules = true;
                         forceFullScan = true;
@@ -5319,6 +7442,26 @@ namespace TunGuard
                     SyncMihomoConnectionConfig();
                 }
 
+                NodeGuardConfig nodeCfg = _nodeConfig;
+                if (monitoring && nodeCfg != null && nodeCfg.WfpEnabled)
+                {
+                    if (nowMs - lastPathDiscoverMs >= PATH_DISCOVERY_INTERVAL_MS)
+                    {
+                        lastPathDiscoverMs = nowMs;
+                        _killer.DiscoverNewProcessPaths(false, path => _pathResolver.RecordRunningImagePath(path));
+                    }
+                    if (nowMs - lastStaticRescanMs >= STATIC_APP_RESCAN_INTERVAL_MS)
+                    {
+                        lastStaticRescanMs = nowMs;
+                        _pathResolver.ScanStaticInstallations();
+                    }
+                    if (_pathResolver.HasDirtyCache && (nowMs - lastCachePersistMs >= CACHE_PERSIST_INTERVAL_MS))
+                    {
+                        lastCachePersistMs = nowMs;
+                        PersistDiscoveredPathCacheSafe();
+                    }
+                }
+
                 int adapterPollInterval = !monitoring
                     ? PAUSED_INTERVAL_MS
                     : (tunActive ? ACTIVE_INTERVAL_MS : INACTIVE_ADAPTER_POLL_MS);
@@ -5326,7 +7469,6 @@ namespace TunGuard
                     recheckAdapter ||
                     (nowMs - lastAdapterCheckMs >= adapterPollInterval);
 
-                NodeGuardConfig nodeCfg = _nodeConfig;
                 bool nodeGuardEnabled = nodeCfg != null && nodeCfg.Enabled;
                 int nodePollInterval = safe ? NODE_CHECK_INTERVAL_ACTIVE_MS : NODE_CHECK_INTERVAL_INACTIVE_MS;
                 bool shouldCheckNode =
@@ -5356,6 +7498,30 @@ namespace TunGuard
                 {
                     lastFullScanMs = nowMs;
                 }
+            }
+        }
+
+        private void PersistDiscoveredPathCacheSafe()
+        {
+            NodeGuardConfig current = _nodeConfig;
+            if (current == null)
+            {
+                return;
+            }
+            NodeGuardConfig next = current.CloneNormalized();
+            if (!_pathResolver.MergeIntoConfig(next, true))
+            {
+                return;
+            }
+            try
+            {
+                NodeGuardConfigStore.Save(_nodeConfigPath, next);
+                _nodeConfig = next;
+                RefreshNodeConfigStatAfterSave();
+            }
+            catch
+            {
+                // Ignore transient disk write failures
             }
         }
 
@@ -5432,21 +7598,55 @@ namespace TunGuard
 
             next.IsGuardSafe = next.IsTunActive && (!next.NodeGuardEnabled || next.IsNodeAllowed);
 
-            // Enforce BEFORE firing UI events so zero milliseconds are wasted on UI updates
+            // Enforce WFP FIRST (kernel-level atomic commit before process sweep & UI updates)
             GuardedAppFlags guardedApps = nodeCfg.GetGuardedAppFlags();
+            List<string> wfpExes;
+            List<string> wfpPkgs;
+            List<string> wfpMihomo;
+            _pathResolver.BuildTargets(guardedApps, out wfpExes, out wfpPkgs, out wfpMihomo);
+            WfpStateSnapshot wfpSnap = _wfp.SyncState(
+                _monitoringEnabled,
+                nodeCfg.WfpEnabled,
+                next.IsGuardSafe,
+                next.IsTunActive ? next.AdapterLuid : 0UL,
+                wfpExes,
+                wfpPkgs,
+                nodeCfg.WfpBlockNonTunDns,
+                wfpMihomo,
+                _clashLocalProxyPorts);
+
+            next.WfpEnabled = wfpSnap.Enabled;
+            next.WfpActive = wfpSnap.Active;
+            next.WfpDegraded = wfpSnap.Degraded;
+            next.WfpBlockingNow = wfpSnap.BlockingNow;
+            next.WfpDnsGuardActive = wfpSnap.DnsGuardActive;
+            next.WfpExeTargetCount = wfpSnap.ExeTargetCount;
+            next.WfpPackageTargetCount = wfpSnap.PackageTargetCount;
+            next.WfpStatusText = wfpSnap.StatusText ?? string.Empty;
+
+            // Process kill runs if WFP is disabled/degraded (fail-safe fallback) or user enabled KillOnBlock
+            bool shouldKillProcesses = !nodeCfg.WfpEnabled || nodeCfg.WfpKillOnBlock || !wfpSnap.Active;
             bool appsExpanded = _killer.SetEnabledApps(guardedApps);
             KillResult killRes = default(KillResult);
+            bool notifyWfpBlockOnly = false;
             if (_monitoringEnabled && !next.IsGuardSafe && guardedApps != GuardedAppFlags.None)
             {
                 bool becameUnsafe = wasSafe && !next.IsGuardSafe;
-                if (becameUnsafe || fullProcessScan || appsExpanded)
+                if (shouldKillProcesses)
                 {
-                    killRes = _killer.KillAllNow();
-                    ranFullScan = true;
+                    if (becameUnsafe || fullProcessScan || appsExpanded)
+                    {
+                        killRes = _killer.KillAllNow();
+                        ranFullScan = true;
+                    }
+                    else
+                    {
+                        killRes = _killer.KillNewProcesses();
+                    }
                 }
-                else
+                else if (becameUnsafe)
                 {
-                    killRes = _killer.KillNewProcesses();
+                    notifyWfpBlockOnly = true;
                 }
             }
             else if ((next.IsGuardSafe && !wasSafe) || guardedApps == GuardedAppFlags.None)
@@ -5457,8 +7657,17 @@ namespace TunGuard
             bool changed = forceNotify ||
                            next.IsGuardSafe != prev.IsGuardSafe ||
                            next.IsTunActive != prev.IsTunActive ||
+                           next.AdapterLuid != prev.AdapterLuid ||
                            next.NodeGuardEnabled != prev.NodeGuardEnabled ||
                            next.IsNodeAllowed != prev.IsNodeAllowed ||
+                           next.WfpEnabled != prev.WfpEnabled ||
+                           next.WfpActive != prev.WfpActive ||
+                           next.WfpDegraded != prev.WfpDegraded ||
+                           next.WfpBlockingNow != prev.WfpBlockingNow ||
+                           next.WfpDnsGuardActive != prev.WfpDnsGuardActive ||
+                           next.WfpExeTargetCount != prev.WfpExeTargetCount ||
+                           next.WfpPackageTargetCount != prev.WfpPackageTargetCount ||
+                           !string.Equals(next.WfpStatusText, prev.WfpStatusText, StringComparison.Ordinal) ||
                            !string.Equals(next.AdapterAlias, prev.AdapterAlias, StringComparison.Ordinal) ||
                            !string.Equals(next.Reason, prev.Reason, StringComparison.Ordinal) ||
                            !string.Equals(next.ActiveNodeName, prev.ActiveNodeName, StringComparison.Ordinal) ||
@@ -5478,6 +7687,14 @@ namespace TunGuard
                 if (killedHandler != null)
                 {
                     killedHandler(killRes, triggerSource, next);
+                }
+            }
+            else if (notifyWfpBlockOnly)
+            {
+                Action<string, TunStatus> blockedHandler = WfpBlocked;
+                if (blockedHandler != null)
+                {
+                    blockedHandler(triggerSource, next);
                 }
             }
 
@@ -5518,6 +7735,7 @@ namespace TunGuard
                     HasDefaultRoute = false,
                     AutoRouteRequired = autoRoute,
                     AdapterIndex = 0,
+                    AdapterLuid = 0,
                     AdapterAlias = string.Empty,
                     Reason = "Clash Verge 配置已关闭 TUN"
                 };
@@ -5530,9 +7748,10 @@ namespace TunGuard
             }
 
             uint tunIfIndex;
+            ulong tunIfLuid;
             string tunAlias;
-            bool adapterUp = TryCheckCachedTunAdapter(_lastKnownTunIfIndex, customDevice, out tunIfIndex, out tunAlias) ||
-                             FindActiveTunAdapter(customDevice, out tunIfIndex, out tunAlias);
+            bool adapterUp = TryCheckCachedTunAdapter(_lastKnownTunIfIndex, customDevice, out tunIfIndex, out tunIfLuid, out tunAlias) ||
+                             FindActiveTunAdapter(customDevice, out tunIfIndex, out tunIfLuid, out tunAlias);
 
             bool hasRoute = true;
             if (adapterUp && autoRoute)
@@ -5568,14 +7787,16 @@ namespace TunGuard
                 HasDefaultRoute = hasRoute,
                 AutoRouteRequired = autoRoute,
                 AdapterIndex = tunIfIndex,
+                AdapterLuid = tunIfLuid,
                 AdapterAlias = tunAlias ?? string.Empty,
                 Reason = reason
             };
         }
 
-        private bool TryCheckCachedTunAdapter(uint cachedIfIndex, string customDevice, out uint ifIndex, out string alias)
+        private bool TryCheckCachedTunAdapter(uint cachedIfIndex, string customDevice, out uint ifIndex, out ulong ifLuid, out string alias)
         {
             ifIndex = 0;
+            ifLuid = 0;
             alias = string.Empty;
             if (cachedIfIndex == 0 || _ifRowBuffer == IntPtr.Zero)
             {
@@ -5612,13 +7833,15 @@ namespace TunGuard
             }
 
             ifIndex = cachedIfIndex;
+            ifLuid = unchecked((ulong)Marshal.ReadInt64(_ifRowBuffer, IF_ROW_LUID_OFFSET));
             alias = rowAlias;
             return true;
         }
 
-        private static bool FindActiveTunAdapter(string customDevice, out uint ifIndex, out string alias)
+        private static bool FindActiveTunAdapter(string customDevice, out uint ifIndex, out ulong ifLuid, out string alias)
         {
             ifIndex = 0;
+            ifLuid = 0;
             alias = string.Empty;
 
             IntPtr pTable;
@@ -5662,6 +7885,7 @@ namespace TunGuard
                     if (IsClashTunAdapter(rowAlias, rowDesc, customDevice))
                     {
                         ifIndex = (uint)Marshal.ReadInt32(row, IF_ROW_INDEX_OFFSET);
+                        ifLuid = unchecked((ulong)Marshal.ReadInt64(row, IF_ROW_LUID_OFFSET));
                         alias = rowAlias;
                         return true;
                     }
@@ -5895,12 +8119,18 @@ namespace TunGuard
                                 _customTunDevice != null ||
                                 _clashExternalController != null ||
                                 _clashExternalPipe != null ||
-                                _clashSecret != null);
+                                _clashSecret != null ||
+                                _clashMixedPort != 0 ||
+                                _clashHttpPort != 0 ||
+                                _clashSocksPort != 0);
                 _clashAutoRoute = true;
                 _customTunDevice = null;
                 _clashExternalController = null;
                 _clashExternalPipe = null;
                 _clashSecret = null;
+                _clashMixedPort = 0;
+                _clashHttpPort = 0;
+                _clashSocksPort = 0;
                 return changed;
             }
 
@@ -5909,13 +8139,19 @@ namespace TunGuard
             string controllerVal;
             string pipeVal;
             string secretVal;
+            ushort mixedPortVal;
+            ushort httpPortVal;
+            ushort socksPortVal;
             if (!TryReadClashYamlHeaderStream(
                 _clashYamlPath,
                 out autoRouteVal,
                 out deviceVal,
                 out controllerVal,
                 out pipeVal,
-                out secretVal))
+                out secretVal,
+                out mixedPortVal,
+                out httpPortVal,
+                out socksPortVal))
             {
                 return false;
             }
@@ -5934,12 +8170,18 @@ namespace TunGuard
                                 !string.Equals(_customTunDevice, nextDevice, StringComparison.Ordinal) ||
                                 !string.Equals(_clashExternalController, controllerVal, StringComparison.Ordinal) ||
                                 !string.Equals(_clashExternalPipe, pipeVal, StringComparison.Ordinal) ||
-                                !string.Equals(_clashSecret, secretVal, StringComparison.Ordinal);
+                                !string.Equals(_clashSecret, secretVal, StringComparison.Ordinal) ||
+                                _clashMixedPort != mixedPortVal ||
+                                _clashHttpPort != httpPortVal ||
+                                _clashSocksPort != socksPortVal;
             _clashAutoRoute = nextAutoRoute;
             _customTunDevice = nextDevice;
             _clashExternalController = controllerVal;
             _clashExternalPipe = pipeVal;
             _clashSecret = secretVal;
+            _clashMixedPort = mixedPortVal;
+            _clashHttpPort = httpPortVal;
+            _clashSocksPort = socksPortVal;
             return valueChanged;
         }
 
@@ -5950,13 +8192,19 @@ namespace TunGuard
             out string deviceVal,
             out string controllerVal,
             out string pipeVal,
-            out string secretVal)
+            out string secretVal,
+            out ushort mixedPortVal,
+            out ushort httpPortVal,
+            out ushort socksPortVal)
         {
             autoRouteVal = null;
             deviceVal = null;
             controllerVal = null;
             pipeVal = null;
             secretVal = null;
+            mixedPortVal = 0;
+            httpPortVal = 0;
+            socksPortVal = 0;
 
             for (int attempt = 0; attempt <= FileRetryDelaysMs.Length; attempt++)
             {
@@ -5974,6 +8222,9 @@ namespace TunGuard
                         string parsedController = null;
                         string parsedPipe = null;
                         string parsedSecret = null;
+                        ushort parsedMixedPort = 0;
+                        ushort parsedHttpPort = 0;
+                        ushort parsedSocksPort = 0;
 
                         string line;
                         while ((line = sr.ReadLine()) != null)
@@ -6032,6 +8283,30 @@ namespace TunGuard
                                         parsedSecret = v;
                                     }
                                 }
+                                else if (trimmed.StartsWith("mixed-port:", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    ushort p;
+                                    if (TryParseYamlPort(trimmed.Substring("mixed-port:".Length), out p))
+                                    {
+                                        parsedMixedPort = p;
+                                    }
+                                }
+                                else if (trimmed.StartsWith("port:", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    ushort p;
+                                    if (TryParseYamlPort(trimmed.Substring("port:".Length), out p))
+                                    {
+                                        parsedHttpPort = p;
+                                    }
+                                }
+                                else if (trimmed.StartsWith("socks-port:", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    ushort p;
+                                    if (TryParseYamlPort(trimmed.Substring("socks-port:".Length), out p))
+                                    {
+                                        parsedSocksPort = p;
+                                    }
+                                }
                                 continue;
                             }
 
@@ -6075,6 +8350,9 @@ namespace TunGuard
                             controllerVal = parsedController;
                             pipeVal = parsedPipe;
                             secretVal = parsedSecret;
+                            mixedPortVal = parsedMixedPort;
+                            httpPortVal = parsedHttpPort;
+                            socksPortVal = parsedSocksPort;
                             return true;
                         }
                     }
@@ -6090,6 +8368,23 @@ namespace TunGuard
                 }
             }
 
+            return false;
+        }
+
+        private static bool TryParseYamlPort(string rawValue, out ushort port)
+        {
+            port = 0;
+            if (string.IsNullOrEmpty(rawValue))
+            {
+                return false;
+            }
+            string v = StripYamlComment(rawValue).Trim().Trim('\'', '"');
+            int parsed;
+            if (int.TryParse(v, out parsed) && parsed > 0 && parsed <= 65535)
+            {
+                port = (ushort)parsed;
+                return true;
+            }
             return false;
         }
 
@@ -6114,10 +8409,14 @@ namespace TunGuard
                 _baseClashLastExists = false;
                 _baseClashLastWriteTicks = 0;
                 _baseClashLastLength = 0;
-                bool changed = (_baseExternalController != null || _baseExternalPipe != null || _baseSecret != null);
+                bool changed = (_baseExternalController != null || _baseExternalPipe != null || _baseSecret != null ||
+                                _baseMixedPort != 0 || _baseHttpPort != 0 || _baseSocksPort != 0);
                 _baseExternalController = null;
                 _baseExternalPipe = null;
                 _baseSecret = null;
+                _baseMixedPort = 0;
+                _baseHttpPort = 0;
+                _baseSocksPort = 0;
                 return changed;
             }
 
@@ -6136,6 +8435,9 @@ namespace TunGuard
             string controllerVal = null;
             string pipeVal = null;
             string secretVal = null;
+            ushort mixedPortVal = 0;
+            ushort httpPortVal = 0;
+            ushort socksPortVal = 0;
 
             using (StringReader sr = new StringReader(content))
             {
@@ -6175,15 +8477,45 @@ namespace TunGuard
                             secretVal = v;
                         }
                     }
+                    else if (trimmed.StartsWith("mixed-port:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ushort p;
+                        if (TryParseYamlPort(trimmed.Substring("mixed-port:".Length), out p))
+                        {
+                            mixedPortVal = p;
+                        }
+                    }
+                    else if (trimmed.StartsWith("port:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ushort p;
+                        if (TryParseYamlPort(trimmed.Substring("port:".Length), out p))
+                        {
+                            httpPortVal = p;
+                        }
+                    }
+                    else if (trimmed.StartsWith("socks-port:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ushort p;
+                        if (TryParseYamlPort(trimmed.Substring("socks-port:".Length), out p))
+                        {
+                            socksPortVal = p;
+                        }
+                    }
                 }
             }
 
             bool valueChanged = !string.Equals(_baseExternalController, controllerVal, StringComparison.Ordinal) ||
                                 !string.Equals(_baseExternalPipe, pipeVal, StringComparison.Ordinal) ||
-                                !string.Equals(_baseSecret, secretVal, StringComparison.Ordinal);
+                                !string.Equals(_baseSecret, secretVal, StringComparison.Ordinal) ||
+                                _baseMixedPort != mixedPortVal ||
+                                _baseHttpPort != httpPortVal ||
+                                _baseSocksPort != socksPortVal;
             _baseExternalController = controllerVal;
             _baseExternalPipe = pipeVal;
             _baseSecret = secretVal;
+            _baseMixedPort = mixedPortVal;
+            _baseHttpPort = httpPortVal;
+            _baseSocksPort = socksPortVal;
             return valueChanged;
         }
 
@@ -6192,6 +8524,28 @@ namespace TunGuard
             string pipe = !string.IsNullOrEmpty(_clashExternalPipe) ? _clashExternalPipe : _baseExternalPipe;
             string secret = !string.IsNullOrEmpty(_clashSecret) ? _clashSecret : _baseSecret;
             _mihomoClient.UpdateConnectionConfig(pipe, _clashExternalController, _baseExternalController, secret);
+
+            _clashLocalProxyPorts.Clear();
+            AddUniquePort(_clashLocalProxyPorts, _clashMixedPort != 0 ? _clashMixedPort : _baseMixedPort);
+            AddUniquePort(_clashLocalProxyPorts, _clashHttpPort != 0 ? _clashHttpPort : _baseHttpPort);
+            AddUniquePort(_clashLocalProxyPorts, _clashSocksPort != 0 ? _clashSocksPort : _baseSocksPort);
+            _clashLocalProxyPorts.Sort();
+        }
+
+        private static void AddUniquePort(List<ushort> ports, ushort port)
+        {
+            if (port == 0)
+            {
+                return;
+            }
+            for (int i = 0; i < ports.Count; i++)
+            {
+                if (ports[i] == port)
+                {
+                    return;
+                }
+            }
+            ports.Add(port);
         }
 
         private bool ReadNodeGuardConfigSafe(bool force)
@@ -6356,6 +8710,9 @@ namespace TunGuard
             {
                 watchdogExited = _watchdogThread.Join(1500);
             }
+
+            // Always close WFP DYNAMIC session immediately so BFE clears all kernel filters on exit
+            _wfp.Dispose();
 
             if (watchdogExited)
             {
@@ -6747,6 +9104,8 @@ namespace TunGuard
 
         private readonly string _configPath;
         private readonly Func<ClashCatalogData> _catalogProvider;
+        private readonly Func<TunStatus> _statusProvider;
+        private readonly Dictionary<string, List<string>> _preservedDiscoveredPaths;
 
         private readonly ToolTip _toolTip;
         private readonly Font _boldHeaderFont;
@@ -6754,6 +9113,10 @@ namespace TunGuard
         private readonly CheckBox _chkGuardAntigravity;
         private readonly CheckBox _chkGuardChatGPT;
         private readonly CheckBox _chkGuardClaude;
+        private readonly CheckBox _chkWfpEnabled;
+        private readonly CheckBox _chkWfpKillOnBlock;
+        private readonly CheckBox _chkWfpBlockNonTunDns;
+        private readonly Label _lblWfpStatus;
         private readonly CheckBox _chkEnabled;
         private readonly Label _lblClashStatus;
         private readonly Button _btnRefresh;
@@ -6802,10 +9165,12 @@ namespace TunGuard
             NodeGuardConfig initialConfig,
             string configPath,
             Func<ClashCatalogData> catalogProvider,
+            Func<TunStatus> statusProvider,
             Icon windowIcon)
         {
             _configPath = configPath;
             _catalogProvider = catalogProvider;
+            _statusProvider = statusProvider;
             _toolTip = new ToolTip();
             _searchDebounceTimer = new System.Windows.Forms.Timer { Interval = 80 };
             _searchDebounceTimer.Tick += (s, e) =>
@@ -6815,6 +9180,7 @@ namespace TunGuard
             };
 
             NodeGuardConfig cfg = (initialConfig != null ? initialConfig : new NodeGuardConfig()).CloneNormalized();
+            _preservedDiscoveredPaths = cfg.DiscoveredAppPaths ?? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < cfg.AllowedNodes.Count; i++)
             {
                 AddSelectionInternal(cfg.AllowedNodes[i]);
@@ -6825,8 +9191,8 @@ namespace TunGuard
             Font = new Font("Microsoft YaHei UI", 9f);
             _boldHeaderFont = new Font(Font, FontStyle.Bold);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(860, 645);
-            MinimumSize = new Size(720, 540);
+            ClientSize = new Size(860, 710);
+            MinimumSize = new Size(740, 590);
             MaximizeBox = true;
             MinimizeBox = false;
             if (windowIcon != null)
@@ -6838,17 +9204,18 @@ namespace TunGuard
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 7,
+                RowCount = 8,
                 Padding = new Padding(14)
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Guarded target apps
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: Enable node guard switch
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2: Live Clash status banner
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Proxy group & match mode
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 4: Transfer box
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 5: Live preview
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 6: Footer buttons
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: WFP kernel kill switch panel
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2: Enable node guard switch
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Live Clash status banner
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 4: Proxy group & match mode
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 5: Transfer box
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 6: Live preview
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 7: Footer buttons
 
             // Row 0: Guarded target apps selector
             TableLayoutPanel targetAppsPanel = new TableLayoutPanel
@@ -6898,7 +9265,7 @@ namespace TunGuard
                 Checked = cfg.GuardChatGPT,
                 Margin = new Padding(0, 2, 18, 2)
             };
-            _toolTip.SetToolTip(_chkGuardChatGPT, "拦截 Windows ChatGPT 桌面端（ChatGPT.exe 及 OpenAI 桌面应用组件）");
+            _toolTip.SetToolTip(_chkGuardChatGPT, "拦截 Windows ChatGPT 桌面端（ChatGPT.exe 及 OpenAI MSIX/桌面应用组件）");
             _chkGuardChatGPT.CheckedChanged += OnTargetAppCheckedChanged;
 
             _chkGuardClaude = new CheckBox
@@ -6908,7 +9275,7 @@ namespace TunGuard
                 Checked = cfg.GuardClaude,
                 Margin = new Padding(0, 2, 0, 2)
             };
-            _toolTip.SetToolTip(_chkGuardClaude, "拦截 Claude / Claude Code 桌面端（Claude.exe 及桌面端内嵌 claude-code 进程，不影响 VS Code 插件或命令行 CLI）");
+            _toolTip.SetToolTip(_chkGuardClaude, "拦截 Claude / Claude Code 桌面端（Claude.exe 及 MSIX 包组件，不影响 VS Code 插件或命令行 CLI）");
             _chkGuardClaude.CheckedChanged += OnTargetAppCheckedChanged;
 
             targetAppsFlow.Controls.Add(_chkGuardAntigravity);
@@ -6919,18 +9286,101 @@ namespace TunGuard
             targetAppsPanel.Controls.Add(targetAppsFlow, 1, 0);
             root.Controls.Add(targetAppsPanel, 0, 0);
 
-            // Row 1: Enable node guard checkbox
+            // Row 1: WFP kernel kill switch settings
+            TableLayoutPanel wfpPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                ColumnCount = 2,
+                RowCount = 2,
+                Margin = new Padding(0, 0, 0, 8),
+                BackColor = Color.FromArgb(245, 247, 250),
+                Padding = new Padding(10, 7, 10, 7)
+            };
+            wfpPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            wfpPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            wfpPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            wfpPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            Label lblWfpHeader = new Label
+            {
+                Text = "内核断网:",
+                AutoSize = true,
+                Font = _boldHeaderFont,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 3, 12, 3)
+            };
+
+            FlowLayoutPanel wfpFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                WrapContents = true,
+                Margin = new Padding(0)
+            };
+
+            _chkWfpEnabled = new CheckBox
+            {
+                Text = "启用 WFP 内核断网保护 (零漏包)",
+                AutoSize = true,
+                Checked = cfg.WfpEnabled,
+                Margin = new Padding(0, 2, 16, 2)
+            };
+            _toolTip.SetToolTip(_chkWfpEnabled, "通过 Windows Filtering Platform 在内核层常驻规则：仅允许受控应用走 TUN 与 Loopback，TUN 掉线瞬间零窗口丢包；使用 DYNAMIC 动态会话，退出自动清理绝不锁死网络（需管理员权限）。");
+            _chkWfpEnabled.CheckedChanged += OnWfpOptionChanged;
+
+            _chkWfpKillOnBlock = new CheckBox
+            {
+                Text = "拦截时同时终止进程",
+                AutoSize = true,
+                Checked = cfg.WfpKillOnBlock,
+                Enabled = cfg.WfpEnabled,
+                Margin = new Padding(0, 2, 16, 2)
+            };
+            _toolTip.SetToolTip(_chkWfpKillOnBlock, "勾选：WFP 内核断网 + 终止进程双重兜底；取消勾选：仅由 WFP 内核断网挂起（保留编辑内容不杀进程，WFP 降级时自动回退强杀）。");
+            _chkWfpKillOnBlock.CheckedChanged += OnWfpOptionChanged;
+
+            _chkWfpBlockNonTunDns = new CheckBox
+            {
+                Text = "全局防 DNS 泄漏 (53 端口)",
+                AutoSize = true,
+                Checked = cfg.WfpBlockNonTunDns,
+                Enabled = cfg.WfpEnabled,
+                Margin = new Padding(0, 2, 0, 2)
+            };
+            _toolTip.SetToolTip(_chkWfpBlockNonTunDns, "阻断系统 dnscache 等所有进程经非 TUN 网卡发出的 UDP/TCP 53 端口 DNS 查询（自动放行 Loopback、TUN 与 Mihomo 内核；仅在 Clash TUN 开启 DNS 劫持时建议启用）。");
+            _chkWfpBlockNonTunDns.CheckedChanged += OnWfpOptionChanged;
+
+            wfpFlow.Controls.Add(_chkWfpEnabled);
+            wfpFlow.Controls.Add(_chkWfpKillOnBlock);
+            wfpFlow.Controls.Add(_chkWfpBlockNonTunDns);
+
+            _lblWfpStatus = new Label
+            {
+                Text = "内核状态: 正在读取...",
+                AutoSize = true,
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Margin = new Padding(0, 4, 0, 0)
+            };
+
+            wfpPanel.Controls.Add(lblWfpHeader, 0, 0);
+            wfpPanel.Controls.Add(wfpFlow, 1, 0);
+            wfpPanel.Controls.Add(_lblWfpStatus, 0, 1);
+            wfpPanel.SetColumnSpan(_lblWfpStatus, 2);
+            root.Controls.Add(wfpPanel, 0, 1);
+
+            // Row 2: Enable node guard checkbox
             _chkEnabled = new CheckBox
             {
-                Text = "启用 Clash 节点守护（当 Clash 未使用右侧允许节点时，同样立即终止已勾选的受控应用）",
+                Text = "启用 Clash 节点守护（当 Clash 未使用右侧允许节点时，同样立即触发内核断网/拦截）",
                 AutoSize = true,
                 Checked = cfg.Enabled,
                 Margin = new Padding(0, 0, 0, 8)
             };
             _chkEnabled.CheckedChanged += OnRuleInputChanged;
-            root.Controls.Add(_chkEnabled, 0, 1);
+            root.Controls.Add(_chkEnabled, 0, 2);
 
-            // Row 2: Live Clash status bar
+            // Row 3: Live Clash status bar
             TableLayoutPanel statusPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -6961,9 +9411,9 @@ namespace TunGuard
 
             statusPanel.Controls.Add(_lblClashStatus, 0, 0);
             statusPanel.Controls.Add(_btnRefresh, 1, 0);
-            root.Controls.Add(statusPanel, 0, 2);
+            root.Controls.Add(statusPanel, 0, 3);
 
-            // Row 3: Proxy group & match mode
+            // Row 4: Proxy group & match mode
             TableLayoutPanel rulePanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -7043,7 +9493,7 @@ namespace TunGuard
             rulePanel.Controls.Add(matchFlow, 3, 0);
             rulePanel.Controls.Add(lblGroupHint, 0, 1);
             rulePanel.SetColumnSpan(lblGroupHint, 4);
-            root.Controls.Add(rulePanel, 0, 3);
+            root.Controls.Add(rulePanel, 0, 4);
 
             // Row 4: Transfer Box (Left pane | Transfer buttons | Right pane)
             TableLayoutPanel transfer = new TableLayoutPanel
@@ -7291,9 +9741,9 @@ namespace TunGuard
             transfer.Controls.Add(leftPane, 0, 0);
             transfer.Controls.Add(midPanel, 1, 0);
             transfer.Controls.Add(rightPane, 2, 0);
-            root.Controls.Add(transfer, 0, 4);
+            root.Controls.Add(transfer, 0, 5);
 
-            // Row 5: Live preview
+            // Row 6: Live preview
             _lblPreview = new Label
             {
                 Text = "预览: 正在检测...",
@@ -7301,9 +9751,9 @@ namespace TunGuard
                 Dock = DockStyle.Fill,
                 Margin = new Padding(0, 0, 0, 10)
             };
-            root.Controls.Add(_lblPreview, 0, 5);
+            root.Controls.Add(_lblPreview, 0, 6);
 
-            // Row 6: Footer buttons
+            // Row 7: Footer buttons
             FlowLayoutPanel footer = new FlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -7333,13 +9783,17 @@ namespace TunGuard
 
             footer.Controls.Add(_btnCancel);
             footer.Controls.Add(_btnSave);
-            root.Controls.Add(footer, 0, 6);
+            root.Controls.Add(footer, 0, 7);
 
             Controls.Add(root);
             CancelButton = _btnCancel;
 
             Load += (s, e) =>
             {
+                if (_statusProvider != null)
+                {
+                    UpdateWfpStatus(_statusProvider());
+                }
                 RebuildTransferLists();
                 UpdatePreview();
                 RefreshCatalogAsync();
@@ -7445,6 +9899,48 @@ namespace TunGuard
             UpdatePreview();
         }
 
+        public void UpdateWfpStatus(TunStatus status)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            if (status.WfpDegraded)
+            {
+                _lblWfpStatus.ForeColor = Color.FromArgb(180, 83, 9);
+                _lblWfpStatus.Text = "内核状态: " + status.WfpStatusText + " — 当前自动回退为进程终止模式，请以管理员权限运行以启用 WFP";
+            }
+            else if (status.WfpActive)
+            {
+                _lblWfpStatus.ForeColor = status.WfpBlockingNow
+                    ? Color.FromArgb(185, 28, 28)
+                    : Color.FromArgb(21, 128, 61);
+                string luidHint = status.AdapterLuid != 0
+                    ? (" | TUN LUID: 0x" + status.AdapterLuid.ToString("X"))
+                    : string.Empty;
+                _lblWfpStatus.Text = "内核状态: " + status.WfpStatusText + luidHint + " | 已放行 Loopback，退出自动清理";
+            }
+            else if (status.WfpEnabled)
+            {
+                _lblWfpStatus.ForeColor = Color.FromArgb(100, 116, 139);
+                _lblWfpStatus.Text = "内核状态: " + (string.IsNullOrEmpty(status.WfpStatusText) ? "等待激活" : status.WfpStatusText);
+            }
+            else
+            {
+                _lblWfpStatus.ForeColor = Color.FromArgb(100, 116, 139);
+                _lblWfpStatus.Text = "内核状态: 未启用（仅使用应用层进程终止保护）";
+            }
+        }
+
+        private void OnWfpOptionChanged(object sender, EventArgs e)
+        {
+            bool wfpOn = _chkWfpEnabled.Checked;
+            _chkWfpKillOnBlock.Enabled = wfpOn;
+            _chkWfpBlockNonTunDns.Enabled = wfpOn;
+            UpdatePreview();
+        }
+
         private void OnTargetAppCheckedChanged(object sender, EventArgs e)
         {
             if (_suppressAppToggleEvents)
@@ -7461,6 +9957,19 @@ namespace TunGuard
             draft.GuardAntigravity = _chkGuardAntigravity.Checked;
             draft.GuardChatGPT = _chkGuardChatGPT.Checked;
             draft.GuardClaude = _chkGuardClaude.Checked;
+            draft.WfpEnabled = _chkWfpEnabled.Checked;
+            draft.WfpKillOnBlock = _chkWfpKillOnBlock.Checked;
+            draft.WfpBlockNonTunDns = _chkWfpBlockNonTunDns.Checked;
+            if (_preservedDiscoveredPaths != null)
+            {
+                foreach (KeyValuePair<string, List<string>> kv in _preservedDiscoveredPaths)
+                {
+                    if (kv.Value != null)
+                    {
+                        draft.DiscoveredAppPaths[kv.Key] = new List<string>(kv.Value);
+                    }
+                }
+            }
 
             string rawGroup = _cmbProxyGroup.Text != null ? _cmbProxyGroup.Text.Trim() : string.Empty;
             draft.ProxyGroup = string.Equals(rawGroup, AutoGroupLabel, StringComparison.Ordinal)
@@ -7939,15 +10448,21 @@ namespace TunGuard
             if (apps == GuardedAppFlags.None)
             {
                 _lblPreview.ForeColor = Color.FromArgb(180, 83, 9);
-                _lblPreview.Text = "预览: 未勾选任何受控应用（TUN 断开或节点不匹配时不会终止任何进程）";
+                _lblPreview.Text = draft.WfpEnabled && draft.WfpBlockNonTunDns
+                    ? "预览: 未勾选受控应用（仅全局 53 端口防 DNS 泄漏生效）"
+                    : "预览: 未勾选任何受控应用（TUN 断开或节点不匹配时不会拦截或终止任何进程）";
                 return;
             }
 
             string appsText = GuardedAppHelper.FormatNames(apps);
+            string actionDesc = draft.WfpEnabled
+                ? (draft.WfpKillOnBlock ? "WFP 内核断网 + 终止进程" : "仅 WFP 内核断网（保留进程）")
+                : "仅终止进程";
+
             if (!draft.Enabled)
             {
                 _lblPreview.ForeColor = Color.FromArgb(100, 116, 139);
-                _lblPreview.Text = "预览: 节点守护未启用（仅监控 TUN 模式；受控应用: " + appsText + "）";
+                _lblPreview.Text = "预览: 节点守护未启用（仅监控 TUN；动作: " + actionDesc + "；受控应用: " + appsText + "）";
                 return;
             }
 
@@ -7969,12 +10484,12 @@ namespace TunGuard
             if (eval.IsAllowed)
             {
                 _lblPreview.ForeColor = Color.FromArgb(21, 128, 61);
-                _lblPreview.Text = "预览: 当前命中 — " + eval.ResolutionChain + "（保存后正常放行；受控应用: " + appsText + "）";
+                _lblPreview.Text = "预览: 当前命中 — " + eval.ResolutionChain + "（保存后正常放行；策略: " + actionDesc + "）";
             }
             else
             {
                 _lblPreview.ForeColor = Color.FromArgb(185, 28, 28);
-                _lblPreview.Text = "预览: 当前未命中 — " + eval.Reason + "（保存后将立即拦截: " + appsText + "！）";
+                _lblPreview.Text = "预览: 当前未命中 — " + eval.Reason + "（保存后将立即执行「" + actionDesc + "」: " + appsText + "！）";
             }
         }
 
@@ -7998,9 +10513,12 @@ namespace TunGuard
                 NodeEvaluationResult eval = NodeGuardEvaluator.Evaluate(draft, _lastSnapshot);
                 if (!eval.IsAllowed)
                 {
+                    string actionSummary = (draft.WfpEnabled && !draft.WfpKillOnBlock)
+                        ? ("立即通过 WFP 内核阻断 " + GuardedAppHelper.FormatNames(apps) + " 联网（若 WFP 降级则终止进程）")
+                        : ("立即触发拦截并终止 " + GuardedAppHelper.FormatNames(apps));
                     DialogResult confirm = MessageBox.Show(
                         this,
-                        "当前 Clash 状态未满足右侧允许节点规则：\n" + eval.Reason + "\n\n保存后将立即触发拦截并终止 " + GuardedAppHelper.FormatNames(apps) + "。\n是否确认保存？",
+                        "当前 Clash 状态未满足右侧允许节点规则：\n" + eval.Reason + "\n\n保存后将" + actionSummary + "。\n是否确认保存？",
                         "确认保存并触发拦截",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Warning,
@@ -8042,6 +10560,7 @@ namespace TunGuard
         private readonly ContextMenuStrip _menu;
         private readonly NotifyIcon _trayIcon;
         private readonly ToolStripMenuItem _statusItem;
+        private readonly ToolStripMenuItem _wfpStatusItem;
         private readonly ToolStripMenuItem _guardedAppsSummaryItem;
         private readonly ToolStripMenuItem _nodeRuleItem;
         private readonly ToolStripMenuItem _lastKillItem;
@@ -8083,6 +10602,7 @@ namespace TunGuard
             _iconPaused = TrayIconFactory.CreateStatusIcon(Color.FromArgb(107, 114, 128), Color.FromArgb(75, 85, 99));
 
             _statusItem = new ToolStripMenuItem("状态: 正在检测...") { Enabled = false };
+            _wfpStatusItem = new ToolStripMenuItem("内核断网: 正在初始化...") { Enabled = false };
             _guardedAppsSummaryItem = new ToolStripMenuItem("受控应用: Antigravity、ChatGPT、Claude") { Enabled = false };
             _nodeRuleItem = new ToolStripMenuItem("节点守护: 未启用") { Enabled = false };
             _lastKillItem = new ToolStripMenuItem("拦截记录: 暂无") { Enabled = false };
@@ -8117,6 +10637,7 @@ namespace TunGuard
 
             _menu = new ContextMenuStrip();
             _menu.Items.Add(_statusItem);
+            _menu.Items.Add(_wfpStatusItem);
             _menu.Items.Add(_guardedAppsSummaryItem);
             _menu.Items.Add(_nodeRuleItem);
             _menu.Items.Add(_lastKillItem);
@@ -8144,6 +10665,7 @@ namespace TunGuard
             _monitor = new TunMonitor();
             _monitor.StatusChanged += OnMonitorStatusChanged;
             _monitor.ProcessesKilled += OnProcessesKilled;
+            _monitor.WfpBlocked += OnWfpBlocked;
             _monitor.AccessDenied += OnAccessDenied;
             _monitor.NodeConfigChanged += OnNodeConfigChanged;
             _monitor.Start();
@@ -8302,6 +10824,28 @@ namespace TunGuard
             });
         }
 
+        private void OnWfpBlocked(string trigger, TunStatus status)
+        {
+            string timeText = DateTime.Now.ToString("HH:mm:ss");
+            bool isNodeTrigger = status.IsTunActive && status.NodeGuardEnabled && !status.IsNodeAllowed;
+            NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
+            string appNames = cfg != null ? GuardedAppHelper.FormatNames(cfg.GetGuardedAppFlags()) : "受控应用";
+            string title = isNodeTrigger
+                ? "Clash 节点不匹配 — WFP 已断网"
+                : "TUN 已关闭 — WFP 已断网";
+            string detailReason = isNodeTrigger ? status.NodeReason : status.Reason;
+
+            PostToUi(() =>
+            {
+                _lastKillItem.Text = string.Format("上次拦截: {0} (WFP 内核断网，未终止进程)", timeText);
+                _trayIcon.ShowBalloonTip(
+                    2500,
+                    title,
+                    string.Format("触发源: {0}\n原因: {1}\n已通过 WFP 内核阻断 {2} 联网（进程保留，恢复合规后自动恢复联网）", trigger, detailReason, appNames),
+                    ToolTipIcon.Warning);
+            });
+        }
+
         private void OnAccessDenied(int deniedCount, GuardedAppFlags deniedApps, string trigger)
         {
             long nowTicks = DateTime.UtcNow.Ticks;
@@ -8349,7 +10893,13 @@ namespace TunGuard
             NodeGuardConfig cfg = _monitor.CurrentNodeConfig;
             SyncGuardedAppsUi(cfg);
             _nodeRuleItem.Text = cfg != null ? cfg.GetSummaryText() : "节点守护: 未启用";
+            _wfpStatusItem.Text = "内核断网: " + (string.IsNullOrEmpty(status.WfpStatusText) ? "未启用" : status.WfpStatusText);
+            if (_settingsForm != null && !_settingsForm.IsDisposed)
+            {
+                _settingsForm.UpdateWfpStatus(status);
+            }
             bool hasTargets = cfg == null || cfg.GetGuardedAppFlags() != GuardedAppFlags.None;
+            bool wfpOnlyMode = status.WfpActive && cfg != null && cfg.WfpEnabled && !cfg.WfpKillOnBlock;
 
             if (!_monitor.MonitoringEnabled)
             {
@@ -8365,32 +10915,35 @@ namespace TunGuard
             if (status.IsGuardSafe)
             {
                 _trayIcon.Icon = _iconSafe;
+                string wfpTag = status.WfpActive ? " [WFP]" : string.Empty;
                 if (status.NodeGuardEnabled)
                 {
                     string node = !string.IsNullOrEmpty(status.ActiveNodeName) ? status.ActiveNodeName : "未知";
-                    _trayIcon.Text = TruncateNotifyText("Clash TUN 守护 | 正常 | 节点: " + node);
+                    _trayIcon.Text = TruncateNotifyText("Clash TUN 守护" + wfpTag + " | 正常 | 节点: " + node);
                     _statusItem.Text = "状态: 正常 | TUN(" + status.AdapterAlias + ") | 节点: " + node;
                 }
                 else
                 {
-                    _trayIcon.Text = TruncateNotifyText("Clash TUN 守护 | TUN: 已开启 (" + status.AdapterAlias + ")");
+                    _trayIcon.Text = TruncateNotifyText("Clash TUN 守护" + wfpTag + " | TUN: 已开启 (" + status.AdapterAlias + ")");
                     _statusItem.Text = "状态: TUN 已开启 (" + status.AdapterAlias + ")";
                 }
             }
             else if (!status.IsTunActive)
             {
                 _trayIcon.Icon = _iconAlert;
-                _trayIcon.Text = hasTargets
-                    ? "Clash TUN 守护 | TUN: 已关闭 (禁止启动)"
-                    : "Clash TUN 守护 | TUN: 已关闭 (未勾选受控应用)";
+                string alertTag = !hasTargets
+                    ? "(未勾选受控应用)"
+                    : (wfpOnlyMode ? "(WFP 已断网)" : "(禁止启动)");
+                _trayIcon.Text = TruncateNotifyText("Clash TUN 守护 | TUN: 已关闭 " + alertTag);
                 _statusItem.Text = "状态: TUN 已关闭 (" + status.Reason + ")";
             }
             else
             {
                 _trayIcon.Icon = _iconAlert;
-                _trayIcon.Text = hasTargets
-                    ? "Clash TUN 守护 | 节点不匹配 (禁止启动)"
-                    : "Clash TUN 守护 | 节点不匹配 (未勾选受控应用)";
+                string alertTag = !hasTargets
+                    ? "(未勾选受控应用)"
+                    : (wfpOnlyMode ? "(WFP 已断网)" : "(禁止启动)");
+                _trayIcon.Text = TruncateNotifyText("Clash TUN 守护 | 节点不匹配 " + alertTag);
                 _statusItem.Text = "状态: 已拦截 (" + status.NodeReason + ")";
             }
         }
@@ -8416,6 +10969,7 @@ namespace TunGuard
                 _monitor.CurrentNodeConfig,
                 _monitor.NodeConfigPath,
                 () => _monitor.QueryClashCatalog(),
+                () => _monitor.CurrentStatus,
                 _iconSafe);
             _settingsForm = form;
             form.FormClosed += (s, args) =>
@@ -8482,7 +11036,8 @@ namespace TunGuard
             NodeGuardConfig cfg = _monitor.CurrentNodeConfig ?? new NodeGuardConfig();
             string mode = _monitor.MonitoringEnabled ? "实时监控中" : "已暂停监控";
             string tunLine = s.IsTunActive ? ("TUN: 已开启 (" + s.AdapterAlias + ")") : ("TUN: 已关闭 (" + s.Reason + ")");
-            string body = mode + "\n" + cfg.GetGuardedAppsSummaryText() + "\n" + tunLine;
+            string wfpLine = "内核断网: " + (string.IsNullOrEmpty(s.WfpStatusText) ? "未启用" : s.WfpStatusText);
+            string body = mode + "\n" + cfg.GetGuardedAppsSummaryText() + "\n" + tunLine + "\n" + wfpLine;
             if (s.NodeGuardEnabled)
             {
                 string nodeDetail = !string.IsNullOrEmpty(s.ActiveNodeChain)

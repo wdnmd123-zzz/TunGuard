@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+    paths:
+      - '**.cs'
+      - 'build.ps1'
+      - 'app.manifest'
   workflow_dispatch:
     inputs:
       version:
