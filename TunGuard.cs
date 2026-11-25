@@ -4516,6 +4516,7 @@ namespace TunGuard
             long startTs = Stopwatch.GetTimestamp();
             int killed = 0;
             int accessDenied = 0;
+            bool hadUnresolved = false;
             GuardedAppFlags killedApps = GuardedAppFlags.None;
             GuardedAppFlags deniedApps = GuardedAppFlags.None;
             GuardedAppFlags enabledApps = _enabledApps;
@@ -4535,11 +4536,17 @@ namespace TunGuard
                     continue;
                 }
 
+                int killedBefore = killed;
+                int deniedBefore = accessDenied;
                 bool isBenign;
                 InspectAndKillPid(pid, enabledApps, true, ref killed, ref accessDenied, ref killedApps, ref deniedApps, out isBenign);
                 if (isBenign)
                 {
                     _nextBenignPids.Add(pid);
+                }
+                else if (killed == killedBefore && accessDenied == deniedBefore)
+                {
+                    hadUnresolved = true;
                 }
             }
 
@@ -4547,7 +4554,7 @@ namespace TunGuard
             _prevBenignPids = _nextBenignPids;
             _nextBenignPids = swap;
 
-            if (killed == 0 && accessDenied == 0)
+            if (killed == 0 && accessDenied == 0 && !hadUnresolved)
             {
                 if (_lastPidSnapshot.Length < pidCount)
                 {
@@ -4887,8 +4894,7 @@ namespace TunGuard
                 return true;
             }
 
-            if ((enabledApps & GuardedAppFlags.Claude) != 0 &&
-                string.Equals(exe, "Claude.exe", StringComparison.OrdinalIgnoreCase))
+            if ((enabledApps & GuardedAppFlags.Claude) != 0 && IsClaudeAuxiliaryExeName(exe))
             {
                 return true;
             }
@@ -4927,7 +4933,7 @@ namespace TunGuard
             }
 
             if ((enabledApps & GuardedAppFlags.Claude) != 0 &&
-                string.Equals(exe, "Claude.exe", StringComparison.OrdinalIgnoreCase) &&
+                IsClaudeAuxiliaryExeName(exe) &&
                 IsClaudeDesktopPath(fullPath))
             {
                 return GuardedAppFlags.Claude;
@@ -4961,7 +4967,8 @@ namespace TunGuard
         {
             return fullPath.IndexOf("\\WindowsApps\\OpenAI.", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   fullPath.IndexOf("\\OpenAI\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0;
+                   fullPath.IndexOf("\\OpenAI\\ChatGPT\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\OpenAI\\Codex\\", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static bool IsClaudeDesktopDirectExeName(string exe)
@@ -4972,13 +4979,23 @@ namespace TunGuard
                    string.Equals(exe, "Claude Code.exe", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsClaudeAuxiliaryExeName(string exe)
+        {
+            return string.Equals(exe, "Claude.exe", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(exe, "cowork-svc.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool IsClaudeDesktopPath(string fullPath)
         {
             return fullPath.IndexOf("\\WindowsApps\\Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   fullPath.IndexOf("\\WindowsApps\\Anthropic.Claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\WindowsApps\\Anthropic.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\WindowsApps\\AnthropicPBC.", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\AnthropicClaude\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude-3p\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude-zh", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude-CN\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   fullPath.IndexOf("\\Claude-Desktop\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude Desktop\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\Claude Code\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    fullPath.IndexOf("\\ClaudeCode\\", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -5082,6 +5099,7 @@ namespace TunGuard
             {
                 CombineSafe(localAppData, "Programs\\ChatGPT"),
                 CombineSafe(localAppData, "ChatGPT"),
+                CombineSafe(localAppData, "OpenAI\\Codex"),
                 CombineSafe(progFiles, "ChatGPT"),
                 CombineSafe(progFiles, "OpenAI\\ChatGPT")
             };
@@ -5095,6 +5113,7 @@ namespace TunGuard
                 CombineSafe(localAppData, "AnthropicClaude"),
                 CombineSafe(localAppData, "Programs\\Claude"),
                 CombineSafe(localAppData, "Claude"),
+                CombineSafe(localAppData, "Claude-3p"),
                 CombineSafe(progFiles, "Claude"),
                 CombineSafe(progFiles, "AnthropicClaude")
             };
@@ -5475,7 +5494,8 @@ namespace TunGuard
                 return GuardedAppFlags.ChatGPT;
             }
             if (pkgFullName.StartsWith("Claude_", StringComparison.OrdinalIgnoreCase) ||
-                pkgFullName.StartsWith("Anthropic.Claude", StringComparison.OrdinalIgnoreCase))
+                pkgFullName.StartsWith("Anthropic.", StringComparison.OrdinalIgnoreCase) ||
+                pkgFullName.StartsWith("AnthropicPBC.", StringComparison.OrdinalIgnoreCase))
             {
                 return GuardedAppFlags.Claude;
             }
@@ -7304,6 +7324,7 @@ namespace TunGuard
             long lastPathDiscoverMs = 0;
             long lastStaticRescanMs = 0;
             long lastCachePersistMs = 0;
+            long followUpRulesRefreshAtMs = 0;
 
             while (_running)
             {
@@ -7460,6 +7481,17 @@ namespace TunGuard
                         lastCachePersistMs = nowMs;
                         PersistDiscoveredPathCacheSafe();
                     }
+                }
+
+                if (refreshRules)
+                {
+                    followUpRulesRefreshAtMs = nowMs + 800;
+                }
+                else if (monitoring && followUpRulesRefreshAtMs > 0 && nowMs >= followUpRulesRefreshAtMs)
+                {
+                    followUpRulesRefreshAtMs = 0;
+                    refreshRules = true;
+                    recheckNode = true;
                 }
 
                 int adapterPollInterval = !monitoring
