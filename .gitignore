@@ -1,6 +1,7 @@
 # Compiled binary and generated icon (produced by build.ps1)
 TunGuard.exe
 TunGuard.ico
+TunGuard.config.json
 *.exe
 *.ico
 *.pdb

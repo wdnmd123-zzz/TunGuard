@@ -71,7 +71,9 @@ $bmp.Dispose()
     "/win32manifest:$manifestPath" `
     "/out:$exePath" `
     /r:System.dll `
+    /r:System.Core.dll `
     /r:System.Drawing.dll `
+    /r:System.Web.Extensions.dll `
     /r:System.Windows.Forms.dll `
     "$srcPath"
 
