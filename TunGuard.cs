@@ -15916,6 +15916,11 @@ namespace TunGuard
                 DialogResult = DialogResult.Cancel,
                 Margin = new Padding(8, 0, 0, 0)
             };
+            _btnCancel.Click += (s, e) =>
+            {
+                DialogResult = DialogResult.Cancel;
+                Close();
+            };
 
             _btnSave = new Button
             {
