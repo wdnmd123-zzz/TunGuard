@@ -1627,6 +1627,42 @@ namespace TunGuard
         public bool IsGroup;
     }
 
+    internal enum AutoRuleResolutionKind
+    {
+        None = 0,
+        MatchProxy = 1,
+        InferredUnique = 2,
+        Ambiguous = 3,
+        NoProxyRule = 4
+    }
+
+    internal struct AutoRuleResolution
+    {
+        public AutoRuleResolutionKind Kind;
+        public string TargetProxy;
+        public string MatchRuleProxy;
+        public string ErrorReason;
+
+        public bool HasTarget
+        {
+            get
+            {
+                return (Kind == AutoRuleResolutionKind.MatchProxy ||
+                        Kind == AutoRuleResolutionKind.InferredUnique) &&
+                       !string.IsNullOrEmpty(TargetProxy);
+            }
+        }
+
+        public bool IsFailure
+        {
+            get
+            {
+                return Kind == AutoRuleResolutionKind.Ambiguous ||
+                       Kind == AutoRuleResolutionKind.NoProxyRule;
+            }
+        }
+    }
+
     internal sealed class ClashSnapshot
     {
         public bool Connected;
@@ -1634,6 +1670,7 @@ namespace TunGuard
         public string Endpoint;
         public string Mode;
         public string MatchRuleProxy;
+        public AutoRuleResolution AutoRuleResolution;
         public Dictionary<string, ClashProxyEntry> Proxies;
 
         public ClashSnapshot()
@@ -1761,6 +1798,19 @@ namespace TunGuard
                 if (!string.IsNullOrEmpty(config.ProxyGroup))
                 {
                     entryName = config.ProxyGroup;
+                }
+                else if (snapshot.AutoRuleResolution.IsFailure)
+                {
+                    res.IsAllowed = false;
+                    res.TargetGroup = snapshot.AutoRuleResolution.MatchRuleProxy ?? string.Empty;
+                    res.Reason = !string.IsNullOrEmpty(snapshot.AutoRuleResolution.ErrorReason)
+                        ? snapshot.AutoRuleResolution.ErrorReason
+                        : "无法自动识别黑名单模式代理组，请在设置中指定代理组";
+                    return res;
+                }
+                else if (snapshot.AutoRuleResolution.HasTarget)
+                {
+                    entryName = snapshot.AutoRuleResolution.TargetProxy;
                 }
                 else if (!string.IsNullOrEmpty(snapshot.MatchRuleProxy))
                 {
@@ -1904,6 +1954,7 @@ namespace TunGuard
         private const int READ_TIMEOUT_MS = 350;
         private const int MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
         private const int RULES_CACHE_TTL_MS = 60000;
+        private const int RULES_ERROR_CACHE_TTL_MS = 3000;
 
         private sealed class EndpointInfo
         {
@@ -1955,7 +2006,7 @@ namespace TunGuard
         private string _fallbackController;
         private string _secret;
         private EndpointInfo _cachedEndpoint;
-        private string _cachedMatchProxy;
+        private AutoRuleResolution _cachedRuleResolution;
         private long _lastRulesFetchTicks;
 
         // Reusable watchdog hot-path connection & buffers (guarded by _kaLock)
@@ -1989,6 +2040,7 @@ namespace TunGuard
                 if (changed)
                 {
                     _cachedEndpoint = null;
+                    _cachedRuleResolution = default(AutoRuleResolution);
                     _lastRulesFetchTicks = 0;
                 }
             }
@@ -2002,6 +2054,7 @@ namespace TunGuard
         {
             lock (_lock)
             {
+                _cachedRuleResolution = default(AutoRuleResolution);
                 _lastRulesFetchTicks = 0;
             }
         }
@@ -2061,12 +2114,12 @@ namespace TunGuard
             }
 
             string secret;
-            string cachedMatch;
+            AutoRuleResolution cachedRuleRes;
             long lastRulesTicks;
             lock (_lock)
             {
                 secret = _secret ?? string.Empty;
-                cachedMatch = _cachedMatchProxy;
+                cachedRuleRes = _cachedRuleResolution;
                 lastRulesTicks = _lastRulesFetchTicks;
             }
 
@@ -2117,18 +2170,28 @@ namespace TunGuard
                 {
                     isAutoMatch = true;
                     long nowTicks = DateTime.UtcNow.Ticks;
+                    int ttlMs = cachedRuleRes.HasTarget ? RULES_CACHE_TTL_MS : RULES_ERROR_CACHE_TTL_MS;
                     bool ttlExpired = (lastRulesTicks == 0) ||
-                                      ((nowTicks - lastRulesTicks) >= TimeSpan.FromMilliseconds(RULES_CACHE_TTL_MS).Ticks);
-                    if (forceRulesRefresh || ttlExpired || string.IsNullOrEmpty(cachedMatch))
+                                      ((nowTicks - lastRulesTicks) >= TimeSpan.FromMilliseconds(ttlMs).Ticks);
+                    if (forceRulesRefresh || ttlExpired || cachedRuleRes.Kind == AutoRuleResolutionKind.None)
                     {
-                        string fetchedMatch = RefreshMatchRuleKeepAlive(secret, nowTicks);
-                        if (!string.IsNullOrEmpty(fetchedMatch))
+                        AutoRuleResolution fetchedRes;
+                        if (TryRefreshAutoRuleKeepAlive(secret, nowTicks, out fetchedRes))
                         {
-                            cachedMatch = fetchedMatch;
+                            cachedRuleRes = fetchedRes;
                         }
                     }
 
-                    entryName = !string.IsNullOrEmpty(cachedMatch) ? cachedMatch : "PROXY";
+                    if (cachedRuleRes.IsFailure)
+                    {
+                        res.TargetGroup = cachedRuleRes.MatchRuleProxy ?? string.Empty;
+                        res.Reason = !string.IsNullOrEmpty(cachedRuleRes.ErrorReason)
+                            ? cachedRuleRes.ErrorReason
+                            : "无法自动识别黑名单模式代理组，请在设置中指定代理组";
+                        return res;
+                    }
+
+                    entryName = cachedRuleRes.HasTarget ? cachedRuleRes.TargetProxy : "PROXY";
                 }
 
                 // 3. Query entry group via GET /proxies/{escaped}
@@ -2143,15 +2206,26 @@ namespace TunGuard
                 // If auto MATCH target returned 404 (profile just switched), refresh /rules once and retry
                 if (entryStatus == 404 && isAutoMatch)
                 {
-                    string refreshedMatch = RefreshMatchRuleKeepAlive(secret, DateTime.UtcNow.Ticks);
-                    if (!string.IsNullOrEmpty(refreshedMatch) &&
-                        !string.Equals(refreshedMatch, entryName, StringComparison.Ordinal))
+                    AutoRuleResolution refreshedRes;
+                    if (TryRefreshAutoRuleKeepAlive(secret, DateTime.UtcNow.Ticks, out refreshedRes))
                     {
-                        entryName = refreshedMatch;
-                        if (!TryKeepAliveGet("/proxies/" + Uri.EscapeDataString(entryName), secret, out entryStatus, out entryBody))
+                        if (refreshedRes.IsFailure)
                         {
-                            res.Reason = "无法读取 Clash 代理组状态";
+                            res.TargetGroup = refreshedRes.MatchRuleProxy ?? string.Empty;
+                            res.Reason = !string.IsNullOrEmpty(refreshedRes.ErrorReason)
+                                ? refreshedRes.ErrorReason
+                                : "无法自动识别黑名单模式代理组，请在设置中指定代理组";
                             return res;
+                        }
+                        if (refreshedRes.HasTarget &&
+                            !string.Equals(refreshedRes.TargetProxy, entryName, StringComparison.Ordinal))
+                        {
+                            entryName = refreshedRes.TargetProxy;
+                            if (!TryKeepAliveGet("/proxies/" + Uri.EscapeDataString(entryName), secret, out entryStatus, out entryBody))
+                            {
+                                res.Reason = "无法读取 Clash 代理组状态";
+                                return res;
+                            }
                         }
                     }
                 }
@@ -2236,24 +2310,22 @@ namespace TunGuard
             }
         }
 
-        private string RefreshMatchRuleKeepAlive(string secret, long nowTicks)
+        private bool TryRefreshAutoRuleKeepAlive(string secret, long nowTicks, out AutoRuleResolution resolution)
         {
+            resolution = default(AutoRuleResolution);
             int statusCode;
             string rulesBody;
             if (!TryKeepAliveGet("/rules", secret, out statusCode, out rulesBody) || statusCode < 200 || statusCode >= 300)
             {
-                return string.Empty;
+                return false;
             }
-            string matchProxy = ExtractMatchRuleProxy(rulesBody);
-            if (!string.IsNullOrEmpty(matchProxy))
+            resolution = ResolveAutoRuleGroup(rulesBody);
+            lock (_lock)
             {
-                lock (_lock)
-                {
-                    _cachedMatchProxy = matchProxy;
-                    _lastRulesFetchTicks = nowTicks;
-                }
+                _cachedRuleResolution = resolution;
+                _lastRulesFetchTicks = nowTicks;
             }
-            return matchProxy;
+            return true;
         }
 
         private bool TryKeepAliveGet(string path, string secret, out int statusCode, out string body)
@@ -3177,13 +3249,13 @@ namespace TunGuard
         {
             ClashSnapshot snap = new ClashSnapshot();
             string secret;
-            string cachedMatch;
+            AutoRuleResolution cachedRuleRes;
             long lastRulesTicks;
 
             lock (_lock)
             {
                 secret = _secret ?? string.Empty;
-                cachedMatch = _cachedMatchProxy;
+                cachedRuleRes = _cachedRuleResolution;
                 lastRulesTicks = _lastRulesFetchTicks;
             }
 
@@ -3230,33 +3302,33 @@ namespace TunGuard
                 !string.Equals(snap.Mode, "direct", StringComparison.OrdinalIgnoreCase))
             {
                 long nowTicks = DateTime.UtcNow.Ticks;
+                int ttlMs = cachedRuleRes.HasTarget ? RULES_CACHE_TTL_MS : RULES_ERROR_CACHE_TTL_MS;
                 bool ttlExpired = (lastRulesTicks == 0) ||
-                                  ((nowTicks - lastRulesTicks) >= TimeSpan.FromMilliseconds(RULES_CACHE_TTL_MS).Ticks);
-                bool cachedMissing = !string.IsNullOrEmpty(cachedMatch) && !proxies.ContainsKey(cachedMatch);
+                                  ((nowTicks - lastRulesTicks) >= TimeSpan.FromMilliseconds(ttlMs).Ticks);
+                ClashProxyEntry unusedEntry;
+                bool cachedMissing = cachedRuleRes.HasTarget && !snap.TryGetProxy(cachedRuleRes.TargetProxy, out unusedEntry);
 
-                if (forceRulesRefresh || ttlExpired || string.IsNullOrEmpty(cachedMatch) || cachedMissing)
+                if (forceRulesRefresh || ttlExpired || cachedRuleRes.Kind == AutoRuleResolutionKind.None || cachedMissing)
                 {
                     string rulesBody;
                     if (TryGetJsonOnEndpoint(ep, "/rules", secret, out rulesBody))
                     {
-                        string matchProxy = ExtractMatchRuleProxy(rulesBody);
-                        if (!string.IsNullOrEmpty(matchProxy))
+                        cachedRuleRes = ResolveAutoRuleGroup(rulesBody);
+                        lock (_lock)
                         {
-                            cachedMatch = matchProxy;
-                            lock (_lock)
-                            {
-                                _cachedMatchProxy = matchProxy;
-                                _lastRulesFetchTicks = nowTicks;
-                            }
+                            _cachedRuleResolution = cachedRuleRes;
+                            _lastRulesFetchTicks = nowTicks;
                         }
                     }
                 }
 
-                snap.MatchRuleProxy = cachedMatch ?? string.Empty;
+                snap.AutoRuleResolution = cachedRuleRes;
+                snap.MatchRuleProxy = cachedRuleRes.HasTarget ? cachedRuleRes.TargetProxy : string.Empty;
             }
             else
             {
-                snap.MatchRuleProxy = cachedMatch ?? string.Empty;
+                snap.AutoRuleResolution = cachedRuleRes;
+                snap.MatchRuleProxy = cachedRuleRes.HasTarget ? cachedRuleRes.TargetProxy : string.Empty;
             }
 
             return snap;
@@ -3910,60 +3982,396 @@ namespace TunGuard
 
         public static string ExtractMatchRuleProxy(string rulesJson)
         {
+            AutoRuleResolution resolved = ResolveAutoRuleGroup(rulesJson);
+            return resolved.HasTarget ? resolved.TargetProxy : string.Empty;
+        }
+
+        public static AutoRuleResolution ResolveAutoRuleGroup(string rulesJson)
+        {
+            AutoRuleResolution none = default(AutoRuleResolution);
             if (string.IsNullOrWhiteSpace(rulesJson))
             {
-                return string.Empty;
+                return none;
             }
 
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
-                int searchFrom = rulesJson.Length - 1;
-                while (searchFrom >= 0)
+                // Fast path: find the first active Match rule (Clash/Mihomo evaluates rules top-down)
+                string firstMatchProxy = null;
+                int searchFrom = 0;
+                while (searchFrom < rulesJson.Length)
                 {
-                    int matchIdx = rulesJson.LastIndexOf("\"Match\"", searchFrom, StringComparison.OrdinalIgnoreCase);
+                    int matchIdx = rulesJson.IndexOf("\"Match\"", searchFrom, StringComparison.OrdinalIgnoreCase);
                     if (matchIdx < 0)
                     {
                         break;
+                    }
+                    if (IsEscapedQuote(rulesJson, matchIdx))
+                    {
+                        searchFrom = matchIdx + 1;
+                        continue;
                     }
 
                     string objJson = ExtractEnclosingJsonObject(rulesJson, matchIdx, 8192);
                     if (!string.IsNullOrEmpty(objJson))
                     {
-                        try
+                        int objPos = 0;
+                        string ruleType;
+                        string ruleProxy;
+                        bool ruleDisabled;
+                        if (TryReadRuleObject(objJson, ref objPos, out ruleType, out ruleProxy, out ruleDisabled) &&
+                            !ruleDisabled &&
+                            string.Equals(ruleType, "Match", StringComparison.OrdinalIgnoreCase) &&
+                            !string.IsNullOrWhiteSpace(ruleProxy))
                         {
-                            Dictionary<string, object> ruleObj = serializer.DeserializeObject(objJson) as Dictionary<string, object>;
-                            if (ruleObj != null)
-                            {
-                                object typeObj;
-                                object proxyObj;
-                                if (ruleObj.TryGetValue("type", out typeObj) &&
-                                    typeObj != null &&
-                                    string.Equals(typeObj.ToString(), "Match", StringComparison.OrdinalIgnoreCase) &&
-                                    ruleObj.TryGetValue("proxy", out proxyObj) &&
-                                    proxyObj != null)
-                                {
-                                    string proxy = proxyObj.ToString().Trim();
-                                    if (!string.IsNullOrEmpty(proxy))
-                                    {
-                                        return proxy;
-                                    }
-                                }
-                            }
-                        }
-                        catch
-                        {
+                            firstMatchProxy = ruleProxy.Trim();
+                            break;
                         }
                     }
 
-                    searchFrom = matchIdx - 1;
+                    searchFrom = matchIdx + 7;
                 }
+
+                if (string.IsNullOrEmpty(firstMatchProxy))
+                {
+                    return none;
+                }
+
+                // Standard whitelist mode: MATCH directly points to a proxy group or proxy node
+                if (!NodeGuardEvaluator.IsBuiltinNode(firstMatchProxy))
+                {
+                    return new AutoRuleResolution
+                    {
+                        Kind = AutoRuleResolutionKind.MatchProxy,
+                        TargetProxy = firstMatchProxy,
+                        MatchRuleProxy = firstMatchProxy,
+                        ErrorReason = string.Empty
+                    };
+                }
+
+                // Blacklist mode (e.g. MATCH,DIRECT): inspect active rules preceding MATCH for non-builtin targets
+                List<string> distinctProxies = CollectDistinctNonBuiltinRuleProxiesBeforeMatch(rulesJson, 4);
+                if (distinctProxies.Count == 1)
+                {
+                    return new AutoRuleResolution
+                    {
+                        Kind = AutoRuleResolutionKind.InferredUnique,
+                        TargetProxy = distinctProxies[0],
+                        MatchRuleProxy = firstMatchProxy,
+                        ErrorReason = string.Empty
+                    };
+                }
+
+                if (distinctProxies.Count > 1)
+                {
+                    int showCount = Math.Min(distinctProxies.Count, 3);
+                    string[] shown = new string[showCount];
+                    for (int i = 0; i < showCount; i++)
+                    {
+                        shown[i] = distinctProxies[i];
+                    }
+                    string sample = string.Join("、", shown) + (distinctProxies.Count > showCount ? " 等" : string.Empty);
+                    return new AutoRuleResolution
+                    {
+                        Kind = AutoRuleResolutionKind.Ambiguous,
+                        TargetProxy = string.Empty,
+                        MatchRuleProxy = firstMatchProxy,
+                        ErrorReason = string.Format("黑名单分流 (MATCH={0}) 存在多个代理组 ({1})，请在设置中指定监控代理组", firstMatchProxy, sample)
+                    };
+                }
+
+                return new AutoRuleResolution
+                {
+                    Kind = AutoRuleResolutionKind.NoProxyRule,
+                    TargetProxy = string.Empty,
+                    MatchRuleProxy = firstMatchProxy,
+                    ErrorReason = string.Format("黑名单分流 (MATCH={0}) 未找到指向代理组的规则，请在设置中指定监控代理组", firstMatchProxy)
+                };
             }
             catch
             {
+                return none;
+            }
+        }
+
+        private static List<string> CollectDistinctNonBuiltinRuleProxiesBeforeMatch(string json, int maxDistinct)
+        {
+            List<string> distinct = new List<string>(maxDistinct);
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            int pos = 0;
+            int len = json.Length;
+            SkipJsonWs(json, ref pos);
+            if (pos >= len || json[pos] != '{')
+            {
+                return distinct;
+            }
+            pos++;
+
+            bool foundRulesArray = false;
+            while (pos < len)
+            {
+                SkipJsonWs(json, ref pos);
+                if (pos >= len || json[pos] == '}')
+                {
+                    break;
+                }
+                if (json[pos] == ',')
+                {
+                    pos++;
+                    continue;
+                }
+
+                string key;
+                if (!ReadJsonString(json, ref pos, out key))
+                {
+                    return distinct;
+                }
+                SkipJsonWs(json, ref pos);
+                if (pos >= len || json[pos] != ':')
+                {
+                    return distinct;
+                }
+                pos++;
+                SkipJsonWs(json, ref pos);
+
+                if (string.Equals(key, "rules", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (pos < len && json[pos] == '[')
+                    {
+                        pos++;
+                        foundRulesArray = true;
+                    }
+                    break;
+                }
+
+                if (!SkipJsonValue(json, ref pos))
+                {
+                    return distinct;
+                }
             }
 
-            return string.Empty;
+            if (!foundRulesArray)
+            {
+                return distinct;
+            }
+
+            while (pos < len)
+            {
+                SkipJsonWs(json, ref pos);
+                if (pos >= len || json[pos] == ']')
+                {
+                    break;
+                }
+                if (json[pos] == ',')
+                {
+                    pos++;
+                    continue;
+                }
+                if (json[pos] != '{')
+                {
+                    if (!SkipJsonValue(json, ref pos))
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                string ruleType;
+                string ruleProxy;
+                bool ruleDisabled;
+                if (!TryReadRuleObject(json, ref pos, out ruleType, out ruleProxy, out ruleDisabled))
+                {
+                    break;
+                }
+
+                if (ruleDisabled)
+                {
+                    continue;
+                }
+
+                if (string.Equals(ruleType, "Match", StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                if (!string.IsNullOrWhiteSpace(ruleProxy))
+                {
+                    string p = ruleProxy.Trim();
+                    if (!NodeGuardEvaluator.IsBuiltinNode(p) && seen.Add(p))
+                    {
+                        distinct.Add(p);
+                        if (distinct.Count >= maxDistinct)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return distinct;
+        }
+
+        private static bool TryReadRuleObject(
+            string json,
+            ref int pos,
+            out string ruleType,
+            out string ruleProxy,
+            out bool disabled)
+        {
+            ruleType = null;
+            ruleProxy = null;
+            disabled = false;
+
+            int len = json.Length;
+            SkipJsonWs(json, ref pos);
+            if (pos >= len || json[pos] != '{')
+            {
+                return false;
+            }
+            pos++;
+
+            while (pos < len)
+            {
+                SkipJsonWs(json, ref pos);
+                if (pos >= len)
+                {
+                    return false;
+                }
+                if (json[pos] == '}')
+                {
+                    pos++;
+                    return true;
+                }
+                if (json[pos] == ',')
+                {
+                    pos++;
+                    continue;
+                }
+
+                string key;
+                if (!ReadJsonString(json, ref pos, out key))
+                {
+                    return false;
+                }
+                SkipJsonWs(json, ref pos);
+                if (pos >= len || json[pos] != ':')
+                {
+                    return false;
+                }
+                pos++;
+                SkipJsonWs(json, ref pos);
+                if (pos >= len)
+                {
+                    return false;
+                }
+
+                if (string.Equals(key, "type", StringComparison.OrdinalIgnoreCase) && json[pos] == '"')
+                {
+                    if (!ReadJsonString(json, ref pos, out ruleType))
+                    {
+                        return false;
+                    }
+                }
+                else if (string.Equals(key, "proxy", StringComparison.OrdinalIgnoreCase) && json[pos] == '"')
+                {
+                    if (!ReadJsonString(json, ref pos, out ruleProxy))
+                    {
+                        return false;
+                    }
+                }
+                else if (string.Equals(key, "extra", StringComparison.OrdinalIgnoreCase) && json[pos] == '{')
+                {
+                    bool extraDisabled;
+                    if (!TryReadExtraDisabled(json, ref pos, out extraDisabled))
+                    {
+                        return false;
+                    }
+                    if (extraDisabled)
+                    {
+                        disabled = true;
+                    }
+                }
+                else
+                {
+                    if (!SkipJsonValue(json, ref pos))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryReadExtraDisabled(string json, ref int pos, out bool disabled)
+        {
+            disabled = false;
+            int len = json.Length;
+            if (pos >= len || json[pos] != '{')
+            {
+                return false;
+            }
+            pos++;
+
+            while (pos < len)
+            {
+                SkipJsonWs(json, ref pos);
+                if (pos >= len)
+                {
+                    return false;
+                }
+                if (json[pos] == '}')
+                {
+                    pos++;
+                    return true;
+                }
+                if (json[pos] == ',')
+                {
+                    pos++;
+                    continue;
+                }
+
+                string key;
+                if (!ReadJsonString(json, ref pos, out key))
+                {
+                    return false;
+                }
+                SkipJsonWs(json, ref pos);
+                if (pos >= len || json[pos] != ':')
+                {
+                    return false;
+                }
+                pos++;
+                SkipJsonWs(json, ref pos);
+                if (pos >= len)
+                {
+                    return false;
+                }
+
+                if (string.Equals(key, "disabled", StringComparison.OrdinalIgnoreCase))
+                {
+                    int valStart = pos;
+                    if (!SkipJsonValue(json, ref pos))
+                    {
+                        return false;
+                    }
+                    if (pos - valStart == 4 &&
+                        string.Compare(json, valStart, "true", 0, 4, StringComparison.OrdinalIgnoreCase) == 0)
+                    {
+                        disabled = true;
+                    }
+                }
+                else
+                {
+                    if (!SkipJsonValue(json, ref pos))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private static string ExtractEnclosingJsonObject(string json, int pos, int maxLen)
@@ -15553,7 +15961,7 @@ namespace TunGuard
 
             Label lblGroupHint = new Label
             {
-                Text = "默认自动跟踪：Rule 模式看 MATCH 主组，Global 模式看 GLOBAL，Direct 模式直接拦截。",
+                Text = "默认自动跟踪：Rule 看 MATCH 主组（MATCH=DIRECT 黑名单模式自动跟踪唯一代理组），Global 看 GLOBAL，Direct 直接拦截。",
                 AutoSize = true,
                 ForeColor = Color.FromArgb(100, 116, 139),
                 Margin = new Padding(0, 2, 0, 0)
