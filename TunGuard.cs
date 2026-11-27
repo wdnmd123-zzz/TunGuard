@@ -258,6 +258,7 @@ namespace TunGuard
         public bool WfpBlockNonTunDns { get; set; }
         public bool PopupOnBlock { get; set; }
         public string LogDirectory { get; set; }
+        public string ThemeMode { get; set; }
         public Dictionary<string, List<string>> CustomAppPaths { get; set; }
         public Dictionary<string, List<string>> DiscoveredAppPaths { get; set; }
 
@@ -275,6 +276,7 @@ namespace TunGuard
             WfpBlockNonTunDns = false;
             PopupOnBlock = true;
             LogDirectory = string.Empty;
+            ThemeMode = IosTheme.ThemeModeSystem;
             CustomAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             DiscoveredAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         }
@@ -321,6 +323,7 @@ namespace TunGuard
             copy.WfpBlockNonTunDns = WfpBlockNonTunDns;
             copy.PopupOnBlock = PopupOnBlock;
             copy.LogDirectory = LogDirectory != null ? LogDirectory.Trim() : string.Empty;
+            copy.ThemeMode = IosTheme.NormalizeThemeMode(ThemeMode);
 
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (AllowedNodes != null)
@@ -627,6 +630,10 @@ namespace TunGuard
             {
                 cfg.LogDirectory = val.ToString();
             }
+            if (TryGetIgnoreCase(obj, "themeMode", out val) && val != null)
+            {
+                cfg.ThemeMode = val.ToString();
+            }
 
             ReadAppPathMapFromObject(obj, "customAppPaths", cfg.CustomAppPaths);
             ReadAppPathMapFromObject(obj, "discoveredAppPaths", cfg.DiscoveredAppPaths);
@@ -721,7 +728,8 @@ namespace TunGuard
             sb.Append("  \"wfpKillOnBlock\": ").Append(cfg.WfpKillOnBlock ? "true" : "false").AppendLine(",");
             sb.Append("  \"wfpBlockNonTunDns\": ").Append(cfg.WfpBlockNonTunDns ? "true" : "false").AppendLine(",");
             sb.Append("  \"popupOnBlock\": ").Append(cfg.PopupOnBlock ? "true" : "false").AppendLine(",");
-            sb.Append("  \"logDirectory\": ").Append(EscapeJsonString(cfg.LogDirectory));
+            sb.Append("  \"logDirectory\": ").Append(EscapeJsonString(cfg.LogDirectory)).AppendLine(",");
+            sb.Append("  \"themeMode\": ").Append(EscapeJsonString(cfg.ThemeMode));
 
             bool hasCustom = cfg.CustomAppPaths != null && cfg.CustomAppPaths.Count > 0;
             bool hasDiscovered = cfg.DiscoveredAppPaths != null && cfg.DiscoveredAppPaths.Count > 0;
@@ -9776,6 +9784,29 @@ namespace TunGuard
             SignalWake("守护配置更新", false, false, false, false, true, true, true, true);
         }
 
+        public bool UpdateThemeMode(string themeMode, out string error)
+        {
+            error = null;
+            string normalizedMode = IosTheme.NormalizeThemeMode(themeMode);
+            NodeGuardConfig current = _nodeConfig ?? new NodeGuardConfig();
+            NodeGuardConfig next = current.CloneNormalized();
+            next.ThemeMode = normalizedMode;
+            try
+            {
+                NodeGuardConfigStore.Save(_nodeConfigPath, next);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                AppLogger.Error("CONFIG", "保存外观主题设置失败: " + ex.Message);
+                return false;
+            }
+            _nodeConfig = next;
+            RefreshNodeConfigStatAfterSave();
+            AppLogger.Info("CONFIG", "外观主题已切换为: " + IosTheme.FormatThemeModeLabel(normalizedMode));
+            return true;
+        }
+
         public AppPathDiagnostics GetAppPathDiagnostics(bool rescanNow)
         {
             bool discoveredAnyNew = false;
@@ -10676,12 +10707,13 @@ namespace TunGuard
                 ? (cfg.WfpKillOnBlock ? "WFP+终止进程" : "仅WFP断网")
                 : "仅终止进程";
             return string.Format(
-                "受控应用=[{0}], {1}, 策略={2}, DNS53={3}, 弹窗={4}",
+                "受控应用=[{0}], {1}, 策略={2}, DNS53={3}, 弹窗={4}, 主题={5}",
                 GuardedAppHelper.FormatShortNames(cfg.GetGuardedAppFlags()),
                 cfg.GetSummaryText(),
                 modeDesc,
                 cfg.WfpBlockNonTunDns ? "开" : "关",
-                cfg.PopupOnBlock ? "开" : "关");
+                cfg.PopupOnBlock ? "开" : "关",
+                IosTheme.FormatThemeModeLabel(cfg.ThemeMode));
         }
 
         private void LogStatusTransitions(TunStatus prev, TunStatus next, bool isInitial, string triggerSource)
@@ -12292,7 +12324,7 @@ namespace TunGuard
             float iy = (Height - iconSize) * 0.5f;
             Color iconColor = (_hovered || _pressed)
                 ? IosTheme.TextPrimary
-                : Color.FromArgb(60, 60, 67);
+                : IosTheme.TextHover;
             TrayIconFactory.DrawGitHubMark(g, ix, iy, iconSize, iconColor);
         }
     }
@@ -13485,69 +13517,390 @@ namespace TunGuard
 
     internal static class IosTheme
     {
-        public static readonly Color CanvasBg = Color.FromArgb(242, 242, 247);
-        public static readonly Color CardBg = Color.FromArgb(255, 255, 255);
-        public static readonly Color CardInsetBg = Color.FromArgb(247, 247, 250);
-        public static readonly Color CardBorder = Color.FromArgb(229, 229, 234);
-        public static readonly Color CardShadowEdge = Color.FromArgb(218, 218, 226);
-        public static readonly Color Separator = Color.FromArgb(232, 232, 238);
-        public static readonly Color SubtleSeparator = Color.FromArgb(242, 242, 247);
+        public const string ThemeModeSystem = "system";
+        public const string ThemeModeLight = "light";
+        public const string ThemeModeDark = "dark";
 
-        public static readonly Color InputBg = Color.FromArgb(242, 242, 247);
-        public static readonly Color InputWhiteBg = Color.FromArgb(255, 255, 255);
-        public static readonly Color InputBorder = Color.FromArgb(214, 214, 222);
+        public static Color CanvasBg;
+        public static Color CardBg;
+        public static Color CardInsetBg;
+        public static Color CardBorder;
+        public static Color CardShadowEdge;
+        public static Color Separator;
+        public static Color SubtleSeparator;
 
-        public static readonly Color SecondaryFill = Color.FromArgb(235, 235, 241);
-        public static readonly Color SecondaryHover = Color.FromArgb(224, 224, 232);
-        public static readonly Color SecondaryPress = Color.FromArgb(210, 210, 220);
+        public static Color InputBg;
+        public static Color InputWhiteBg;
+        public static Color InputBorder;
+        public static Color InputBorderHover;
+        public static Color InputSoftBorder;
 
-        public static readonly Color TextPrimary = Color.FromArgb(28, 28, 30);
-        public static readonly Color TextSecondary = Color.FromArgb(108, 108, 112);
-        public static readonly Color TextTertiary = Color.FromArgb(142, 142, 147);
-        public static readonly Color TextDisabled = Color.FromArgb(174, 174, 178);
+        public static Color ListBg;
+        public static Color ListHoverBg;
 
-        public static readonly Color Blue = Color.FromArgb(0, 122, 255);
-        public static readonly Color BlueHover = Color.FromArgb(0, 102, 220);
-        public static readonly Color BluePress = Color.FromArgb(0, 82, 184);
-        public static readonly Color BlueSoft = Color.FromArgb(232, 242, 255);
-        public static readonly Color BlueSoftHover = Color.FromArgb(216, 233, 255);
-        public static readonly Color BlueSoftPress = Color.FromArgb(196, 222, 255);
+        public static Color SecondaryFill;
+        public static Color SecondaryHover;
+        public static Color SecondaryPress;
+        public static Color SecondaryBorder;
+        public static Color DisabledFill;
 
-        public static readonly Color Green = Color.FromArgb(52, 199, 89);
-        public static readonly Color GreenHover = Color.FromArgb(40, 179, 75);
-        public static readonly Color GreenPress = Color.FromArgb(30, 154, 62);
-        public static readonly Color GreenText = Color.FromArgb(26, 132, 62);
-        public static readonly Color GreenSoft = Color.FromArgb(234, 249, 238);
-        public static readonly Color GreenSoftBorder = Color.FromArgb(194, 236, 206);
+        public static Color SegmentedThumb;
+        public static Color SegmentedThumbBorder;
+        public static Color SegmentedThumbShadow;
+        public static Color SegmentedDivider;
 
-        public static readonly Color Red = Color.FromArgb(255, 59, 48);
-        public static readonly Color RedHover = Color.FromArgb(230, 46, 36);
-        public static readonly Color RedPress = Color.FromArgb(204, 34, 26);
-        public static readonly Color RedText = Color.FromArgb(215, 0, 21);
-        public static readonly Color RedSoft = Color.FromArgb(255, 236, 235);
-        public static readonly Color RedSoftHover = Color.FromArgb(255, 220, 218);
-        public static readonly Color RedSoftPress = Color.FromArgb(255, 204, 201);
-        public static readonly Color RedSoftBorder = Color.FromArgb(255, 204, 200);
+        public static Color TextPrimary;
+        public static Color TextHover;
+        public static Color TextSecondary;
+        public static Color TextTertiary;
+        public static Color TextDisabled;
 
-        public static readonly Color Orange = Color.FromArgb(255, 149, 0);
-        public static readonly Color OrangeHover = Color.FromArgb(230, 132, 0);
-        public static readonly Color OrangePress = Color.FromArgb(204, 114, 0);
-        public static readonly Color OrangeText = Color.FromArgb(178, 80, 0);
-        public static readonly Color OrangeSoft = Color.FromArgb(255, 244, 229);
-        public static readonly Color OrangeSoftBorder = Color.FromArgb(255, 218, 173);
+        public static Color Blue;
+        public static Color BlueHover;
+        public static Color BluePress;
+        public static Color BlueText;
+        public static Color BlueSoft;
+        public static Color BlueSoftHover;
+        public static Color BlueSoftPress;
+        public static Color BlueSoftBorder;
 
-        public static readonly Color PurpleText = Color.FromArgb(137, 68, 171);
-        public static readonly Color PurpleSoft = Color.FromArgb(245, 236, 252);
+        public static Color Green;
+        public static Color GreenHover;
+        public static Color GreenPress;
+        public static Color GreenText;
+        public static Color GreenSoft;
+        public static Color GreenSoftBorder;
 
-        public static readonly Color SwitchOff = Color.FromArgb(209, 209, 214);
-        public static readonly Color SwitchOffDisabled = Color.FromArgb(229, 229, 234);
+        public static Color Red;
+        public static Color RedHover;
+        public static Color RedPress;
+        public static Color RedText;
+        public static Color RedSoft;
+        public static Color RedSoftHover;
+        public static Color RedSoftPress;
+        public static Color RedSoftBorder;
 
-        public static readonly Color ConsoleBg = Color.FromArgb(28, 28, 30);
-        public static readonly Color ConsoleBorder = Color.FromArgb(52, 52, 56);
-        public static readonly Color ConsoleInfo = Color.FromArgb(229, 229, 234);
-        public static readonly Color ConsoleWarn = Color.FromArgb(255, 214, 10);
-        public static readonly Color ConsoleError = Color.FromArgb(255, 69, 58);
+        public static Color Orange;
+        public static Color OrangeHover;
+        public static Color OrangePress;
+        public static Color OrangeText;
+        public static Color OrangeSoft;
+        public static Color OrangeSoftBorder;
 
+        public static Color PurpleText;
+        public static Color PurpleSoft;
+
+        public static Color SwitchOff;
+        public static Color SwitchOffHover;
+        public static Color SwitchOffDisabled;
+        public static Color SwitchKnobDisabled;
+
+        public static Color BannerNeutralBg;
+        public static Color BannerNeutralBorder;
+
+        public static Color MenuBg;
+        public static Color MenuBorder;
+
+        public static Color AlertBorder;
+
+        public static Color ConsoleBg;
+        public static Color ConsoleBorder;
+        public static Color ConsoleInfo;
+        public static Color ConsoleWarn;
+        public static Color ConsoleError;
+
+        private static string _configuredMode = ThemeModeSystem;
+        private static bool _isDark;
+
+        public static event EventHandler ThemeChanged;
+
+        public static string ConfiguredMode
+        {
+            get { return _configuredMode; }
+        }
+
+        public static bool IsDark
+        {
+            get { return _isDark; }
+        }
+
+        static IosTheme()
+        {
+            ApplyPalette(false);
+        }
+
+        public static string NormalizeThemeMode(string mode)
+        {
+            if (string.Equals(mode, ThemeModeDark, StringComparison.OrdinalIgnoreCase))
+            {
+                return ThemeModeDark;
+            }
+            if (string.Equals(mode, ThemeModeLight, StringComparison.OrdinalIgnoreCase))
+            {
+                return ThemeModeLight;
+            }
+            return ThemeModeSystem;
+        }
+
+        public static string FormatThemeModeLabel(string mode)
+        {
+            string norm = NormalizeThemeMode(mode);
+            if (norm == ThemeModeDark) return "深色";
+            if (norm == ThemeModeLight) return "浅色";
+            return "跟随系统";
+        }
+
+        public static bool DetectWindowsDarkMode()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue("AppsUseLightTheme");
+                        if (val is int)
+                        {
+                            return ((int)val) == 0;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        public static bool SetThemeMode(string mode)
+        {
+            string norm = NormalizeThemeMode(mode);
+            bool nextDark = norm == ThemeModeDark
+                ? true
+                : (norm == ThemeModeLight ? false : DetectWindowsDarkMode());
+            _configuredMode = norm;
+            if (nextDark == _isDark)
+            {
+                return false;
+            }
+            ApplyPalette(nextDark);
+            RaiseThemeChanged();
+            return true;
+        }
+
+        public static bool RefreshSystemTheme()
+        {
+            if (_configuredMode != ThemeModeSystem)
+            {
+                return false;
+            }
+            bool nextDark = DetectWindowsDarkMode();
+            if (nextDark == _isDark)
+            {
+                return false;
+            }
+            ApplyPalette(nextDark);
+            RaiseThemeChanged();
+            return true;
+        }
+
+        private static void RaiseThemeChanged()
+        {
+            EventHandler handler = ThemeChanged;
+            if (handler != null)
+            {
+                handler(null, EventArgs.Empty);
+            }
+        }
+
+        private static void ApplyPalette(bool dark)
+        {
+            _isDark = dark;
+            if (!dark)
+            {
+                CanvasBg = Color.FromArgb(242, 242, 247);
+                CardBg = Color.FromArgb(255, 255, 255);
+                CardInsetBg = Color.FromArgb(247, 247, 250);
+                CardBorder = Color.FromArgb(229, 229, 234);
+                CardShadowEdge = Color.FromArgb(218, 218, 226);
+                Separator = Color.FromArgb(232, 232, 238);
+                SubtleSeparator = Color.FromArgb(242, 242, 247);
+
+                InputBg = Color.FromArgb(242, 242, 247);
+                InputWhiteBg = Color.FromArgb(255, 255, 255);
+                InputBorder = Color.FromArgb(214, 214, 222);
+                InputBorderHover = Color.FromArgb(196, 196, 206);
+                InputSoftBorder = Color.FromArgb(228, 228, 234);
+
+                ListBg = Color.FromArgb(255, 255, 255);
+                ListHoverBg = Color.FromArgb(245, 245, 249);
+
+                SecondaryFill = Color.FromArgb(235, 235, 241);
+                SecondaryHover = Color.FromArgb(224, 224, 232);
+                SecondaryPress = Color.FromArgb(210, 210, 220);
+                SecondaryBorder = Color.FromArgb(223, 223, 231);
+                DisabledFill = Color.FromArgb(238, 238, 243);
+
+                SegmentedThumb = Color.FromArgb(255, 255, 255);
+                SegmentedThumbBorder = Color.FromArgb(224, 224, 232);
+                SegmentedThumbShadow = Color.FromArgb(24, 0, 0, 0);
+                SegmentedDivider = Color.FromArgb(209, 209, 218);
+
+                TextPrimary = Color.FromArgb(28, 28, 30);
+                TextHover = Color.FromArgb(60, 60, 67);
+                TextSecondary = Color.FromArgb(108, 108, 112);
+                TextTertiary = Color.FromArgb(142, 142, 147);
+                TextDisabled = Color.FromArgb(174, 174, 178);
+
+                Blue = Color.FromArgb(0, 122, 255);
+                BlueHover = Color.FromArgb(0, 102, 220);
+                BluePress = Color.FromArgb(0, 82, 184);
+                BlueText = Color.FromArgb(0, 96, 210);
+                BlueSoft = Color.FromArgb(232, 242, 255);
+                BlueSoftHover = Color.FromArgb(216, 233, 255);
+                BlueSoftPress = Color.FromArgb(196, 222, 255);
+                BlueSoftBorder = Color.FromArgb(168, 208, 255);
+
+                Green = Color.FromArgb(52, 199, 89);
+                GreenHover = Color.FromArgb(40, 179, 75);
+                GreenPress = Color.FromArgb(30, 154, 62);
+                GreenText = Color.FromArgb(26, 132, 62);
+                GreenSoft = Color.FromArgb(234, 249, 238);
+                GreenSoftBorder = Color.FromArgb(194, 236, 206);
+
+                Red = Color.FromArgb(255, 59, 48);
+                RedHover = Color.FromArgb(230, 46, 36);
+                RedPress = Color.FromArgb(204, 34, 26);
+                RedText = Color.FromArgb(215, 0, 21);
+                RedSoft = Color.FromArgb(255, 236, 235);
+                RedSoftHover = Color.FromArgb(255, 220, 218);
+                RedSoftPress = Color.FromArgb(255, 204, 201);
+                RedSoftBorder = Color.FromArgb(255, 204, 200);
+
+                Orange = Color.FromArgb(255, 149, 0);
+                OrangeHover = Color.FromArgb(230, 132, 0);
+                OrangePress = Color.FromArgb(204, 114, 0);
+                OrangeText = Color.FromArgb(178, 80, 0);
+                OrangeSoft = Color.FromArgb(255, 244, 229);
+                OrangeSoftBorder = Color.FromArgb(255, 218, 173);
+
+                PurpleText = Color.FromArgb(137, 68, 171);
+                PurpleSoft = Color.FromArgb(245, 236, 252);
+
+                SwitchOff = Color.FromArgb(209, 209, 214);
+                SwitchOffHover = Color.FromArgb(196, 196, 204);
+                SwitchOffDisabled = Color.FromArgb(229, 229, 234);
+                SwitchKnobDisabled = Color.FromArgb(248, 248, 250);
+
+                BannerNeutralBg = Color.FromArgb(236, 236, 242);
+                BannerNeutralBorder = Color.FromArgb(224, 224, 232);
+
+                MenuBg = Color.FromArgb(255, 255, 255);
+                MenuBorder = Color.FromArgb(214, 214, 222);
+
+                AlertBorder = Color.FromArgb(208, 208, 218);
+
+                ConsoleBg = Color.FromArgb(28, 28, 30);
+                ConsoleBorder = Color.FromArgb(52, 52, 56);
+                ConsoleInfo = Color.FromArgb(229, 229, 234);
+                ConsoleWarn = Color.FromArgb(255, 214, 10);
+                ConsoleError = Color.FromArgb(255, 69, 58);
+            }
+            else
+            {
+                CanvasBg = Color.FromArgb(20, 20, 22);
+                CardBg = Color.FromArgb(30, 30, 34);
+                CardInsetBg = Color.FromArgb(38, 38, 42);
+                CardBorder = Color.FromArgb(52, 52, 58);
+                CardShadowEdge = Color.FromArgb(12, 12, 14);
+                Separator = Color.FromArgb(52, 52, 58);
+                SubtleSeparator = Color.FromArgb(40, 40, 46);
+
+                InputBg = Color.FromArgb(44, 44, 48);
+                InputWhiteBg = Color.FromArgb(24, 24, 28);
+                InputBorder = Color.FromArgb(66, 66, 74);
+                InputBorderHover = Color.FromArgb(88, 88, 98);
+                InputSoftBorder = Color.FromArgb(56, 56, 62);
+
+                ListBg = Color.FromArgb(24, 24, 28);
+                ListHoverBg = Color.FromArgb(38, 38, 45);
+
+                SecondaryFill = Color.FromArgb(46, 46, 52);
+                SecondaryHover = Color.FromArgb(58, 58, 66);
+                SecondaryPress = Color.FromArgb(68, 68, 76);
+                SecondaryBorder = Color.FromArgb(64, 64, 72);
+                DisabledFill = Color.FromArgb(45, 45, 52);
+
+                SegmentedThumb = Color.FromArgb(72, 72, 80);
+                SegmentedThumbBorder = Color.FromArgb(88, 88, 98);
+                SegmentedThumbShadow = Color.FromArgb(48, 0, 0, 0);
+                SegmentedDivider = Color.FromArgb(66, 66, 74);
+
+                TextPrimary = Color.FromArgb(242, 242, 247);
+                TextHover = Color.FromArgb(218, 218, 224);
+                TextSecondary = Color.FromArgb(174, 174, 178);
+                TextTertiary = Color.FromArgb(132, 132, 138);
+                TextDisabled = Color.FromArgb(116, 116, 124);
+
+                Blue = Color.FromArgb(10, 132, 255);
+                BlueHover = Color.FromArgb(40, 148, 255);
+                BluePress = Color.FromArgb(0, 108, 224);
+                BlueText = Color.FromArgb(94, 176, 255);
+                BlueSoft = Color.FromArgb(24, 46, 74);
+                BlueSoftHover = Color.FromArgb(30, 58, 94);
+                BlueSoftPress = Color.FromArgb(38, 72, 114);
+                BlueSoftBorder = Color.FromArgb(48, 96, 156);
+
+                Green = Color.FromArgb(48, 209, 88);
+                GreenHover = Color.FromArgb(68, 220, 104);
+                GreenPress = Color.FromArgb(36, 180, 72);
+                GreenText = Color.FromArgb(74, 222, 128);
+                GreenSoft = Color.FromArgb(22, 54, 34);
+                GreenSoftBorder = Color.FromArgb(42, 96, 60);
+
+                Red = Color.FromArgb(255, 69, 58);
+                RedHover = Color.FromArgb(255, 92, 82);
+                RedPress = Color.FromArgb(224, 52, 42);
+                RedText = Color.FromArgb(255, 112, 104);
+                RedSoft = Color.FromArgb(64, 26, 28);
+                RedSoftHover = Color.FromArgb(82, 32, 35);
+                RedSoftPress = Color.FromArgb(98, 38, 42);
+                RedSoftBorder = Color.FromArgb(124, 48, 52);
+
+                Orange = Color.FromArgb(255, 159, 10);
+                OrangeHover = Color.FromArgb(255, 176, 48);
+                OrangePress = Color.FromArgb(224, 134, 0);
+                OrangeText = Color.FromArgb(255, 184, 72);
+                OrangeSoft = Color.FromArgb(62, 44, 20);
+                OrangeSoftBorder = Color.FromArgb(118, 82, 34);
+
+                PurpleText = Color.FromArgb(202, 146, 244);
+                PurpleSoft = Color.FromArgb(52, 34, 68);
+
+                SwitchOff = Color.FromArgb(68, 68, 74);
+                SwitchOffHover = Color.FromArgb(82, 82, 90);
+                SwitchOffDisabled = Color.FromArgb(48, 48, 54);
+                SwitchKnobDisabled = Color.FromArgb(176, 176, 182);
+
+                BannerNeutralBg = Color.FromArgb(34, 34, 40);
+                BannerNeutralBorder = Color.FromArgb(56, 56, 64);
+
+                MenuBg = Color.FromArgb(36, 36, 40);
+                MenuBorder = Color.FromArgb(64, 64, 72);
+
+                AlertBorder = Color.FromArgb(68, 68, 76);
+
+                ConsoleBg = Color.FromArgb(15, 15, 17);
+                ConsoleBorder = Color.FromArgb(48, 48, 54);
+                ConsoleInfo = Color.FromArgb(229, 229, 234);
+                ConsoleWarn = Color.FromArgb(255, 214, 10);
+                ConsoleError = Color.FromArgb(255, 69, 58);
+            }
+        }
+
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19;
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
         private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
         private const int DWMWA_BORDER_COLOR = 34;
         private const int DWMWA_CAPTION_COLOR = 35;
@@ -13556,6 +13909,9 @@ namespace TunGuard
 
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
 
         [DllImport("gdi32.dll")]
         private static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int widthEllipse, int heightEllipse);
@@ -13568,6 +13924,21 @@ namespace TunGuard
             return new Font("Microsoft YaHei UI", sizePt, style);
         }
 
+        public static void ApplyDarkScrollBar(Control control)
+        {
+            if (control == null || control.IsDisposed || !control.IsHandleCreated)
+            {
+                return;
+            }
+            try
+            {
+                SetWindowTheme(control.Handle, _isDark ? "DarkMode_Explorer" : "Explorer", null);
+            }
+            catch
+            {
+            }
+        }
+
         public static bool ApplyWindowChrome(Form form, Color captionColor, bool roundCorners)
         {
             if (form == null || form.IsDisposed || !form.IsHandleCreated)
@@ -13577,6 +13948,11 @@ namespace TunGuard
             bool roundedByDwm = false;
             try
             {
+                int useDark = _isDark ? 1 : 0;
+                if (DwmSetWindowAttribute(form.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDark, 4) != 0)
+                {
+                    DwmSetWindowAttribute(form.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useDark, 4);
+                }
                 if (roundCorners)
                 {
                     int pref = DWMWCP_ROUND;
@@ -13873,6 +14249,24 @@ namespace TunGuard
         }
     }
 
+    internal sealed class IosScrollHostPanel : Panel
+    {
+        public IosScrollHostPanel()
+        {
+            DoubleBuffered = true;
+            AutoScroll = true;
+            BackColor = IosTheme.CanvasBg;
+            HandleCreated += (s, e) => IosTheme.ApplyDarkScrollBar(this);
+        }
+
+        public void ApplyTheme(Color backColor)
+        {
+            BackColor = backColor;
+            IosTheme.ApplyDarkScrollBar(this);
+            Invalidate();
+        }
+    }
+
     internal sealed class IosButton : Control, IButtonControl
     {
         private IosButtonStyle _buttonStyle = IosButtonStyle.Secondary;
@@ -14115,8 +14509,12 @@ namespace TunGuard
                 }
                 else
                 {
-                    bg = Color.FromArgb(238, 238, 243);
+                    bg = IosTheme.DisabledFill;
                     fg = IosTheme.TextDisabled;
+                    if (IosTheme.IsDark)
+                    {
+                        border = IosTheme.CardBorder;
+                    }
                 }
                 return;
             }
@@ -14150,7 +14548,7 @@ namespace TunGuard
                     break;
                 case IosButtonStyle.Tinted:
                     bg = _pressed ? IosTheme.BlueSoftPress : (_hovered ? IosTheme.BlueSoftHover : IosTheme.BlueSoft);
-                    fg = IosTheme.Blue;
+                    fg = IosTheme.IsDark ? IosTheme.BlueText : IosTheme.Blue;
                     break;
                 case IosButtonStyle.Ghost:
                     bg = _pressed ? IosTheme.SecondaryPress : (_hovered ? IosTheme.SecondaryFill : Color.Transparent);
@@ -14159,7 +14557,7 @@ namespace TunGuard
                 default: // Secondary
                     bg = _pressed ? IosTheme.SecondaryPress : (_hovered ? IosTheme.SecondaryHover : IosTheme.SecondaryFill);
                     fg = IosTheme.TextPrimary;
-                    border = Color.FromArgb(223, 223, 231);
+                    border = IosTheme.SecondaryBorder;
                     break;
             }
         }
@@ -14236,8 +14634,8 @@ namespace TunGuard
         private float _thumbProgress;
         private bool _hovered;
         private bool _compact;
-        private Color _onColor = IosTheme.Green;
-        private Color _textColor = IosTheme.TextPrimary;
+        private Color _onColor = Color.Empty;
+        private Color _textColor = Color.Empty;
         private bool _autoSize = true;
         private readonly System.Windows.Forms.Timer _animTimer;
 
@@ -14455,8 +14853,9 @@ namespace TunGuard
             float ty = (Height - th) * 0.5f;
             float tx = 1f;
 
-            Color offCol = Enabled ? (_hovered ? Color.FromArgb(196, 196, 204) : IosTheme.SwitchOff) : IosTheme.SwitchOffDisabled;
-            Color onCol = Enabled ? (_hovered ? IosTheme.Darken(_onColor, 0.06f) : _onColor) : IosTheme.Blend(_onColor, Color.White, 0.55f);
+            Color onBase = _onColor != Color.Empty ? _onColor : IosTheme.Green;
+            Color offCol = Enabled ? (_hovered ? IosTheme.SwitchOffHover : IosTheme.SwitchOff) : IosTheme.SwitchOffDisabled;
+            Color onCol = Enabled ? (_hovered ? IosTheme.Darken(onBase, 0.06f) : onBase) : IosTheme.Blend(onBase, IosTheme.CardBg, 0.55f);
             Color trackColor = IosTheme.Blend(offCol, onCol, _thumbProgress);
 
             using (GraphicsPath trackPath = IosTheme.CreateRoundedRectPath(tx, ty, tw, th, th * 0.5f))
@@ -14475,7 +14874,7 @@ namespace TunGuard
             {
                 g.FillEllipse(shadowBrush, knobX, knobY + 1.0f, knobD, knobD);
             }
-            using (SolidBrush knobBrush = new SolidBrush(Enabled ? Color.White : Color.FromArgb(248, 248, 250)))
+            using (SolidBrush knobBrush = new SolidBrush(Enabled ? Color.White : IosTheme.SwitchKnobDisabled))
             {
                 g.FillEllipse(knobBrush, knobX, knobY, knobD, knobD);
             }
@@ -14493,7 +14892,8 @@ namespace TunGuard
             if (txt.Length > 0)
             {
                 Rectangle textRect = new Rectangle(tw + 9, 0, Math.Max(0, Width - (tw + 9)), Height);
-                Color fg = Enabled ? _textColor : IosTheme.TextDisabled;
+                Color activeTextCol = _textColor != Color.Empty ? _textColor : IosTheme.TextPrimary;
+                Color fg = Enabled ? activeTextCol : IosTheme.TextDisabled;
                 TextRenderer.DrawText(
                     g,
                     txt,
@@ -14674,13 +15074,13 @@ namespace TunGuard
             if (_checked)
             {
                 bg = _pressed ? IosTheme.BlueSoftPress : (_hovered ? IosTheme.BlueSoftHover : IosTheme.BlueSoft);
-                border = Color.FromArgb(148, 198, 255);
-                fg = Color.FromArgb(0, 96, 210);
+                border = IosTheme.BlueSoftBorder;
+                fg = IosTheme.BlueText;
             }
             else
             {
                 bg = _pressed ? IosTheme.SecondaryPress : (_hovered ? IosTheme.SecondaryHover : IosTheme.InputBg);
-                border = Color.FromArgb(222, 222, 230);
+                border = IosTheme.InputBorder;
                 fg = IosTheme.TextSecondary;
             }
 
@@ -14718,7 +15118,7 @@ namespace TunGuard
             }
             else
             {
-                using (Pen ringPen = new Pen(Color.FromArgb(174, 174, 178), 1.3f))
+                using (Pen ringPen = new Pen(IosTheme.TextDisabled, 1.3f))
                 {
                     g.DrawEllipse(ringPen, ix + 0.5f, iy + 0.5f, iconD - 1f, iconD - 1f);
                 }
@@ -14956,7 +15356,7 @@ namespace TunGuard
             float segW = innerW / _segments.Length;
 
             // Subtle dividers between non-selected adjacent segments
-            using (Pen divPen = new Pen(Color.FromArgb(209, 209, 218), 1f))
+            using (Pen divPen = new Pen(IosTheme.SegmentedDivider, 1f))
             {
                 for (int i = 1; i < _segments.Length; i++)
                 {
@@ -14969,16 +15369,16 @@ namespace TunGuard
                 }
             }
 
-            // Sliding elevated white thumb
+            // Sliding elevated thumb
             float thumbX = inset + segW * _animIndex;
             using (GraphicsPath thumbShadow = IosTheme.CreateRoundedRectPath(thumbX, inset + 0.8f, segW, innerH, 6.5f))
-            using (SolidBrush sb = new SolidBrush(Color.FromArgb(24, 0, 0, 0)))
+            using (SolidBrush sb = new SolidBrush(IosTheme.SegmentedThumbShadow))
             {
                 g.FillPath(sb, thumbShadow);
             }
             using (GraphicsPath thumbPath = IosTheme.CreateRoundedRectPath(thumbX, inset, segW, innerH, 6.5f))
-            using (SolidBrush thumbBrush = new SolidBrush(Color.White))
-            using (Pen thumbBorder = new Pen(Color.FromArgb(224, 224, 232), 1f))
+            using (SolidBrush thumbBrush = new SolidBrush(IosTheme.SegmentedThumb))
+            using (Pen thumbBorder = new Pen(IosTheme.SegmentedThumbBorder, 1f))
             {
                 g.FillPath(thumbBrush, thumbPath);
                 g.DrawPath(thumbBorder, thumbPath);
@@ -14995,7 +15395,7 @@ namespace TunGuard
                 bool isSel = (i == _selectedIndex);
                 Color fg = isSel
                     ? IosTheme.TextPrimary
-                    : (_hoveredIndex == i ? Color.FromArgb(60, 60, 67) : IosTheme.TextSecondary);
+                    : (_hoveredIndex == i ? IosTheme.TextHover : IosTheme.TextSecondary);
                 TextRenderer.DrawText(
                     g,
                     _segments[i],
@@ -15153,6 +15553,17 @@ namespace TunGuard
             set { _cornerRadius = value; Invalidate(); }
         }
 
+        public void ApplyTheme(Color outerBack, Color surface)
+        {
+            _outerBackColor = outerBack;
+            BackColor = outerBack;
+            _surfaceColor = surface;
+            _inner.BackColor = surface;
+            _inner.ForeColor = IosTheme.TextPrimary;
+            Invalidate();
+            _inner.Invalidate();
+        }
+
         public void Clear()
         {
             _inner.Clear();
@@ -15267,7 +15678,7 @@ namespace TunGuard
 
             Color borderCol = (_isFocused && !_readOnly)
                 ? IosTheme.Blue
-                : (_surfaceColor == Color.White ? IosTheme.InputBorder : Color.FromArgb(228, 228, 234));
+                : (_surfaceColor == IosTheme.InputWhiteBg ? IosTheme.InputBorder : IosTheme.InputSoftBorder);
             float borderW = (_isFocused && !_readOnly) ? 1.5f : 1f;
 
             using (GraphicsPath path = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, _cornerRadius))
@@ -15294,12 +15705,12 @@ namespace TunGuard
             if (IsClearVisible)
             {
                 Rectangle cr = GetClearRect();
-                Color circleCol = _clearHovered ? IosTheme.TextSecondary : Color.FromArgb(174, 174, 178);
+                Color circleCol = _clearHovered ? IosTheme.TextSecondary : IosTheme.TextDisabled;
                 using (SolidBrush b = new SolidBrush(circleCol))
                 {
                     g.FillEllipse(b, cr);
                 }
-                using (Pen xPen = new Pen(Color.White, 1.5f))
+                using (Pen xPen = new Pen(IosTheme.IsDark ? IosTheme.CardBg : Color.White, 1.5f))
                 {
                     xPen.StartCap = LineCap.Round;
                     xPen.EndCap = LineCap.Round;
@@ -15314,6 +15725,7 @@ namespace TunGuard
     internal sealed class IosComboBox : ComboBox
     {
         private const int WM_PAINT = 0x000F;
+        private const int WM_PRINT = 0x0317;
         private Color _outerBackColor = IosTheme.CardBg;
         private Color _surfaceColor = IosTheme.InputBg;
         private bool _hovered;
@@ -15323,10 +15735,11 @@ namespace TunGuard
             DrawMode = DrawMode.OwnerDrawFixed;
             FlatStyle = FlatStyle.Flat;
             ItemHeight = 22;
-            BackColor = Color.White;
+            BackColor = _surfaceColor;
             ForeColor = IosTheme.TextPrimary;
             IntegralHeight = false;
             MaxDropDownItems = 12;
+            HandleCreated += (s, e) => IosTheme.ApplyDarkScrollBar(this);
         }
 
         public Color OuterBackColor
@@ -15341,12 +15754,19 @@ namespace TunGuard
             set
             {
                 _surfaceColor = value;
-                if (DropDownStyle == ComboBoxStyle.DropDown)
-                {
-                    BackColor = value;
-                }
+                BackColor = value;
                 Invalidate();
             }
+        }
+
+        public void ApplyTheme(Color outerBack, Color surface)
+        {
+            _outerBackColor = outerBack;
+            _surfaceColor = surface;
+            BackColor = surface;
+            ForeColor = IosTheme.TextPrimary;
+            IosTheme.ApplyDarkScrollBar(this);
+            Invalidate();
         }
 
         protected override void OnMouseEnter(EventArgs e)
@@ -15386,7 +15806,7 @@ namespace TunGuard
             bool selected = (e.State & DrawItemState.Selected) != 0;
             bool isComboEdit = (e.State & DrawItemState.ComboBoxEdit) != 0;
 
-            using (SolidBrush bg = new SolidBrush(isComboEdit ? _surfaceColor : Color.White))
+            using (SolidBrush bg = new SolidBrush(isComboEdit ? _surfaceColor : IosTheme.MenuBg))
             {
                 g.FillRectangle(bg, e.Bounds);
             }
@@ -15416,82 +15836,93 @@ namespace TunGuard
         protected override void WndProc(ref Message m)
         {
             base.WndProc(ref m);
-            if (m.Msg == WM_PAINT && IsHandleCreated && Width > 6 && Height > 6)
+            if (!IsHandleCreated || Width <= 6 || Height <= 6)
             {
-                PaintIosChrome();
+                return;
+            }
+            if (m.Msg == WM_PAINT)
+            {
+                using (Graphics g = Graphics.FromHwnd(Handle))
+                {
+                    PaintIosChrome(g);
+                }
+            }
+            else if (m.Msg == WM_PRINT && m.WParam != IntPtr.Zero)
+            {
+                using (Graphics g = Graphics.FromHdc(m.WParam))
+                {
+                    PaintIosChrome(g);
+                }
             }
         }
 
-        private void PaintIosChrome()
+        private void PaintIosChrome(Graphics g)
         {
-            using (Graphics g = Graphics.FromHwnd(Handle))
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            bool active = Focused || DroppedDown;
+            Color borderColor = active
+                ? IosTheme.Blue
+                : (_hovered ? IosTheme.InputBorderHover : IosTheme.InputBorder);
+            Color fillCol = _surfaceColor;
+
+            if (DropDownStyle == ComboBoxStyle.DropDownList)
             {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                bool active = Focused || DroppedDown;
-                Color borderColor = active
-                    ? IosTheme.Blue
-                    : (_hovered ? Color.FromArgb(196, 196, 206) : IosTheme.InputBorder);
-                Color fillCol = DropDownStyle == ComboBoxStyle.DropDown ? Color.White : _surfaceColor;
-
-                if (DropDownStyle == ComboBoxStyle.DropDownList)
+                using (SolidBrush outer = new SolidBrush(_outerBackColor))
                 {
-                    using (SolidBrush outer = new SolidBrush(_outerBackColor))
-                    {
-                        g.FillRectangle(outer, 0, 0, Width, Height);
-                    }
-                    using (GraphicsPath pill = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, 8f))
-                    using (SolidBrush fill = new SolidBrush(Enabled ? fillCol : Color.FromArgb(242, 242, 246)))
-                    using (Pen borderPen = new Pen(borderColor, active ? 1.5f : 1f))
-                    {
-                        g.FillPath(fill, pill);
-                        g.DrawPath(borderPen, pill);
-                    }
-
-                    string display = SelectedIndex >= 0 ? GetItemText(SelectedItem) : Text;
-                    Rectangle textRect = new Rectangle(10, 0, Math.Max(4, Width - 32), Height);
-                    TextRenderer.DrawText(
-                        g,
-                        display ?? string.Empty,
-                        Font,
-                        textRect,
-                        Enabled ? IosTheme.TextPrimary : IosTheme.TextDisabled,
-                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                    g.FillRectangle(outer, 0, 0, Width, Height);
                 }
-                else
+                using (GraphicsPath pill = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, 8f))
+                using (SolidBrush fill = new SolidBrush(Enabled ? fillCol : IosTheme.DisabledFill))
+                using (Pen borderPen = new Pen(borderColor, active ? 1.5f : 1f))
                 {
-                    // Editable DropDown: cleanly mask outer Win32 border & dropdown button without touching inner edit box
-                    Rectangle editMask = new Rectangle(4, 3, Math.Max(4, Width - 26), Math.Max(4, Height - 6));
-                    g.SetClip(editMask, CombineMode.Exclude);
-
-                    using (SolidBrush outer = new SolidBrush(_outerBackColor))
-                    {
-                        g.FillRectangle(outer, 0, 0, Width, Height);
-                    }
-                    using (GraphicsPath pill = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, 8f))
-                    using (SolidBrush fill = new SolidBrush(Enabled ? fillCol : Color.FromArgb(242, 242, 246)))
-                    using (Pen borderPen = new Pen(borderColor, active ? 1.5f : 1f))
-                    {
-                        g.FillPath(fill, pill);
-                        g.DrawPath(borderPen, pill);
-                    }
-                    g.ResetClip();
+                    g.FillPath(fill, pill);
+                    g.DrawPath(borderPen, pill);
                 }
 
-                // Crisp Apple chevron on the right
-                float cx = Width - 14f;
-                float cy = Height * 0.5f - 1.5f;
-                using (Pen chevPen = new Pen(Enabled ? IosTheme.TextSecondary : IosTheme.TextDisabled, 1.6f))
+                string display = SelectedIndex >= 0 ? GetItemText(SelectedItem) : Text;
+                Rectangle textRect = new Rectangle(10, 0, Math.Max(4, Width - 32), Height);
+                TextRenderer.DrawText(
+                    g,
+                    display ?? string.Empty,
+                    Font,
+                    textRect,
+                    Enabled ? IosTheme.TextPrimary : IosTheme.TextDisabled,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+            else
+            {
+                // Editable DropDown: cleanly mask outer Win32 border & dropdown button without touching inner edit box
+                Rectangle editMask = new Rectangle(4, 3, Math.Max(4, Width - 26), Math.Max(4, Height - 6));
+                g.SetClip(editMask, CombineMode.Exclude);
+
+                using (SolidBrush outer = new SolidBrush(_outerBackColor))
                 {
-                    chevPen.StartCap = LineCap.Round;
-                    chevPen.EndCap = LineCap.Round;
-                    chevPen.LineJoin = LineJoin.Round;
-                    g.DrawLines(chevPen, new PointF[]
-                    {
-                        new PointF(cx - 4f, cy),
-                        new PointF(cx, cy + 4f),
-                        new PointF(cx + 4f, cy)
-                    });
+                    g.FillRectangle(outer, 0, 0, Width, Height);
                 }
+                using (GraphicsPath pill = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, 8f))
+                using (SolidBrush fill = new SolidBrush(Enabled ? fillCol : IosTheme.DisabledFill))
+                using (Pen borderPen = new Pen(borderColor, active ? 1.5f : 1f))
+                {
+                    g.FillPath(fill, pill);
+                    g.DrawPath(borderPen, pill);
+                }
+                g.ResetClip();
+            }
+
+            // Crisp Apple chevron on the right
+            float cx = Width - 14f;
+            float cy = Height * 0.5f - 1.5f;
+            using (Pen chevPen = new Pen(Enabled ? IosTheme.TextSecondary : IosTheme.TextDisabled, 1.6f))
+            {
+                chevPen.StartCap = LineCap.Round;
+                chevPen.EndCap = LineCap.Round;
+                chevPen.LineJoin = LineJoin.Round;
+                g.DrawLines(chevPen, new PointF[]
+                {
+                    new PointF(cx - 4f, cy),
+                    new PointF(cx, cy + 4f),
+                    new PointF(cx + 4f, cy)
+                });
             }
         }
     }
@@ -15513,9 +15944,18 @@ namespace TunGuard
                 ItemHeight = 27;
                 IntegralHeight = false;
                 HorizontalScrollbar = true;
-                BackColor = Color.White;
+                BackColor = IosTheme.ListBg;
                 ForeColor = IosTheme.TextPrimary;
                 DoubleBuffered = true;
+                HandleCreated += (s, e) => IosTheme.ApplyDarkScrollBar(this);
+            }
+
+            public void ApplyTheme()
+            {
+                BackColor = IosTheme.ListBg;
+                ForeColor = IosTheme.TextPrimary;
+                IosTheme.ApplyDarkScrollBar(this);
+                Invalidate();
             }
 
             public string EmptyText
@@ -15528,6 +15968,11 @@ namespace TunGuard
             {
                 base.OnFontChanged(e);
                 DisposeSubFonts();
+                int scaledItemH = Math.Max(27, Font.Height + 11);
+                if (ItemHeight != scaledItemH)
+                {
+                    ItemHeight = scaledItemH;
+                }
             }
 
             private void DisposeSubFonts()
@@ -15625,7 +16070,7 @@ namespace TunGuard
                 bool selected = (e.State & DrawItemState.Selected) != 0;
                 bool hovered = (!selected && e.Index == _hoveredIndex);
 
-                using (SolidBrush bg = new SolidBrush(Color.White))
+                using (SolidBrush bg = new SolidBrush(IosTheme.ListBg))
                 {
                     g.FillRectangle(bg, e.Bounds);
                 }
@@ -15644,7 +16089,7 @@ namespace TunGuard
                 {
                     Rectangle pillRect = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 2, Math.Max(4, e.Bounds.Width - 8), Math.Max(4, e.Bounds.Height - 4));
                     using (GraphicsPath pill = IosTheme.CreateRoundedRectPath(pillRect.X, pillRect.Y, pillRect.Width, pillRect.Height, 7f))
-                    using (SolidBrush hovBrush = new SolidBrush(Color.FromArgb(245, 245, 249)))
+                    using (SolidBrush hovBrush = new SolidBrush(IosTheme.ListHoverBg))
                     {
                         g.FillPath(hovBrush, pill);
                     }
@@ -15703,7 +16148,7 @@ namespace TunGuard
 
                 Color mainFg = strongSel
                     ? Color.White
-                    : (selected ? Color.FromArgb(0, 88, 196) : IosTheme.TextPrimary);
+                    : (selected ? IosTheme.BlueText : IosTheme.TextPrimary);
 
                 if (string.IsNullOrEmpty(metaText))
                 {
@@ -15900,6 +16345,28 @@ namespace TunGuard
             set { _outerBackColor = value; BackColor = value; Invalidate(); }
         }
 
+        public int ItemHeight
+        {
+            get { return _list.ItemHeight; }
+            set { _list.ItemHeight = value; }
+        }
+
+        public int GetMinimumHeightForRows(int minRows)
+        {
+            int rows = Math.Max(1, minRows);
+            int itemH = Math.Max(24, _list.ItemHeight);
+            int hScrollH = SystemInformation.HorizontalScrollBarHeight;
+            return rows * itemH + Padding.Vertical + hScrollH + 4;
+        }
+
+        public void ApplyTheme(Color outerBack)
+        {
+            _outerBackColor = outerBack;
+            BackColor = outerBack;
+            _list.ApplyTheme();
+            Invalidate();
+        }
+
         public void BeginUpdate()
         {
             _list.BeginUpdate();
@@ -15924,7 +16391,7 @@ namespace TunGuard
             g.Clear(_outerBackColor);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             using (GraphicsPath path = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, 10f))
-            using (SolidBrush fill = new SolidBrush(Color.White))
+            using (SolidBrush fill = new SolidBrush(IosTheme.ListBg))
             using (Pen pen = new Pen(_focused ? IosTheme.Blue : IosTheme.CardBorder, _focused ? 1.4f : 1f))
             {
                 g.FillPath(fill, path);
@@ -15999,13 +16466,13 @@ namespace TunGuard
                     break;
                 case IosStatusTone.Info:
                     bg = IosTheme.BlueSoft;
-                    border = Color.FromArgb(190, 220, 255);
+                    border = IosTheme.BlueSoftBorder;
                     dot = IosTheme.Blue;
-                    fg = Color.FromArgb(0, 88, 196);
+                    fg = IosTheme.BlueText;
                     break;
                 default:
-                    bg = Color.FromArgb(236, 236, 242);
-                    border = Color.FromArgb(224, 224, 232);
+                    bg = IosTheme.BannerNeutralBg;
+                    border = IosTheme.BannerNeutralBorder;
                     dot = IosTheme.TextTertiary;
                     fg = IosTheme.TextSecondary;
                     break;
@@ -16210,15 +16677,15 @@ namespace TunGuard
 
     internal sealed class IosMenuColorTable : ProfessionalColorTable
     {
-        public override Color ToolStripDropDownBackground { get { return Color.White; } }
-        public override Color MenuBorder { get { return Color.FromArgb(218, 218, 226); } }
+        public override Color ToolStripDropDownBackground { get { return IosTheme.MenuBg; } }
+        public override Color MenuBorder { get { return IosTheme.MenuBorder; } }
         public override Color MenuItemBorder { get { return Color.Transparent; } }
         public override Color MenuItemSelected { get { return IosTheme.Blue; } }
-        public override Color ImageMarginGradientBegin { get { return Color.White; } }
-        public override Color ImageMarginGradientMiddle { get { return Color.White; } }
-        public override Color ImageMarginGradientEnd { get { return Color.White; } }
+        public override Color ImageMarginGradientBegin { get { return IosTheme.MenuBg; } }
+        public override Color ImageMarginGradientMiddle { get { return IosTheme.MenuBg; } }
+        public override Color ImageMarginGradientEnd { get { return IosTheme.MenuBg; } }
         public override Color SeparatorDark { get { return IosTheme.Separator; } }
-        public override Color SeparatorLight { get { return Color.White; } }
+        public override Color SeparatorLight { get { return IosTheme.MenuBg; } }
     }
 
     internal sealed class IosMenuRenderer : ToolStripProfessionalRenderer
@@ -16230,7 +16697,7 @@ namespace TunGuard
 
         protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
         {
-            using (SolidBrush bg = new SolidBrush(Color.White))
+            using (SolidBrush bg = new SolidBrush(IosTheme.MenuBg))
             {
                 e.Graphics.FillRectangle(bg, e.AffectedBounds);
             }
@@ -16239,7 +16706,7 @@ namespace TunGuard
         protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (Pen pen = new Pen(Color.FromArgb(214, 214, 222), 1f))
+            using (Pen pen = new Pen(IosTheme.MenuBorder, 1f))
             {
                 e.Graphics.DrawRectangle(pen, 0, 0, e.AffectedBounds.Width - 1, e.AffectedBounds.Height - 1);
             }
@@ -16352,24 +16819,32 @@ namespace TunGuard
         private readonly Font _closeXFont;
         private readonly Font _primaryBtnFont;
 
+        private readonly TableLayoutPanel _root;
+        private readonly TableLayoutPanel _header;
+        private readonly TableLayoutPanel _titleStack;
         private readonly Panel _badgePanel;
         private readonly Label _lblTitle;
         private readonly Label _lblSubtitle;
         private readonly IosButton _btnCloseX;
         private readonly IosCardLayoutPanel _detailCard;
+        private readonly Label _lblReasonCap;
         private readonly Label _lblReasonVal;
         private readonly Label _lblChainCaption;
         private readonly Label _lblChainVal;
         private readonly Label _lblAllowedCaption;
         private readonly Label _lblAllowedVal;
+        private readonly Label _lblActionCap;
         private readonly Label _lblActionVal;
         private readonly Label _lblHint;
+        private readonly TableLayoutPanel _footer;
+        private readonly FlowLayoutPanel _leftBtns;
         private readonly IosButton _btnSettings;
         private readonly IosButton _btnLogs;
         private readonly IosButton _btnAck;
 
         private Color _accentColor = IosTheme.Red;
         private Color _accentSoftColor = IosTheme.RedSoft;
+        private bool _lastIsSevere = true;
         private int _burstKilledTotal;
         private bool _positionedOnce;
         private bool _dismissedByUser;
@@ -16420,7 +16895,7 @@ namespace TunGuard
             _closeXFont = IosTheme.CreateFont(11.5f, FontStyle.Regular);
             _primaryBtnFont = IosTheme.CreateFont(9.2f, FontStyle.Bold);
 
-            TableLayoutPanel root = new TableLayoutPanel
+            _root = new TableLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -16430,14 +16905,14 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(0)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // detail card
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // hint
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // buttons
+            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // detail card
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // hint
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // buttons
 
             // Header row (draggable)
-            TableLayoutPanel header = new TableLayoutPanel
+            _header = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -16446,9 +16921,9 @@ namespace TunGuard
                 Margin = new Padding(0, 0, 0, 12),
                 BackColor = IosTheme.CardBg
             };
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             _badgePanel = new Panel
             {
@@ -16458,7 +16933,7 @@ namespace TunGuard
             };
             _badgePanel.Paint += OnBadgePaint;
 
-            TableLayoutPanel titleStack = new TableLayoutPanel
+            _titleStack = new TableLayoutPanel
             {
                 AutoSize = true,
                 ColumnCount = 1,
@@ -16467,9 +16942,9 @@ namespace TunGuard
                 Anchor = AnchorStyles.Left,
                 Margin = new Padding(0, 0, 10, 0)
             };
-            titleStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            titleStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            titleStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _titleStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _titleStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _titleStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             _lblTitle = new Label
             {
@@ -16489,8 +16964,8 @@ namespace TunGuard
                 Margin = new Padding(0)
             };
 
-            titleStack.Controls.Add(_lblTitle, 0, 0);
-            titleStack.Controls.Add(_lblSubtitle, 0, 1);
+            _titleStack.Controls.Add(_lblTitle, 0, 0);
+            _titleStack.Controls.Add(_lblSubtitle, 0, 1);
 
             _btnCloseX = new IosButton
             {
@@ -16506,15 +16981,15 @@ namespace TunGuard
             };
             _btnCloseX.Click += (s, e) => DismissByUser();
 
-            header.Controls.Add(_badgePanel, 0, 0);
-            header.Controls.Add(titleStack, 1, 0);
-            header.Controls.Add(_btnCloseX, 2, 0);
-            AttachDragHandler(header);
+            _header.Controls.Add(_badgePanel, 0, 0);
+            _header.Controls.Add(_titleStack, 1, 0);
+            _header.Controls.Add(_btnCloseX, 2, 0);
+            AttachDragHandler(_header);
             AttachDragHandler(_badgePanel);
-            AttachDragHandler(titleStack);
+            AttachDragHandler(_titleStack);
             AttachDragHandler(_lblTitle);
             AttachDragHandler(_lblSubtitle);
-            root.Controls.Add(header, 0, 0);
+            _root.Controls.Add(_header, 0, 0);
 
             // Inset grouped iOS details card
             _detailCard = new IosCardLayoutPanel
@@ -16539,7 +17014,7 @@ namespace TunGuard
             _detailCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             _detailCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-            Label lblReasonCap = CreateCaptionLabel("拦截原因");
+            _lblReasonCap = CreateCaptionLabel("拦截原因");
             _lblReasonVal = CreateValueLabel(IosTheme.RedText, true);
 
             _lblChainCaption = CreateCaptionLabel("当前出口");
@@ -16548,18 +17023,18 @@ namespace TunGuard
             _lblAllowedCaption = CreateCaptionLabel("允许节点");
             _lblAllowedVal = CreateValueLabel(IosTheme.GreenText, false);
 
-            Label lblActionCap = CreateCaptionLabel("执行动作");
+            _lblActionCap = CreateCaptionLabel("执行动作");
             _lblActionVal = CreateValueLabel(IosTheme.TextSecondary, false);
 
-            _detailCard.Controls.Add(lblReasonCap, 0, 0);
+            _detailCard.Controls.Add(_lblReasonCap, 0, 0);
             _detailCard.Controls.Add(_lblReasonVal, 1, 0);
             _detailCard.Controls.Add(_lblChainCaption, 0, 1);
             _detailCard.Controls.Add(_lblChainVal, 1, 1);
             _detailCard.Controls.Add(_lblAllowedCaption, 0, 2);
             _detailCard.Controls.Add(_lblAllowedVal, 1, 2);
-            _detailCard.Controls.Add(lblActionCap, 0, 3);
+            _detailCard.Controls.Add(_lblActionCap, 0, 3);
             _detailCard.Controls.Add(_lblActionVal, 1, 3);
-            root.Controls.Add(_detailCard, 0, 1);
+            _root.Controls.Add(_detailCard, 0, 1);
 
             // Hint row
             _lblHint = new Label
@@ -16571,10 +17046,10 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(4, 0, 4, 14)
             };
-            root.Controls.Add(_lblHint, 0, 2);
+            _root.Controls.Add(_lblHint, 0, 2);
 
             // Footer buttons
-            TableLayoutPanel footer = new TableLayoutPanel
+            _footer = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -16583,10 +17058,10 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(0)
             };
-            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            FlowLayoutPanel leftBtns = new FlowLayoutPanel
+            _leftBtns = new FlowLayoutPanel
             {
                 AutoSize = true,
                 WrapContents = false,
@@ -16630,8 +17105,8 @@ namespace TunGuard
                 }
             };
 
-            leftBtns.Controls.Add(_btnSettings);
-            leftBtns.Controls.Add(_btnLogs);
+            _leftBtns.Controls.Add(_btnSettings);
+            _leftBtns.Controls.Add(_btnLogs);
 
             _btnAck = new IosButton
             {
@@ -16645,11 +17120,11 @@ namespace TunGuard
             };
             _btnAck.Click += (s, e) => DismissByUser();
 
-            footer.Controls.Add(leftBtns, 0, 0);
-            footer.Controls.Add(_btnAck, 1, 0);
-            root.Controls.Add(footer, 0, 3);
+            _footer.Controls.Add(_leftBtns, 0, 0);
+            _footer.Controls.Add(_btnAck, 1, 0);
+            _root.Controls.Add(_footer, 0, 3);
 
-            Controls.Add(root);
+            Controls.Add(_root);
 
             KeyPreview = true;
             KeyDown += (s, e) =>
@@ -16661,13 +17136,70 @@ namespace TunGuard
             };
             SizeChanged += (s, e) => ApplyAlertRounding();
             HandleCreated += (s, e) => ApplyAlertRounding();
+            IosTheme.ThemeChanged += OnThemeChanged;
+        }
+
+        private void OnThemeChanged(object sender, EventArgs e)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)ApplyTheme); } catch { }
+                return;
+            }
+            ApplyTheme();
+        }
+
+        public void ApplyTheme()
+        {
+            if (IsDisposed) return;
+            BackColor = IosTheme.CardBg;
+            _root.BackColor = IosTheme.CardBg;
+            _header.BackColor = IosTheme.CardBg;
+            _titleStack.BackColor = IosTheme.CardBg;
+            _lblTitle.ForeColor = IosTheme.TextPrimary;
+            _lblSubtitle.ForeColor = IosTheme.TextTertiary;
+
+            _detailCard.OuterBackColor = IosTheme.CardBg;
+            _detailCard.CardBackColor = IosTheme.CardInsetBg;
+            _detailCard.BorderColor = IosTheme.CardBorder;
+
+            _lblReasonCap.ForeColor = IosTheme.TextSecondary;
+            _lblReasonCap.BackColor = IosTheme.CardInsetBg;
+            _lblChainCaption.ForeColor = IosTheme.TextSecondary;
+            _lblChainCaption.BackColor = IosTheme.CardInsetBg;
+            _lblAllowedCaption.ForeColor = IosTheme.TextSecondary;
+            _lblAllowedCaption.BackColor = IosTheme.CardInsetBg;
+            _lblActionCap.ForeColor = IosTheme.TextSecondary;
+            _lblActionCap.BackColor = IosTheme.CardInsetBg;
+
+            _lblReasonVal.BackColor = IosTheme.CardInsetBg;
+            _lblChainVal.ForeColor = IosTheme.TextPrimary;
+            _lblChainVal.BackColor = IosTheme.CardInsetBg;
+            _lblAllowedVal.ForeColor = IosTheme.GreenText;
+            _lblAllowedVal.BackColor = IosTheme.CardInsetBg;
+            _lblActionVal.ForeColor = IosTheme.TextSecondary;
+            _lblActionVal.BackColor = IosTheme.CardInsetBg;
+
+            _lblHint.ForeColor = IosTheme.TextTertiary;
+            _lblHint.BackColor = IosTheme.CardBg;
+            _footer.BackColor = IosTheme.CardBg;
+            _leftBtns.BackColor = IosTheme.CardBg;
+
+            _accentColor = _lastIsSevere ? IosTheme.Red : IosTheme.Orange;
+            _accentSoftColor = _lastIsSevere ? IosTheme.RedSoft : IosTheme.OrangeSoft;
+            _btnAck.CustomBackColor = _accentColor;
+            _lblReasonVal.ForeColor = _lastIsSevere ? IosTheme.RedText : IosTheme.OrangeText;
+
+            ApplyAlertRounding();
+            Invalidate(true);
         }
 
         private void ApplyAlertRounding()
         {
             if (IsHandleCreated && !IsDisposed && Width > 8 && Height > 8)
             {
-                _roundedByDwm = IosTheme.ApplyBorderlessRoundedCorners(this, 16, Color.FromArgb(212, 212, 222));
+                _roundedByDwm = IosTheme.ApplyBorderlessRoundedCorners(this, 16, IosTheme.AlertBorder);
             }
         }
 
@@ -16740,7 +17272,7 @@ namespace TunGuard
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 using (GraphicsPath borderPath = IosTheme.CreateRoundedRectPath(0.5f, 0.5f, Width - 1.5f, Height - 1.5f, 15.5f))
-                using (Pen borderPen = new Pen(Color.FromArgb(208, 208, 218), 1.2f))
+                using (Pen borderPen = new Pen(IosTheme.AlertBorder, 1.2f))
                 {
                     e.Graphics.DrawPath(borderPen, borderPath);
                 }
@@ -16750,6 +17282,7 @@ namespace TunGuard
         public void ShowOrUpdate(GuardAlertPayload payload, bool accumulateBurst)
         {
             _dismissedByUser = false;
+            _lastIsSevere = payload.IsSevere;
             _accentColor = payload.IsSevere ? IosTheme.Red : IosTheme.Orange;
             _accentSoftColor = payload.IsSevere ? IosTheme.RedSoft : IosTheme.OrangeSoft;
             _btnAck.CustomBackColor = _accentColor;
@@ -16843,6 +17376,7 @@ namespace TunGuard
         {
             if (disposing)
             {
+                IosTheme.ThemeChanged -= OnThemeChanged;
                 if (_titleFont != null) _titleFont.Dispose();
                 if (_subTitleFont != null) _subTitleFont.Dispose();
                 if (_boldLabelFont != null) _boldLabelFont.Dispose();
@@ -16884,12 +17418,17 @@ namespace TunGuard
         private readonly Font _monoFont;
         private readonly System.Windows.Forms.Timer _searchDebounceTimer;
 
+        private readonly TableLayoutPanel _root;
+        private readonly IosCardLayoutPanel _dirPanel;
+        private readonly Label _lblDir;
         private readonly IosTextBox _txtLogDir;
         private readonly IosPillBadge _lblDirBadge;
         private readonly IosButton _btnChangeDir;
         private readonly IosButton _btnResetDir;
         private readonly IosButton _btnOpenDir;
 
+        private readonly IosCardLayoutPanel _filterPanel;
+        private readonly Label _lblFile;
         private readonly IosComboBox _cmbFiles;
         private readonly IosSegmentedControl _segLevel;
         private readonly IosTextBox _txtSearch;
@@ -16898,7 +17437,9 @@ namespace TunGuard
         private readonly IosButton _btnCopy;
         private readonly IosButton _btnClear;
 
+        private readonly IosRoundedContainer _consoleFrame;
         private readonly RichTextBox _rtbLog;
+        private readonly TableLayoutPanel _footer;
         private readonly IosDotStatusLabel _lblStatus;
         private readonly IosButton _btnClose;
 
@@ -16937,7 +17478,7 @@ namespace TunGuard
                 LoadSelectedFileContent();
             };
 
-            TableLayoutPanel root = new TableLayoutPanel
+            _root = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
@@ -16945,14 +17486,14 @@ namespace TunGuard
                 BackColor = IosTheme.CanvasBg,
                 Padding = new Padding(16, 12, 16, 14)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Log directory card
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: Filter toolbar card
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 2: Dark console viewer
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Footer status bar
+            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0: Log directory card
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1: Filter toolbar card
+            _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 2: Dark console viewer
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3: Footer status bar
 
             // Row 0: Log directory card
-            IosCardLayoutPanel dirPanel = new IosCardLayoutPanel
+            _dirPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -16962,14 +17503,14 @@ namespace TunGuard
                 Padding = new Padding(14, 9, 14, 9),
                 Margin = new Padding(0, 0, 0, 10)
             };
-            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _dirPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            Label lblDir = new Label
+            _lblDir = new Label
             {
                 Text = "日志目录",
                 AutoSize = true,
@@ -17025,16 +17566,16 @@ namespace TunGuard
             };
             _btnOpenDir.Click += OnOpenDirClick;
 
-            dirPanel.Controls.Add(lblDir, 0, 0);
-            dirPanel.Controls.Add(_txtLogDir, 1, 0);
-            dirPanel.Controls.Add(_lblDirBadge, 2, 0);
-            dirPanel.Controls.Add(_btnChangeDir, 3, 0);
-            dirPanel.Controls.Add(_btnResetDir, 4, 0);
-            dirPanel.Controls.Add(_btnOpenDir, 5, 0);
-            root.Controls.Add(dirPanel, 0, 0);
+            _dirPanel.Controls.Add(_lblDir, 0, 0);
+            _dirPanel.Controls.Add(_txtLogDir, 1, 0);
+            _dirPanel.Controls.Add(_lblDirBadge, 2, 0);
+            _dirPanel.Controls.Add(_btnChangeDir, 3, 0);
+            _dirPanel.Controls.Add(_btnResetDir, 4, 0);
+            _dirPanel.Controls.Add(_btnOpenDir, 5, 0);
+            _root.Controls.Add(_dirPanel, 0, 0);
 
             // Row 1: Filter & actions card
-            IosCardLayoutPanel filterPanel = new IosCardLayoutPanel
+            _filterPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -17044,16 +17585,16 @@ namespace TunGuard
                 Padding = new Padding(14, 9, 14, 9),
                 Margin = new Padding(0, 0, 0, 10)
             };
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));      // 0: file label
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 200f)); // 1: file combo
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 240f)); // 2: level segmented
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));  // 3: search box
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 4: auto scroll switch
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 5: refresh
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 6: copy
-            filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 7: clear
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));      // 0: file label
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 200f)); // 1: file combo
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 240f)); // 2: level segmented
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));  // 3: search box
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 4: auto scroll switch
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 5: refresh
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 6: copy
+            _filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // 7: clear
 
-            Label lblFile = new Label
+            _lblFile = new Label
             {
                 Text = "文件",
                 AutoSize = true,
@@ -17152,18 +17693,18 @@ namespace TunGuard
             };
             _btnClear.Click += OnClearClick;
 
-            filterPanel.Controls.Add(lblFile, 0, 0);
-            filterPanel.Controls.Add(_cmbFiles, 1, 0);
-            filterPanel.Controls.Add(_segLevel, 2, 0);
-            filterPanel.Controls.Add(_txtSearch, 3, 0);
-            filterPanel.Controls.Add(_chkAutoScroll, 4, 0);
-            filterPanel.Controls.Add(_btnRefresh, 5, 0);
-            filterPanel.Controls.Add(_btnCopy, 6, 0);
-            filterPanel.Controls.Add(_btnClear, 7, 0);
-            root.Controls.Add(filterPanel, 0, 1);
+            _filterPanel.Controls.Add(_lblFile, 0, 0);
+            _filterPanel.Controls.Add(_cmbFiles, 1, 0);
+            _filterPanel.Controls.Add(_segLevel, 2, 0);
+            _filterPanel.Controls.Add(_txtSearch, 3, 0);
+            _filterPanel.Controls.Add(_chkAutoScroll, 4, 0);
+            _filterPanel.Controls.Add(_btnRefresh, 5, 0);
+            _filterPanel.Controls.Add(_btnCopy, 6, 0);
+            _filterPanel.Controls.Add(_btnClear, 7, 0);
+            _root.Controls.Add(_filterPanel, 0, 1);
 
             // Row 2: Dark Apple Console surface
-            IosRoundedContainer consoleFrame = new IosRoundedContainer
+            _consoleFrame = new IosRoundedContainer
             {
                 Dock = DockStyle.Fill,
                 OuterBackColor = IosTheme.CanvasBg,
@@ -17187,11 +17728,12 @@ namespace TunGuard
                 Font = _monoFont,
                 HideSelection = false
             };
-            consoleFrame.Controls.Add(_rtbLog);
-            root.Controls.Add(consoleFrame, 0, 2);
+            _rtbLog.HandleCreated += (s, e) => IosTheme.ApplyDarkScrollBar(_rtbLog);
+            _consoleFrame.Controls.Add(_rtbLog);
+            _root.Controls.Add(_consoleFrame, 0, 2);
 
             // Row 3: Bottom status & close button
-            TableLayoutPanel footer = new TableLayoutPanel
+            _footer = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -17200,8 +17742,8 @@ namespace TunGuard
                 BackColor = IosTheme.CanvasBg,
                 Margin = new Padding(0)
             };
-            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             _lblStatus = new IosDotStatusLabel
             {
@@ -17223,13 +17765,14 @@ namespace TunGuard
             };
             _btnClose.Click += (s, e) => Close();
 
-            footer.Controls.Add(_lblStatus, 0, 0);
-            footer.Controls.Add(_btnClose, 1, 0);
-            root.Controls.Add(footer, 0, 3);
+            _footer.Controls.Add(_lblStatus, 0, 0);
+            _footer.Controls.Add(_btnClose, 1, 0);
+            _root.Controls.Add(_footer, 0, 3);
 
-            Controls.Add(root);
+            Controls.Add(_root);
             CancelButton = _btnClose;
 
+            IosTheme.ThemeChanged += OnThemeChanged;
             Load += (s, e) =>
             {
                 AppLogger.EntryLogged += OnLiveLogEntry;
@@ -17239,6 +17782,54 @@ namespace TunGuard
             {
                 AppLogger.EntryLogged -= OnLiveLogEntry;
             };
+        }
+
+        private void OnThemeChanged(object sender, EventArgs e)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)ApplyTheme); } catch { }
+                return;
+            }
+            ApplyTheme();
+        }
+
+        public void ApplyTheme()
+        {
+            if (IsDisposed) return;
+            BackColor = IosTheme.CanvasBg;
+            ForeColor = IosTheme.TextPrimary;
+            IosTheme.ApplyWindowChrome(this, IosTheme.CanvasBg, true);
+
+            _root.BackColor = IosTheme.CanvasBg;
+            _dirPanel.OuterBackColor = IosTheme.CanvasBg;
+            _dirPanel.CardBackColor = IosTheme.CardBg;
+            _dirPanel.BorderColor = IosTheme.CardBorder;
+            _lblDir.ForeColor = IosTheme.TextPrimary;
+            _lblDir.BackColor = IosTheme.CardBg;
+            _txtLogDir.ApplyTheme(IosTheme.CardBg, IosTheme.CardInsetBg);
+
+            _filterPanel.OuterBackColor = IosTheme.CanvasBg;
+            _filterPanel.CardBackColor = IosTheme.CardBg;
+            _filterPanel.BorderColor = IosTheme.CardBorder;
+            _lblFile.ForeColor = IosTheme.TextSecondary;
+            _lblFile.BackColor = IosTheme.CardBg;
+            _cmbFiles.ApplyTheme(IosTheme.CardBg, IosTheme.InputBg);
+            _txtSearch.ApplyTheme(IosTheme.CardBg, IosTheme.InputBg);
+
+            _consoleFrame.OuterBackColor = IosTheme.CanvasBg;
+            _consoleFrame.FillColor = IosTheme.ConsoleBg;
+            _consoleFrame.BorderColor = IosTheme.ConsoleBorder;
+            _rtbLog.BackColor = IosTheme.ConsoleBg;
+            IosTheme.ApplyDarkScrollBar(_rtbLog);
+
+            _footer.BackColor = IosTheme.CanvasBg;
+            _lblStatus.ForeColor = IosTheme.TextSecondary;
+
+            UpdateDirectoryBar();
+            UpdateStatusLabel();
+            Invalidate(true);
         }
 
         private static Font CreateMonoFont()
@@ -17277,7 +17868,7 @@ namespace TunGuard
             _txtLogDir.Text = effective;
             _lblDirBadge.Text = isDefault ? "默认" : "自定义";
             _lblDirBadge.PillBackColor = isDefault ? IosTheme.SecondaryFill : IosTheme.BlueSoft;
-            _lblDirBadge.PillForeColor = isDefault ? IosTheme.TextSecondary : IosTheme.Blue;
+            _lblDirBadge.PillForeColor = isDefault ? IosTheme.TextSecondary : (IosTheme.IsDark ? IosTheme.BlueText : IosTheme.Blue);
             _btnResetDir.Enabled = !isDefault;
         }
 
@@ -17754,6 +18345,7 @@ namespace TunGuard
         {
             if (disposing)
             {
+                IosTheme.ThemeChanged -= OnThemeChanged;
                 AppLogger.EntryLogged -= OnLiveLogEntry;
                 if (_searchDebounceTimer != null)
                 {
@@ -17789,15 +18381,22 @@ namespace TunGuard
         private readonly Font _boldFont;
         private readonly Font _hintFont;
         private readonly Font _primaryBtnFont;
+        private readonly TableLayoutPanel _root;
+        private readonly IosCardLayoutPanel _topBar;
         private readonly IosSegmentedControl _segApp;
         private readonly IosButton _btnRescan;
+        private readonly IosCardLayoutPanel _customPanel;
         private readonly Label _lblCustomHeader;
         private readonly IosListBox _lstCustom;
+        private readonly FlowLayoutPanel _customBtns;
         private readonly IosButton _btnAddExe;
         private readonly IosButton _btnAddDir;
         private readonly IosButton _btnRemove;
+        private readonly IosCardLayoutPanel _discoveredPanel;
         private readonly Label _lblDiscoveredHeader;
         private readonly IosListBox _lstDiscovered;
+        private readonly Label _lblHint;
+        private readonly FlowLayoutPanel _footer;
         private AppPathDiagnostics _diagnostics;
 
         public Dictionary<string, List<string>> ResultCustomPaths { get; private set; }
@@ -17830,7 +18429,7 @@ namespace TunGuard
             }
             HandleCreated += (s, e) => IosTheme.ApplyWindowChrome(this, IosTheme.CanvasBg, true);
 
-            TableLayoutPanel root = new TableLayoutPanel
+            _root = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
@@ -17838,15 +18437,15 @@ namespace TunGuard
                 BackColor = IosTheme.CanvasBg,
                 Padding = new Padding(16, 12, 16, 14)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 0: app selector + rescan
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 50f)); // 1: custom paths panel
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 50f)); // 2: auto-discovered panel
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 3: tip
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 4: footer
+            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 0: app selector + rescan
+            _root.RowStyles.Add(new RowStyle(SizeType.Percent, 50f)); // 1: custom paths panel
+            _root.RowStyles.Add(new RowStyle(SizeType.Percent, 50f)); // 2: auto-discovered panel
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 3: tip
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 4: footer
 
             // Row 0: App segmented selector & Rescan
-            IosCardLayoutPanel topBar = new IosCardLayoutPanel
+            _topBar = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -17856,8 +18455,8 @@ namespace TunGuard
                 Padding = new Padding(12, 9, 12, 9),
                 Margin = new Padding(0, 0, 0, 10)
             };
-            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             _segApp = new IosSegmentedControl
             {
@@ -17878,12 +18477,12 @@ namespace TunGuard
             };
             _btnRescan.Click += OnRescanClick;
 
-            topBar.Controls.Add(_segApp, 0, 0);
-            topBar.Controls.Add(_btnRescan, 1, 0);
-            root.Controls.Add(topBar, 0, 0);
+            _topBar.Controls.Add(_segApp, 0, 0);
+            _topBar.Controls.Add(_btnRescan, 1, 0);
+            _root.Controls.Add(_topBar, 0, 0);
 
             // Row 1: Custom paths card
-            IosCardLayoutPanel customPanel = new IosCardLayoutPanel
+            _customPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
@@ -17891,10 +18490,10 @@ namespace TunGuard
                 Padding = new Padding(14, 10, 14, 10),
                 Margin = new Padding(0, 0, 0, 10)
             };
-            customPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            customPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            customPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-            customPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _customPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _customPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _customPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            _customPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             _lblCustomHeader = new Label
             {
@@ -17916,7 +18515,7 @@ namespace TunGuard
             };
             _lstCustom.SelectedIndexChanged += (s, e) => _btnRemove.Enabled = _lstCustom.SelectedItems.Count > 0;
 
-            FlowLayoutPanel customBtns = new FlowLayoutPanel
+            _customBtns = new FlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -17951,17 +18550,17 @@ namespace TunGuard
             };
             _btnRemove.Click += OnRemoveSelectedClick;
 
-            customBtns.Controls.Add(_btnAddDir);
-            customBtns.Controls.Add(_btnAddExe);
-            customBtns.Controls.Add(_btnRemove);
+            _customBtns.Controls.Add(_btnAddDir);
+            _customBtns.Controls.Add(_btnAddExe);
+            _customBtns.Controls.Add(_btnRemove);
 
-            customPanel.Controls.Add(_lblCustomHeader, 0, 0);
-            customPanel.Controls.Add(_lstCustom, 0, 1);
-            customPanel.Controls.Add(customBtns, 0, 2);
-            root.Controls.Add(customPanel, 0, 1);
+            _customPanel.Controls.Add(_lblCustomHeader, 0, 0);
+            _customPanel.Controls.Add(_lstCustom, 0, 1);
+            _customPanel.Controls.Add(_customBtns, 0, 2);
+            _root.Controls.Add(_customPanel, 0, 1);
 
             // Row 2: Auto-discovered targets card (read-only)
-            IosCardLayoutPanel discoveredPanel = new IosCardLayoutPanel
+            _discoveredPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
@@ -17969,9 +18568,9 @@ namespace TunGuard
                 Padding = new Padding(14, 10, 14, 10),
                 Margin = new Padding(0, 0, 0, 8)
             };
-            discoveredPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            discoveredPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            discoveredPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            _discoveredPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _discoveredPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _discoveredPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
             _lblDiscoveredHeader = new Label
             {
@@ -17991,12 +18590,12 @@ namespace TunGuard
                 Margin = new Padding(0)
             };
 
-            discoveredPanel.Controls.Add(_lblDiscoveredHeader, 0, 0);
-            discoveredPanel.Controls.Add(_lstDiscovered, 0, 1);
-            root.Controls.Add(discoveredPanel, 0, 2);
+            _discoveredPanel.Controls.Add(_lblDiscoveredHeader, 0, 0);
+            _discoveredPanel.Controls.Add(_lstDiscovered, 0, 1);
+            _root.Controls.Add(_discoveredPanel, 0, 2);
 
             // Row 3: Hint
-            Label lblHint = new Label
+            _lblHint = new Label
             {
                 Text = "提示：若使用绿色/便携版、自定义安装目录，或未来软件更新改名/新增子进程，添加其安装目录即可自动覆盖全部 .exe；修改后请点击控制面板的「保存并生效」。",
                 AutoSize = true,
@@ -18005,10 +18604,10 @@ namespace TunGuard
                 BackColor = IosTheme.CanvasBg,
                 Margin = new Padding(4, 0, 4, 10)
             };
-            root.Controls.Add(lblHint, 0, 3);
+            _root.Controls.Add(_lblHint, 0, 3);
 
             // Row 4: Footer buttons
-            FlowLayoutPanel footer = new FlowLayoutPanel
+            _footer = new FlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -18047,14 +18646,15 @@ namespace TunGuard
                 Close();
             };
 
-            footer.Controls.Add(btnCancel);
-            footer.Controls.Add(btnOk);
-            root.Controls.Add(footer, 0, 4);
+            _footer.Controls.Add(btnCancel);
+            _footer.Controls.Add(btnOk);
+            _root.Controls.Add(_footer, 0, 4);
 
-            Controls.Add(root);
+            Controls.Add(_root);
             AcceptButton = btnOk;
             CancelButton = btnCancel;
 
+            IosTheme.ThemeChanged += OnThemeChanged;
             Load += (s, e) =>
             {
                 LoadDiagnostics(false);
@@ -18062,10 +18662,55 @@ namespace TunGuard
             };
         }
 
+        private void OnThemeChanged(object sender, EventArgs e)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)ApplyTheme); } catch { }
+                return;
+            }
+            ApplyTheme();
+        }
+
+        public void ApplyTheme()
+        {
+            if (IsDisposed) return;
+            BackColor = IosTheme.CanvasBg;
+            ForeColor = IosTheme.TextPrimary;
+            IosTheme.ApplyWindowChrome(this, IosTheme.CanvasBg, true);
+
+            _root.BackColor = IosTheme.CanvasBg;
+            _topBar.OuterBackColor = IosTheme.CanvasBg;
+            _topBar.CardBackColor = IosTheme.CardBg;
+            _topBar.BorderColor = IosTheme.CardBorder;
+
+            _customPanel.OuterBackColor = IosTheme.CanvasBg;
+            _customPanel.CardBackColor = IosTheme.CardBg;
+            _customPanel.BorderColor = IosTheme.CardBorder;
+            _lblCustomHeader.ForeColor = IosTheme.TextPrimary;
+            _lblCustomHeader.BackColor = IosTheme.CardBg;
+            _lstCustom.ApplyTheme(IosTheme.CardBg);
+            _customBtns.BackColor = IosTheme.CardBg;
+
+            _discoveredPanel.OuterBackColor = IosTheme.CanvasBg;
+            _discoveredPanel.CardBackColor = IosTheme.CardBg;
+            _discoveredPanel.BorderColor = IosTheme.CardBorder;
+            _lblDiscoveredHeader.ForeColor = IosTheme.GreenText;
+            _lblDiscoveredHeader.BackColor = IosTheme.CardBg;
+            _lstDiscovered.ApplyTheme(IosTheme.CardBg);
+
+            _lblHint.ForeColor = IosTheme.TextTertiary;
+            _lblHint.BackColor = IosTheme.CanvasBg;
+            _footer.BackColor = IosTheme.CanvasBg;
+            Invalidate(true);
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
+                IosTheme.ThemeChanged -= OnThemeChanged;
                 if (_boldFont != null) _boldFont.Dispose();
                 if (_hintFont != null) _hintFont.Dispose();
                 if (_primaryBtnFont != null) _primaryBtnFont.Dispose();
@@ -18288,6 +18933,7 @@ namespace TunGuard
     internal sealed class NodeSettingsForm : Form
     {
         private const string AutoGroupLabel = "(自动跟踪默认出口组)";
+        private const int MinTransferVisibleRows = 3;
 
         private sealed class ProfileFilterItem
         {
@@ -18318,6 +18964,7 @@ namespace TunGuard
         private readonly Func<TunStatus> _statusProvider;
         private readonly Func<bool, AppPathDiagnostics> _pathDiagnosticsProvider;
         private readonly Action _onOpenLogViewer;
+        private readonly Action<string> _onThemeModeChanged;
         private readonly ApplyUpdateCallback _onApplyUpdate;
         private readonly Dictionary<string, List<string>> _preservedDiscoveredPaths;
         private Dictionary<string, List<string>> _draftCustomAppPaths;
@@ -18329,40 +18976,76 @@ namespace TunGuard
         private readonly Font _badgeFont;
         private readonly Font _primaryBtnFont;
         private readonly System.Windows.Forms.Timer _searchDebounceTimer;
+        private readonly TableLayoutPanel _root;
+        private readonly IosScrollHostPanel _scrollHost;
+        private readonly TableLayoutPanel _cardsPanel;
+        private readonly IosCardLayoutPanel _targetAppsPanel;
+        private readonly Label _lblTargetApps;
+        private readonly FlowLayoutPanel _targetAppsFlow;
+        private readonly FlowLayoutPanel _targetAppsButtons;
         private readonly IosToggleChip _chkGuardAntigravity;
         private readonly IosToggleChip _chkGuardChatGPT;
         private readonly IosToggleChip _chkGuardClaude;
         private readonly IosButton _btnAutoDetectApps;
         private readonly IosButton _btnManagePaths;
         private readonly IosDotStatusLabel _lblAppDetectStatus;
+        private readonly IosCardLayoutPanel _wfpPanel;
+        private readonly Label _lblWfpHeader;
+        private readonly FlowLayoutPanel _wfpFlow;
         private readonly IosToggleSwitch _chkWfpEnabled;
         private readonly IosToggleSwitch _chkWfpKillOnBlock;
         private readonly IosToggleSwitch _chkWfpBlockNonTunDns;
+        private readonly IosCardLayoutPanel _alertLogPanel;
+        private readonly Label _lblAlertHeader;
+        private readonly TableLayoutPanel _alertTopRow;
         private readonly IosToggleSwitch _chkPopupOnBlock;
+        private readonly FlowLayoutPanel _themeFlow;
+        private readonly Label _lblThemeHeader;
+        private readonly IosSegmentedControl _segTheme;
+        private readonly Label _lblLogDirHeader;
         private readonly IosDotStatusLabel _lblWfpStatus;
         private readonly IosTextBox _txtLogDir;
         private readonly IosButton _btnChangeLogDir;
         private readonly IosButton _btnResetLogDir;
         private readonly IosButton _btnViewLogs;
+        private readonly IosCardLayoutPanel _nodeCard;
+        private readonly TableLayoutPanel _nodeHeaderRow;
+        private readonly FlowLayoutPanel _nodeToggleFlow;
         private readonly IosToggleSwitch _chkEnabled;
+        private readonly Label _lblNodeGuardSub;
+        private readonly IosRoundedContainer _clashStatusBox;
         private readonly IosDotStatusLabel _lblClashStatus;
         private readonly IosButton _btnRefresh;
+        private readonly TableLayoutPanel _rulePanel;
+        private readonly Label _lblGroup;
         private readonly IosComboBox _cmbProxyGroup;
+        private readonly Label _lblMatch;
         private readonly IosSegmentedControl _segMatchMode;
+        private readonly Label _lblGroupHint;
+        private readonly TableLayoutPanel _transfer;
 
         // Left pane (Available subscription nodes)
+        private readonly IosCardLayoutPanel _leftPane;
+        private readonly FlowLayoutPanel _leftHeaderFlow;
+        private readonly Label _lblAvailTitle;
         private readonly IosPillBadge _badgeAvailableCount;
+        private readonly Label _lblProfile;
         private readonly IosComboBox _cmbProfileFilter;
         private readonly IosTextBox _txtLeftSearch;
         private readonly IosListBox _lstAvailable;
+        private readonly Label _lblLeftHint;
 
         // Center transfer buttons
+        private readonly TableLayoutPanel _midPanel;
         private readonly IosButton _btnMoveRight;
         private readonly IosButton _btnMoveAllRight;
         private readonly IosButton _btnMoveLeft;
         private readonly IosButton _btnMoveAllLeft;
 
         // Right pane (Allowed nodes / keywords)
+        private readonly IosCardLayoutPanel _rightPane;
+        private readonly FlowLayoutPanel _rightHeaderFlow;
+        private readonly Label _lblAllowTitle;
         private readonly IosPillBadge _badgeAllowedCount;
         private readonly IosButton _btnAddCurrent;
         private readonly IosTextBox _txtRightSearch;
@@ -18371,6 +19054,8 @@ namespace TunGuard
         private readonly IosButton _btnAddCustom;
 
         private readonly IosStatusBanner _previewBanner;
+        private readonly TableLayoutPanel _footerPanel;
+        private readonly FlowLayoutPanel _footerRight;
         private readonly GitHubIconButton _btnGitHub;
         private readonly IosPillBadge _lblVersion;
         private readonly IosButton _btnCheckUpdate;
@@ -18396,7 +19081,11 @@ namespace TunGuard
         private bool _suppressFilterEvents;
         private bool _suppressAppToggleEvents;
         private bool _suppressNodeToggleEvents;
+        private bool _suppressThemeEvents;
+        private bool _updatingScrollLayout;
+        private IosStatusTone _updateStatusTone = IosStatusTone.Neutral;
         private string _draftLogDirectory = string.Empty;
+        private string _draftThemeMode = IosTheme.ThemeModeSystem;
 
         public NodeGuardConfig ResultConfig { get; private set; }
 
@@ -18407,6 +19096,7 @@ namespace TunGuard
             Func<TunStatus> statusProvider,
             Func<bool, AppPathDiagnostics> pathDiagnosticsProvider,
             Action onOpenLogViewer,
+            Action<string> onThemeModeChanged,
             ApplyUpdateCallback onApplyUpdate,
             Icon windowIcon)
         {
@@ -18415,6 +19105,7 @@ namespace TunGuard
             _statusProvider = statusProvider;
             _pathDiagnosticsProvider = pathDiagnosticsProvider;
             _onOpenLogViewer = onOpenLogViewer;
+            _onThemeModeChanged = onThemeModeChanged;
             _onApplyUpdate = onApplyUpdate;
             _toolTip = new ToolTip();
             _searchDebounceTimer = new System.Windows.Forms.Timer { Interval = 80 };
@@ -18429,6 +19120,7 @@ namespace TunGuard
             _draftCustomAppPaths = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             NodeGuardConfig.CopyNormalizedAppPathMap(cfg.CustomAppPaths, _draftCustomAppPaths);
             _draftLogDirectory = cfg.LogDirectory ?? string.Empty;
+            _draftThemeMode = IosTheme.NormalizeThemeMode(cfg.ThemeMode);
             for (int i = 0; i < cfg.AllowedNodes.Count; i++)
             {
                 AddSelectionInternal(cfg.AllowedNodes[i]);
@@ -18445,8 +19137,8 @@ namespace TunGuard
             _badgeFont = IosTheme.CreateFont(8f, FontStyle.Bold);
             _primaryBtnFont = IosTheme.CreateFont(9f, FontStyle.Bold);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(940, 850);
-            MinimumSize = new Size(840, 710);
+            ClientSize = new Size(940, 880);
+            MinimumSize = new Size(840, 620);
             MaximizeBox = true;
             MinimizeBox = false;
             if (windowIcon != null)
@@ -18455,24 +19147,44 @@ namespace TunGuard
             }
             HandleCreated += (s, e) => IosTheme.ApplyWindowChrome(this, IosTheme.CanvasBg, true);
 
-            TableLayoutPanel root = new TableLayoutPanel
+            _root = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 6,
+                RowCount = 3,
                 BackColor = IosTheme.CanvasBg,
-                Padding = new Padding(16, 12, 16, 14)
+                Padding = new Padding(16, 10, 16, 12)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 0: Guarded apps card
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 1: WFP kernel card
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 2: Alert & logs card
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 3: Unified Clash node guard card
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 4: Live preview banner
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 5: Footer bar
+            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 0: Scrollable cards host
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 1: Live preview banner
+            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 2: Footer bar
+
+            _scrollHost = new IosScrollHostPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = IosTheme.CanvasBg,
+                Margin = new Padding(0, 0, 0, 7)
+            };
+            _scrollHost.SizeChanged += (s, e) => UpdateTransferMinHeightsAndLayout();
+
+            _cardsPanel = new TableLayoutPanel
+            {
+                Location = new Point(0, 0),
+                ColumnCount = 1,
+                RowCount = 4,
+                BackColor = IosTheme.CanvasBg,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+            _cardsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _cardsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 0: Guarded apps card
+            _cardsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 1: WFP kernel card
+            _cardsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // 2: Alert, theme & logs card
+            _cardsPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 3: Unified Clash node guard card
 
             // Card 0: Guarded target apps selector + auto-detection status
-            IosCardLayoutPanel targetAppsPanel = new IosCardLayoutPanel
+            _targetAppsPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -18480,16 +19192,16 @@ namespace TunGuard
                 ColumnCount = 3,
                 RowCount = 2,
                 DividerAfterRows = new int[] { 0 },
-                Padding = new Padding(14, 9, 14, 8),
-                Margin = new Padding(0, 0, 0, 9)
+                Padding = new Padding(14, 8, 14, 7),
+                Margin = new Padding(0, 0, 0, 7)
             };
-            targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            targetAppsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            targetAppsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _targetAppsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _targetAppsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _targetAppsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-            Label lblTargetApps = new Label
+            _lblTargetApps = new Label
             {
                 Text = "受控应用",
                 AutoSize = true,
@@ -18500,7 +19212,7 @@ namespace TunGuard
                 Margin = new Padding(0, 0, 12, 7)
             };
 
-            FlowLayoutPanel targetAppsFlow = new FlowLayoutPanel
+            _targetAppsFlow = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -18537,7 +19249,7 @@ namespace TunGuard
             _toolTip.SetToolTip(_chkGuardClaude, "拦截 Claude / Claude Code 桌面端（Claude.exe 及 MSIX 包组件，不影响 VS Code 插件或命令行 CLI）");
             _chkGuardClaude.CheckedChanged += OnTargetAppCheckedChanged;
 
-            FlowLayoutPanel targetAppsButtons = new FlowLayoutPanel
+            _targetAppsButtons = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -18565,8 +19277,8 @@ namespace TunGuard
             _toolTip.SetToolTip(_btnManagePaths, "查看本机已自动发现的受控程序与 MSIX 包，或手动添加绿色版目录、自定义 .exe（应对软件更新改名或换电脑）");
             _btnManagePaths.Click += OnManagePathsClick;
 
-            targetAppsButtons.Controls.Add(_btnAutoDetectApps);
-            targetAppsButtons.Controls.Add(_btnManagePaths);
+            _targetAppsButtons.Controls.Add(_btnAutoDetectApps);
+            _targetAppsButtons.Controls.Add(_btnManagePaths);
 
             _lblAppDetectStatus = new IosDotStatusLabel
             {
@@ -18579,20 +19291,20 @@ namespace TunGuard
                 Margin = new Padding(0, 6, 0, 0)
             };
 
-            targetAppsFlow.Controls.Add(_chkGuardAntigravity);
-            targetAppsFlow.Controls.Add(_chkGuardChatGPT);
-            targetAppsFlow.Controls.Add(_chkGuardClaude);
+            _targetAppsFlow.Controls.Add(_chkGuardAntigravity);
+            _targetAppsFlow.Controls.Add(_chkGuardChatGPT);
+            _targetAppsFlow.Controls.Add(_chkGuardClaude);
 
-            targetAppsPanel.Controls.Add(lblTargetApps, 0, 0);
-            targetAppsPanel.Controls.Add(targetAppsFlow, 1, 0);
-            targetAppsPanel.Controls.Add(targetAppsButtons, 2, 0);
-            targetAppsPanel.Controls.Add(_lblAppDetectStatus, 0, 1);
-            targetAppsPanel.SetColumnSpan(_lblAppDetectStatus, 3);
-            root.Controls.Add(targetAppsPanel, 0, 0);
+            _targetAppsPanel.Controls.Add(_lblTargetApps, 0, 0);
+            _targetAppsPanel.Controls.Add(_targetAppsFlow, 1, 0);
+            _targetAppsPanel.Controls.Add(_targetAppsButtons, 2, 0);
+            _targetAppsPanel.Controls.Add(_lblAppDetectStatus, 0, 1);
+            _targetAppsPanel.SetColumnSpan(_lblAppDetectStatus, 3);
+            _cardsPanel.Controls.Add(_targetAppsPanel, 0, 0);
             UpdateManagePathsButtonText();
 
             // Card 1: WFP kernel kill switch settings
-            IosCardLayoutPanel wfpPanel = new IosCardLayoutPanel
+            _wfpPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -18600,15 +19312,15 @@ namespace TunGuard
                 ColumnCount = 2,
                 RowCount = 2,
                 DividerAfterRows = new int[] { 0 },
-                Padding = new Padding(14, 9, 14, 8),
-                Margin = new Padding(0, 0, 0, 9)
+                Padding = new Padding(14, 8, 14, 7),
+                Margin = new Padding(0, 0, 0, 7)
             };
-            wfpPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            wfpPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            wfpPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            wfpPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _wfpPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _wfpPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _wfpPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _wfpPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-            Label lblWfpHeader = new Label
+            _lblWfpHeader = new Label
             {
                 Text = "内核断网",
                 AutoSize = true,
@@ -18619,7 +19331,7 @@ namespace TunGuard
                 Margin = new Padding(0, 0, 12, 7)
             };
 
-            FlowLayoutPanel wfpFlow = new FlowLayoutPanel
+            _wfpFlow = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -18661,9 +19373,9 @@ namespace TunGuard
             _toolTip.SetToolTip(_chkWfpBlockNonTunDns, "阻断系统 dnscache 等所有进程经非 TUN 网卡发出的 UDP/TCP 53 端口 DNS 查询（自动放行 Loopback、TUN 与 Mihomo 内核；仅在 Clash TUN 开启 DNS 劫持时建议启用）。");
             _chkWfpBlockNonTunDns.CheckedChanged += OnWfpOptionChanged;
 
-            wfpFlow.Controls.Add(_chkWfpEnabled);
-            wfpFlow.Controls.Add(_chkWfpKillOnBlock);
-            wfpFlow.Controls.Add(_chkWfpBlockNonTunDns);
+            _wfpFlow.Controls.Add(_chkWfpEnabled);
+            _wfpFlow.Controls.Add(_chkWfpKillOnBlock);
+            _wfpFlow.Controls.Add(_chkWfpBlockNonTunDns);
 
             _lblWfpStatus = new IosDotStatusLabel
             {
@@ -18676,14 +19388,14 @@ namespace TunGuard
                 Margin = new Padding(0, 6, 0, 0)
             };
 
-            wfpPanel.Controls.Add(lblWfpHeader, 0, 0);
-            wfpPanel.Controls.Add(wfpFlow, 1, 0);
-            wfpPanel.Controls.Add(_lblWfpStatus, 0, 1);
-            wfpPanel.SetColumnSpan(_lblWfpStatus, 2);
-            root.Controls.Add(wfpPanel, 0, 1);
+            _wfpPanel.Controls.Add(_lblWfpHeader, 0, 0);
+            _wfpPanel.Controls.Add(_wfpFlow, 1, 0);
+            _wfpPanel.Controls.Add(_lblWfpStatus, 0, 1);
+            _wfpPanel.SetColumnSpan(_lblWfpStatus, 2);
+            _cardsPanel.Controls.Add(_wfpPanel, 0, 1);
 
-            // Card 2: On-screen alert popup & logging directory settings
-            IosCardLayoutPanel alertLogPanel = new IosCardLayoutPanel
+            // Card 2: On-screen alert popup, appearance theme & logging directory settings
+            _alertLogPanel = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -18691,18 +19403,18 @@ namespace TunGuard
                 ColumnCount = 5,
                 RowCount = 2,
                 DividerAfterRows = new int[] { 0 },
-                Padding = new Padding(14, 9, 14, 9),
-                Margin = new Padding(0, 0, 0, 9)
+                Padding = new Padding(14, 8, 14, 8),
+                Margin = new Padding(0, 0, 0, 7)
             };
-            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            alertLogPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            alertLogPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _alertLogPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _alertLogPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _alertLogPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-            Label lblAlertHeader = new Label
+            _lblAlertHeader = new Label
             {
                 Text = "弹窗提示",
                 AutoSize = true,
@@ -18713,17 +19425,68 @@ namespace TunGuard
                 Margin = new Padding(0, 0, 12, 7)
             };
 
+            _alertTopRow = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                ColumnCount = 2,
+                RowCount = 1,
+                BackColor = IosTheme.CardBg,
+                Margin = new Padding(0, 0, 0, 7)
+            };
+            _alertTopRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _alertTopRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _alertTopRow.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
             _chkPopupOnBlock = new IosToggleSwitch
             {
                 Text = "未匹配节点或 TUN 关闭时打开受控软件，在屏幕弹出置顶提示",
                 Compact = true,
                 Checked = cfg.PopupOnBlock,
                 Anchor = AnchorStyles.Left,
-                Margin = new Padding(0, 0, 0, 7)
+                Margin = new Padding(0, 2, 10, 0)
             };
             _toolTip.SetToolTip(_chkPopupOnBlock, "在节点不匹配或 TUN 关闭状态下打开受控应用（或运行中被拦截）时，在屏幕上方弹出醒目的置顶提示卡片，不再仅依赖易被系统屏蔽的托盘气泡。");
 
-            Label lblLogDirHeader = new Label
+            _themeFlow = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Anchor = AnchorStyles.Right,
+                WrapContents = false,
+                BackColor = IosTheme.CardBg,
+                Margin = new Padding(0)
+            };
+
+            _lblThemeHeader = new Label
+            {
+                Text = "外观",
+                AutoSize = true,
+                Font = _boldHeaderFont,
+                ForeColor = IosTheme.TextSecondary,
+                BackColor = IosTheme.CardBg,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 8, 0)
+            };
+
+            _segTheme = new IosSegmentedControl
+            {
+                Segments = new string[] { "跟随系统", "浅色", "深色" },
+                SelectedIndex = ThemeModeToSegmentIndex(_draftThemeMode),
+                Size = new Size(188, 26),
+                Margin = new Padding(0)
+            };
+            _toolTip.SetToolTip(_segTheme, "立即切换界面浅色/深色外观或跟随 Windows 系统深色模式，自动保存");
+            _segTheme.SelectedIndexChanged += OnThemeSegmentChanged;
+
+            _themeFlow.Controls.Add(_lblThemeHeader);
+            _themeFlow.Controls.Add(_segTheme);
+
+            _alertTopRow.Controls.Add(_chkPopupOnBlock, 0, 0);
+            _alertTopRow.Controls.Add(_themeFlow, 1, 0);
+
+            _lblLogDirHeader = new Label
             {
                 Text = "日志目录",
                 AutoSize = true,
@@ -18781,35 +19544,35 @@ namespace TunGuard
                 }
             };
 
-            alertLogPanel.Controls.Add(lblAlertHeader, 0, 0);
-            alertLogPanel.Controls.Add(_chkPopupOnBlock, 1, 0);
-            alertLogPanel.SetColumnSpan(_chkPopupOnBlock, 4);
-            alertLogPanel.Controls.Add(lblLogDirHeader, 0, 1);
-            alertLogPanel.Controls.Add(_txtLogDir, 1, 1);
-            alertLogPanel.Controls.Add(_btnChangeLogDir, 2, 1);
-            alertLogPanel.Controls.Add(_btnResetLogDir, 3, 1);
-            alertLogPanel.Controls.Add(_btnViewLogs, 4, 1);
-            root.Controls.Add(alertLogPanel, 0, 2);
+            _alertLogPanel.Controls.Add(_lblAlertHeader, 0, 0);
+            _alertLogPanel.Controls.Add(_alertTopRow, 1, 0);
+            _alertLogPanel.SetColumnSpan(_alertTopRow, 4);
+            _alertLogPanel.Controls.Add(_lblLogDirHeader, 0, 1);
+            _alertLogPanel.Controls.Add(_txtLogDir, 1, 1);
+            _alertLogPanel.Controls.Add(_btnChangeLogDir, 2, 1);
+            _alertLogPanel.Controls.Add(_btnResetLogDir, 3, 1);
+            _alertLogPanel.Controls.Add(_btnViewLogs, 4, 1);
+            _cardsPanel.Controls.Add(_alertLogPanel, 0, 2);
             UpdateLogDirectoryDisplay();
 
             // Card 3: Unified Clash Node Guard section
-            IosCardLayoutPanel nodeCard = new IosCardLayoutPanel
+            _nodeCard = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
                 RowCount = 4,
                 DividerAfterRows = new int[] { 0 },
-                Padding = new Padding(14, 9, 14, 12),
-                Margin = new Padding(0, 0, 0, 9)
+                Padding = new Padding(14, 8, 14, 10),
+                Margin = new Padding(0)
             };
-            nodeCard.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            nodeCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 0: Master switch + Refresh button
-            nodeCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 1: Live Clash status pill
-            nodeCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 2: Proxy group & match mode
-            nodeCard.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 3: Transfer panes
+            _nodeCard.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _nodeCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 0: Master switch + Refresh button
+            _nodeCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 1: Live Clash status pill
+            _nodeCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 2: Proxy group & match mode
+            _nodeCard.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 3: Transfer panes
 
             // Node card row 0: Header with master switch
-            TableLayoutPanel nodeHeaderRow = new TableLayoutPanel
+            _nodeHeaderRow = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -18819,10 +19582,10 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(0, 0, 0, 7)
             };
-            nodeHeaderRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            nodeHeaderRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _nodeHeaderRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _nodeHeaderRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            FlowLayoutPanel nodeToggleFlow = new FlowLayoutPanel
+            _nodeToggleFlow = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -18845,7 +19608,7 @@ namespace TunGuard
             _toolTip.SetToolTip(_chkEnabled, "需先在下方右侧「已允许的节点 / 关键词」中选入至少 1 项；选入后将自动勾选，也可手动取消勾选");
             _chkEnabled.CheckedChanged += OnRuleInputChanged;
 
-            Label lblNodeGuardSub = new Label
+            _lblNodeGuardSub = new Label
             {
                 Text = "未使用右侧允许节点时立即触发内核断网/拦截",
                 AutoSize = true,
@@ -18856,8 +19619,8 @@ namespace TunGuard
                 Margin = new Padding(0, 4, 0, 0)
             };
 
-            nodeToggleFlow.Controls.Add(_chkEnabled);
-            nodeToggleFlow.Controls.Add(lblNodeGuardSub);
+            _nodeToggleFlow.Controls.Add(_chkEnabled);
+            _nodeToggleFlow.Controls.Add(_lblNodeGuardSub);
 
             _btnRefresh = new IosButton
             {
@@ -18868,12 +19631,12 @@ namespace TunGuard
             };
             _btnRefresh.Click += (s, e) => RefreshCatalogAsync();
 
-            nodeHeaderRow.Controls.Add(nodeToggleFlow, 0, 0);
-            nodeHeaderRow.Controls.Add(_btnRefresh, 1, 0);
-            nodeCard.Controls.Add(nodeHeaderRow, 0, 0);
+            _nodeHeaderRow.Controls.Add(_nodeToggleFlow, 0, 0);
+            _nodeHeaderRow.Controls.Add(_btnRefresh, 1, 0);
+            _nodeCard.Controls.Add(_nodeHeaderRow, 0, 0);
 
             // Node card row 1: Live Clash status strip
-            IosRoundedContainer clashStatusBox = new IosRoundedContainer
+            _clashStatusBox = new IosRoundedContainer
             {
                 Dock = DockStyle.Fill,
                 Height = 29,
@@ -18892,11 +19655,11 @@ namespace TunGuard
                 ForeColor = IosTheme.TextSecondary,
                 DotColor = IosTheme.TextTertiary
             };
-            clashStatusBox.Controls.Add(_lblClashStatus);
-            nodeCard.Controls.Add(clashStatusBox, 0, 1);
+            _clashStatusBox.Controls.Add(_lblClashStatus);
+            _nodeCard.Controls.Add(_clashStatusBox, 0, 1);
 
             // Node card row 2: Proxy group & match mode
-            TableLayoutPanel rulePanel = new TableLayoutPanel
+            _rulePanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -18906,12 +19669,12 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(0, 0, 0, 9)
             };
-            rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44f));
-            rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 56f));
+            _rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44f));
+            _rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _rulePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 56f));
 
-            Label lblGroup = new Label
+            _lblGroup = new Label
             {
                 Text = "监控代理组",
                 AutoSize = true,
@@ -18926,7 +19689,7 @@ namespace TunGuard
                 DropDownStyle = ComboBoxStyle.DropDown,
                 Dock = DockStyle.Fill,
                 OuterBackColor = IosTheme.CardBg,
-                SurfaceColor = Color.White,
+                SurfaceColor = IosTheme.InputWhiteBg,
                 Margin = new Padding(0, 1, 14, 1)
             };
             _cmbProxyGroup.Items.Add(AutoGroupLabel);
@@ -18934,7 +19697,7 @@ namespace TunGuard
             _cmbProxyGroup.TextChanged += OnRuleInputChanged;
             _cmbProxyGroup.SelectedIndexChanged += OnRuleInputChanged;
 
-            Label lblMatch = new Label
+            _lblMatch = new Label
             {
                 Text = "匹配方式",
                 AutoSize = true,
@@ -18955,26 +19718,29 @@ namespace TunGuard
             };
             _segMatchMode.SelectedIndexChanged += OnRuleInputChanged;
 
-            Label lblGroupHint = new Label
+            _lblGroupHint = new Label
             {
                 Text = "默认自动跟踪：Rule 看 MATCH 主组（MATCH=DIRECT 黑名单模式自动跟踪唯一代理组），Global 看 GLOBAL，Direct 直接拦截。",
-                AutoSize = true,
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                Height = Math.Max(18, _hintFont.Height + 3),
+                AutoEllipsis = true,
                 Font = _hintFont,
                 ForeColor = IosTheme.TextTertiary,
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(0, 4, 0, 0)
             };
 
-            rulePanel.Controls.Add(lblGroup, 0, 0);
-            rulePanel.Controls.Add(_cmbProxyGroup, 1, 0);
-            rulePanel.Controls.Add(lblMatch, 2, 0);
-            rulePanel.Controls.Add(_segMatchMode, 3, 0);
-            rulePanel.Controls.Add(lblGroupHint, 0, 1);
-            rulePanel.SetColumnSpan(lblGroupHint, 4);
-            nodeCard.Controls.Add(rulePanel, 0, 2);
+            _rulePanel.Controls.Add(_lblGroup, 0, 0);
+            _rulePanel.Controls.Add(_cmbProxyGroup, 1, 0);
+            _rulePanel.Controls.Add(_lblMatch, 2, 0);
+            _rulePanel.Controls.Add(_segMatchMode, 3, 0);
+            _rulePanel.Controls.Add(_lblGroupHint, 0, 1);
+            _rulePanel.SetColumnSpan(_lblGroupHint, 4);
+            _nodeCard.Controls.Add(_rulePanel, 0, 2);
 
             // Node card row 3: Transfer Box (Left pane | Transfer buttons | Right pane)
-            TableLayoutPanel transfer = new TableLayoutPanel
+            _transfer = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 3,
@@ -18982,13 +19748,13 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(0)
             };
-            transfer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
-            transfer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            transfer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
-            transfer.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            _transfer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            _transfer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _transfer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            _transfer.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
             // --- Left Pane ---
-            IosCardLayoutPanel leftPane = new IosCardLayoutPanel
+            _leftPane = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
@@ -19001,15 +19767,15 @@ namespace TunGuard
                 Padding = new Padding(10, 9, 10, 9),
                 Margin = new Padding(0)
             };
-            leftPane.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            leftPane.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
-            leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // profile filter
-            leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // search
-            leftPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // list
-            leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // hint
+            _leftPane.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _leftPane.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
+            _leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // profile filter
+            _leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // search
+            _leftPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // list
+            _leftPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // hint
 
-            FlowLayoutPanel leftHeaderFlow = new FlowLayoutPanel
+            _leftHeaderFlow = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -19018,7 +19784,7 @@ namespace TunGuard
                 BackColor = IosTheme.CardInsetBg,
                 Margin = new Padding(0, 0, 0, 6)
             };
-            Label lblAvailTitle = new Label
+            _lblAvailTitle = new Label
             {
                 Text = "可选订阅节点",
                 AutoSize = true,
@@ -19036,10 +19802,10 @@ namespace TunGuard
                 PillForeColor = IosTheme.TextSecondary,
                 Margin = new Padding(0)
             };
-            leftHeaderFlow.Controls.Add(lblAvailTitle);
-            leftHeaderFlow.Controls.Add(_badgeAvailableCount);
+            _leftHeaderFlow.Controls.Add(_lblAvailTitle);
+            _leftHeaderFlow.Controls.Add(_badgeAvailableCount);
 
-            Label lblProfile = new Label
+            _lblProfile = new Label
             {
                 Text = "订阅",
                 AutoSize = true,
@@ -19053,7 +19819,7 @@ namespace TunGuard
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Dock = DockStyle.Fill,
                 OuterBackColor = IosTheme.CardInsetBg,
-                SurfaceColor = Color.White,
+                SurfaceColor = IosTheme.InputWhiteBg,
                 Margin = new Padding(0, 0, 0, 6)
             };
             _cmbProfileFilter.SelectedIndexChanged += (s, e) =>
@@ -19072,7 +19838,7 @@ namespace TunGuard
                 ShowClearButton = true,
                 PlaceholderText = "搜索节点名、协议或订阅...",
                 OuterBackColor = IosTheme.CardInsetBg,
-                SurfaceColor = Color.White,
+                SurfaceColor = IosTheme.InputWhiteBg,
                 Margin = new Padding(0, 0, 0, 6)
             };
             _txtLeftSearch.TextChanged += OnSearchTextChanged;
@@ -19088,7 +19854,7 @@ namespace TunGuard
             _lstAvailable.SelectedIndexChanged += (s, e) => UpdateTransferButtonStates();
             _lstAvailable.DoubleClick += (s, e) => MoveSelectedRight();
 
-            Label lblLeftHint = new Label
+            _lblLeftHint = new Label
             {
                 Text = "支持 Ctrl / Shift 多选，双击节点可直接移入右侧",
                 AutoSize = true,
@@ -19098,19 +19864,19 @@ namespace TunGuard
                 Margin = new Padding(2, 0, 0, 0)
             };
 
-            leftPane.Controls.Add(leftHeaderFlow, 0, 0);
-            leftPane.SetColumnSpan(leftHeaderFlow, 2);
-            leftPane.Controls.Add(lblProfile, 0, 1);
-            leftPane.Controls.Add(_cmbProfileFilter, 1, 1);
-            leftPane.Controls.Add(_txtLeftSearch, 0, 2);
-            leftPane.SetColumnSpan(_txtLeftSearch, 2);
-            leftPane.Controls.Add(_lstAvailable, 0, 3);
-            leftPane.SetColumnSpan(_lstAvailable, 2);
-            leftPane.Controls.Add(lblLeftHint, 0, 4);
-            leftPane.SetColumnSpan(lblLeftHint, 2);
+            _leftPane.Controls.Add(_leftHeaderFlow, 0, 0);
+            _leftPane.SetColumnSpan(_leftHeaderFlow, 2);
+            _leftPane.Controls.Add(_lblProfile, 0, 1);
+            _leftPane.Controls.Add(_cmbProfileFilter, 1, 1);
+            _leftPane.Controls.Add(_txtLeftSearch, 0, 2);
+            _leftPane.SetColumnSpan(_txtLeftSearch, 2);
+            _leftPane.Controls.Add(_lstAvailable, 0, 3);
+            _leftPane.SetColumnSpan(_lstAvailable, 2);
+            _leftPane.Controls.Add(_lblLeftHint, 0, 4);
+            _leftPane.SetColumnSpan(_lblLeftHint, 2);
 
             // --- Center Transfer Buttons ---
-            TableLayoutPanel midPanel = new TableLayoutPanel
+            _midPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -19120,13 +19886,13 @@ namespace TunGuard
                 BackColor = IosTheme.CardBg,
                 Margin = new Padding(8, 0, 8, 0)
             };
-            midPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            midPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
-            midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            midPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+            _midPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _midPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+            _midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _midPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _midPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
 
             _btnMoveRight = CreateTransferButton(">", "将左侧选中节点移入允许列表");
             _btnMoveRight.Click += (s, e) => MoveSelectedRight();
@@ -19140,13 +19906,13 @@ namespace TunGuard
             _btnMoveAllLeft = CreateTransferButton("<<", "清空右侧所有允许节点");
             _btnMoveAllLeft.Click += (s, e) => MoveAllLeft();
 
-            midPanel.Controls.Add(_btnMoveRight, 0, 1);
-            midPanel.Controls.Add(_btnMoveAllRight, 0, 2);
-            midPanel.Controls.Add(_btnMoveLeft, 0, 3);
-            midPanel.Controls.Add(_btnMoveAllLeft, 0, 4);
+            _midPanel.Controls.Add(_btnMoveRight, 0, 1);
+            _midPanel.Controls.Add(_btnMoveAllRight, 0, 2);
+            _midPanel.Controls.Add(_btnMoveLeft, 0, 3);
+            _midPanel.Controls.Add(_btnMoveAllLeft, 0, 4);
 
             // --- Right Pane ---
-            IosCardLayoutPanel rightPane = new IosCardLayoutPanel
+            _rightPane = new IosCardLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
@@ -19159,15 +19925,15 @@ namespace TunGuard
                 Padding = new Padding(10, 9, 10, 9),
                 Margin = new Padding(0)
             };
-            rightPane.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            rightPane.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
-            rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // quick add current
-            rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // search
-            rightPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // list
-            rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // custom add
+            _rightPane.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _rightPane.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
+            _rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // quick add current
+            _rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // search
+            _rightPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // list
+            _rightPane.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // custom add
 
-            FlowLayoutPanel rightHeaderFlow = new FlowLayoutPanel
+            _rightHeaderFlow = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -19176,7 +19942,7 @@ namespace TunGuard
                 BackColor = IosTheme.CardInsetBg,
                 Margin = new Padding(0, 0, 0, 6)
             };
-            Label lblAllowTitle = new Label
+            _lblAllowTitle = new Label
             {
                 Text = "已允许的节点 / 关键词",
                 AutoSize = true,
@@ -19194,8 +19960,8 @@ namespace TunGuard
                 PillForeColor = IosTheme.GreenText,
                 Margin = new Padding(0)
             };
-            rightHeaderFlow.Controls.Add(lblAllowTitle);
-            rightHeaderFlow.Controls.Add(_badgeAllowedCount);
+            _rightHeaderFlow.Controls.Add(_lblAllowTitle);
+            _rightHeaderFlow.Controls.Add(_badgeAllowedCount);
 
             _btnAddCurrent = new IosButton
             {
@@ -19218,7 +19984,7 @@ namespace TunGuard
                 ShowClearButton = true,
                 PlaceholderText = "筛选已允许的节点...",
                 OuterBackColor = IosTheme.CardInsetBg,
-                SurfaceColor = Color.White,
+                SurfaceColor = IosTheme.InputWhiteBg,
                 Margin = new Padding(0, 0, 0, 6)
             };
             _txtRightSearch.TextChanged += OnSearchTextChanged;
@@ -19240,7 +20006,7 @@ namespace TunGuard
                 Height = 28,
                 PlaceholderText = "输入自定义节点名或关键词，回车添加...",
                 OuterBackColor = IosTheme.CardInsetBg,
-                SurfaceColor = Color.White,
+                SurfaceColor = IosTheme.InputWhiteBg,
                 Margin = new Padding(0, 0, 6, 0)
             };
             _txtCustomNode.KeyDown += (s, e) =>
@@ -19259,24 +20025,26 @@ namespace TunGuard
             };
             _btnAddCustom.Click += (s, e) => AddCustomNodeFromInput();
 
-            rightPane.Controls.Add(rightHeaderFlow, 0, 0);
-            rightPane.SetColumnSpan(rightHeaderFlow, 2);
-            rightPane.Controls.Add(_btnAddCurrent, 0, 1);
-            rightPane.SetColumnSpan(_btnAddCurrent, 2);
-            rightPane.Controls.Add(_txtRightSearch, 0, 2);
-            rightPane.SetColumnSpan(_txtRightSearch, 2);
-            rightPane.Controls.Add(_lstAllowed, 0, 3);
-            rightPane.SetColumnSpan(_lstAllowed, 2);
-            rightPane.Controls.Add(_txtCustomNode, 0, 4);
-            rightPane.Controls.Add(_btnAddCustom, 1, 4);
+            _rightPane.Controls.Add(_rightHeaderFlow, 0, 0);
+            _rightPane.SetColumnSpan(_rightHeaderFlow, 2);
+            _rightPane.Controls.Add(_btnAddCurrent, 0, 1);
+            _rightPane.SetColumnSpan(_btnAddCurrent, 2);
+            _rightPane.Controls.Add(_txtRightSearch, 0, 2);
+            _rightPane.SetColumnSpan(_txtRightSearch, 2);
+            _rightPane.Controls.Add(_lstAllowed, 0, 3);
+            _rightPane.SetColumnSpan(_lstAllowed, 2);
+            _rightPane.Controls.Add(_txtCustomNode, 0, 4);
+            _rightPane.Controls.Add(_btnAddCustom, 1, 4);
 
-            transfer.Controls.Add(leftPane, 0, 0);
-            transfer.Controls.Add(midPanel, 1, 0);
-            transfer.Controls.Add(rightPane, 2, 0);
-            nodeCard.Controls.Add(transfer, 0, 3);
-            root.Controls.Add(nodeCard, 0, 3);
+            _transfer.Controls.Add(_leftPane, 0, 0);
+            _transfer.Controls.Add(_midPanel, 1, 0);
+            _transfer.Controls.Add(_rightPane, 2, 0);
+            _nodeCard.Controls.Add(_transfer, 0, 3);
+            _cardsPanel.Controls.Add(_nodeCard, 0, 3);
+            _scrollHost.Controls.Add(_cardsPanel);
+            _root.Controls.Add(_scrollHost, 0, 0);
 
-            // Row 4: Live preview banner
+            // Row 1: Live preview banner
             _previewBanner = new IosStatusBanner
             {
                 Text = "预览: 正在检测...",
@@ -19284,12 +20052,12 @@ namespace TunGuard
                 Height = 34,
                 Tone = IosStatusTone.Neutral,
                 OuterBackColor = IosTheme.CanvasBg,
-                Margin = new Padding(0, 0, 0, 10)
+                Margin = new Padding(0, 0, 0, 8)
             };
-            root.Controls.Add(_previewBanner, 0, 4);
+            _root.Controls.Add(_previewBanner, 0, 1);
 
-            // Row 5: Footer (left: GitHub icon, version & update actions; right: Save / Cancel)
-            TableLayoutPanel footerPanel = new TableLayoutPanel
+            // Row 2: Footer (left: GitHub icon, version & update actions; right: Save / Cancel)
+            _footerPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoSize = true,
@@ -19299,13 +20067,13 @@ namespace TunGuard
                 BackColor = IosTheme.CanvasBg,
                 Margin = new Padding(0)
             };
-            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 0: GitHub icon
-            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 1: Version pill
-            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 2: Check update button
-            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 3: One-click update button
-            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));// 4: Update status text
-            footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 5: Save / Cancel buttons
-            footerPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 0: GitHub icon
+            _footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 1: Version pill
+            _footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 2: Check update button
+            _footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 3: One-click update button
+            _footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));// 4: Update status text
+            _footerPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));     // 5: Save / Cancel buttons
+            _footerPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             _btnGitHub = new GitHubIconButton
             {
@@ -19362,7 +20130,7 @@ namespace TunGuard
                 Margin = new Padding(2, 0, 10, 0)
             };
 
-            FlowLayoutPanel footerRight = new FlowLayoutPanel
+            _footerRight = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -19399,22 +20167,24 @@ namespace TunGuard
             };
             _btnSave.Click += OnSaveClick;
 
-            footerRight.Controls.Add(_btnCancel);
-            footerRight.Controls.Add(_btnSave);
+            _footerRight.Controls.Add(_btnCancel);
+            _footerRight.Controls.Add(_btnSave);
 
-            footerPanel.Controls.Add(_btnGitHub, 0, 0);
-            footerPanel.Controls.Add(_lblVersion, 1, 0);
-            footerPanel.Controls.Add(_btnCheckUpdate, 2, 0);
-            footerPanel.Controls.Add(_btnOneClickUpdate, 3, 0);
-            footerPanel.Controls.Add(_lblUpdateStatus, 4, 0);
-            footerPanel.Controls.Add(footerRight, 5, 0);
-            root.Controls.Add(footerPanel, 0, 5);
+            _footerPanel.Controls.Add(_btnGitHub, 0, 0);
+            _footerPanel.Controls.Add(_lblVersion, 1, 0);
+            _footerPanel.Controls.Add(_btnCheckUpdate, 2, 0);
+            _footerPanel.Controls.Add(_btnOneClickUpdate, 3, 0);
+            _footerPanel.Controls.Add(_lblUpdateStatus, 4, 0);
+            _footerPanel.Controls.Add(_footerRight, 5, 0);
+            _root.Controls.Add(_footerPanel, 0, 2);
 
-            Controls.Add(root);
+            Controls.Add(_root);
             CancelButton = _btnCancel;
 
+            IosTheme.ThemeChanged += OnThemeChanged;
             Load += (s, e) =>
             {
+                ApplyInitialAndMinWindowBounds();
                 if (_statusProvider != null)
                 {
                     UpdateWfpStatus(_statusProvider());
@@ -19425,6 +20195,393 @@ namespace TunGuard
                 RefreshCatalogAsync();
                 CheckForUpdatesAsync(false);
             };
+            Shown += (s, e) =>
+            {
+                ApplyInitialAndMinWindowBounds();
+                try
+                {
+                    BeginInvoke((Action)ApplyInitialAndMinWindowBounds);
+                }
+                catch
+                {
+                }
+            };
+        }
+
+        private static int ThemeModeToSegmentIndex(string mode)
+        {
+            string norm = IosTheme.NormalizeThemeMode(mode);
+            if (norm == IosTheme.ThemeModeLight) return 1;
+            if (norm == IosTheme.ThemeModeDark) return 2;
+            return 0;
+        }
+
+        private static string SegmentIndexToThemeMode(int index)
+        {
+            if (index == 1) return IosTheme.ThemeModeLight;
+            if (index == 2) return IosTheme.ThemeModeDark;
+            return IosTheme.ThemeModeSystem;
+        }
+
+        private static int MeasureFixedRowsHeight(TableLayoutPanel panel, int skipRowIndex)
+        {
+            int[] rowHeights = panel.GetRowHeights();
+            int sum = panel.Padding.Vertical;
+            for (int i = 0; i < rowHeights.Length; i++)
+            {
+                if (i != skipRowIndex)
+                {
+                    sum += rowHeights[i];
+                }
+            }
+            return sum;
+        }
+
+        private int UpdateTransferMinHeightsAndLayout()
+        {
+            if (_updatingScrollLayout || IsDisposed)
+            {
+                return 0;
+            }
+            _updatingScrollLayout = true;
+            try
+            {
+                int minListH = _lstAvailable.GetMinimumHeightForRows(MinTransferVisibleRows);
+                if (_lstAvailable.MinimumSize.Height != minListH)
+                {
+                    _lstAvailable.MinimumSize = new Size(0, minListH);
+                }
+                if (_lstAllowed.MinimumSize.Height != minListH)
+                {
+                    _lstAllowed.MinimumSize = new Size(0, minListH);
+                }
+
+                // Ensure _cardsPanel has a valid width before reading wrapped/scaled row heights
+                int baseHostW = Math.Max(400, _scrollHost.Width);
+                if (_cardsPanel.Width < 100)
+                {
+                    _cardsPanel.Width = baseHostW;
+                }
+                _cardsPanel.PerformLayout();
+
+                int leftFixedH = MeasureFixedRowsHeight(_leftPane, 3);
+                int rightFixedH = MeasureFixedRowsHeight(_rightPane, 3);
+                int minLeftPaneH = Math.Max(120, leftFixedH) + minListH + _lstAvailable.Margin.Vertical;
+                int minRightPaneH = Math.Max(120, rightFixedH) + minListH + _lstAllowed.Margin.Vertical;
+                int minMidH = _midPanel.GetPreferredSize(Size.Empty).Height + _midPanel.Margin.Vertical;
+                int minTransferH = Math.Max(Math.Max(minLeftPaneH, minRightPaneH), minMidH);
+
+                if (_leftPane.MinimumSize.Height != minLeftPaneH)
+                {
+                    _leftPane.MinimumSize = new Size(0, minLeftPaneH);
+                }
+                if (_rightPane.MinimumSize.Height != minRightPaneH)
+                {
+                    _rightPane.MinimumSize = new Size(0, minRightPaneH);
+                }
+                if (_transfer.MinimumSize.Height != minTransferH)
+                {
+                    _transfer.MinimumSize = new Size(0, minTransferH);
+                }
+
+                int nodeCardFixedH = MeasureFixedRowsHeight(_nodeCard, 3);
+                int minNodeCardH = Math.Max(120, nodeCardFixedH) + minTransferH + _transfer.Margin.Vertical;
+                if (_nodeCard.MinimumSize.Height != minNodeCardH)
+                {
+                    _nodeCard.MinimumSize = new Size(0, minNodeCardH);
+                }
+
+                int cardsFixedH = MeasureFixedRowsHeight(_cardsPanel, 3);
+                int minCardsH = Math.Max(200, cardsFixedH) + minNodeCardH + _nodeCard.Margin.Vertical;
+
+                int hostH = _scrollHost.Height;
+                bool needScroll = hostH > 0 && hostH < minCardsH;
+                if (!needScroll)
+                {
+                    if (_scrollHost.AutoScroll)
+                    {
+                        _scrollHost.AutoScrollPosition = Point.Empty;
+                        _scrollHost.AutoScroll = false;
+                    }
+                    int targetW = Math.Max(100, _scrollHost.ClientSize.Width);
+                    int targetH = Math.Max(Math.Max(100, _scrollHost.ClientSize.Height), minCardsH);
+                    if (_cardsPanel.Location != Point.Empty)
+                    {
+                        _cardsPanel.Location = Point.Empty;
+                    }
+                    if (_cardsPanel.Width != targetW || _cardsPanel.Height != targetH)
+                    {
+                        _cardsPanel.Size = new Size(targetW, targetH);
+                    }
+                }
+                else
+                {
+                    if (!_scrollHost.AutoScroll)
+                    {
+                        _scrollHost.AutoScroll = true;
+                    }
+                    int targetW = Math.Max(100, _scrollHost.Width - SystemInformation.VerticalScrollBarWidth - 2);
+                    int targetH = minCardsH;
+                    if (_cardsPanel.Width != targetW || _cardsPanel.Height != targetH)
+                    {
+                        _cardsPanel.Size = new Size(targetW, targetH);
+                    }
+                }
+                return minCardsH;
+            }
+            finally
+            {
+                _updatingScrollLayout = false;
+            }
+        }
+
+        private void ApplyInitialAndMinWindowBounds()
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            PerformLayout();
+            int minCardsH = UpdateTransferMinHeightsAndLayout();
+            if (minCardsH <= 0)
+            {
+                return;
+            }
+
+            Rectangle workArea = Screen.FromControl(this).WorkingArea;
+            int chromeH = Math.Max(0, Height - ClientSize.Height);
+            int rootFixedH = MeasureFixedRowsHeight(_root, 0);
+            int idealMinFormH = chromeH + rootFixedH + _scrollHost.Margin.Vertical + minCardsH + 4;
+            int maxScreenFormH = Math.Max(520, workArea.Height - 24);
+            int clampedMinFormH = Math.Min(idealMinFormH, maxScreenFormH);
+
+            if (MinimumSize.Height != clampedMinFormH)
+            {
+                MinimumSize = new Size(MinimumSize.Width, clampedMinFormH);
+            }
+            if (Height > maxScreenFormH)
+            {
+                Height = maxScreenFormH;
+                int centeredY = workArea.Top + Math.Max(0, (workArea.Height - Height) / 2);
+                Top = centeredY;
+            }
+            else if (Height < clampedMinFormH)
+            {
+                Height = clampedMinFormH;
+            }
+            UpdateTransferMinHeightsAndLayout();
+        }
+
+        private void OnThemeSegmentChanged(object sender, EventArgs e)
+        {
+            if (_suppressThemeEvents)
+            {
+                return;
+            }
+            string nextMode = SegmentIndexToThemeMode(_segTheme.SelectedIndex);
+            _draftThemeMode = nextMode;
+            IosTheme.SetThemeMode(nextMode);
+            if (_onThemeModeChanged != null)
+            {
+                _onThemeModeChanged(nextMode);
+            }
+        }
+
+        public void SyncThemeMode(string themeMode)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            string norm = IosTheme.NormalizeThemeMode(themeMode);
+            _draftThemeMode = norm;
+            _suppressThemeEvents = true;
+            try
+            {
+                _segTheme.SelectedIndex = ThemeModeToSegmentIndex(norm);
+            }
+            finally
+            {
+                _suppressThemeEvents = false;
+            }
+            ApplyTheme();
+        }
+
+        private void OnThemeChanged(object sender, EventArgs e)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)ApplyTheme); } catch { }
+                return;
+            }
+            ApplyTheme();
+        }
+
+        private void SetUpdateStatusStyle(IosStatusTone tone)
+        {
+            _updateStatusTone = tone;
+            switch (tone)
+            {
+                case IosStatusTone.Success:
+                    _lblUpdateStatus.ForeColor = IosTheme.GreenText;
+                    break;
+                case IosStatusTone.Warning:
+                    _lblUpdateStatus.ForeColor = IosTheme.OrangeText;
+                    break;
+                case IosStatusTone.Danger:
+                    _lblUpdateStatus.ForeColor = IosTheme.RedText;
+                    break;
+                case IosStatusTone.Info:
+                    _lblUpdateStatus.ForeColor = IosTheme.IsDark ? IosTheme.BlueText : IosTheme.Blue;
+                    break;
+                default:
+                    _lblUpdateStatus.ForeColor = IosTheme.TextSecondary;
+                    break;
+            }
+        }
+
+        public void ApplyTheme()
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            BackColor = IosTheme.CanvasBg;
+            ForeColor = IosTheme.TextPrimary;
+            IosTheme.ApplyWindowChrome(this, IosTheme.CanvasBg, true);
+
+            _root.BackColor = IosTheme.CanvasBg;
+            _scrollHost.ApplyTheme(IosTheme.CanvasBg);
+            _cardsPanel.BackColor = IosTheme.CanvasBg;
+
+            // Card 0: Target apps
+            _targetAppsPanel.OuterBackColor = IosTheme.CanvasBg;
+            _targetAppsPanel.CardBackColor = IosTheme.CardBg;
+            _targetAppsPanel.BorderColor = IosTheme.CardBorder;
+            _lblTargetApps.ForeColor = IosTheme.TextPrimary;
+            _lblTargetApps.BackColor = IosTheme.CardBg;
+            _targetAppsFlow.BackColor = IosTheme.CardBg;
+            _targetAppsButtons.BackColor = IosTheme.CardBg;
+
+            // Card 1: WFP
+            _wfpPanel.OuterBackColor = IosTheme.CanvasBg;
+            _wfpPanel.CardBackColor = IosTheme.CardBg;
+            _wfpPanel.BorderColor = IosTheme.CardBorder;
+            _lblWfpHeader.ForeColor = IosTheme.TextPrimary;
+            _lblWfpHeader.BackColor = IosTheme.CardBg;
+            _wfpFlow.BackColor = IosTheme.CardBg;
+
+            // Card 2: Alert, theme & logs
+            _alertLogPanel.OuterBackColor = IosTheme.CanvasBg;
+            _alertLogPanel.CardBackColor = IosTheme.CardBg;
+            _alertLogPanel.BorderColor = IosTheme.CardBorder;
+            _lblAlertHeader.ForeColor = IosTheme.TextPrimary;
+            _lblAlertHeader.BackColor = IosTheme.CardBg;
+            _alertTopRow.BackColor = IosTheme.CardBg;
+            _themeFlow.BackColor = IosTheme.CardBg;
+            _lblThemeHeader.ForeColor = IosTheme.TextSecondary;
+            _lblThemeHeader.BackColor = IosTheme.CardBg;
+            _lblLogDirHeader.ForeColor = IosTheme.TextPrimary;
+            _lblLogDirHeader.BackColor = IosTheme.CardBg;
+            _txtLogDir.ApplyTheme(IosTheme.CardBg, IosTheme.CardInsetBg);
+
+            // Card 3: Node guard
+            _nodeCard.OuterBackColor = IosTheme.CanvasBg;
+            _nodeCard.CardBackColor = IosTheme.CardBg;
+            _nodeCard.BorderColor = IosTheme.CardBorder;
+            _nodeHeaderRow.BackColor = IosTheme.CardBg;
+            _nodeToggleFlow.BackColor = IosTheme.CardBg;
+            _lblNodeGuardSub.ForeColor = IosTheme.TextTertiary;
+            _lblNodeGuardSub.BackColor = IosTheme.CardBg;
+            _clashStatusBox.OuterBackColor = IosTheme.CardBg;
+            _clashStatusBox.FillColor = IosTheme.CardInsetBg;
+            _clashStatusBox.BorderColor = IosTheme.CardBorder;
+            _rulePanel.BackColor = IosTheme.CardBg;
+            _lblGroup.ForeColor = IosTheme.TextSecondary;
+            _lblGroup.BackColor = IosTheme.CardBg;
+            _cmbProxyGroup.ApplyTheme(IosTheme.CardBg, IosTheme.InputWhiteBg);
+            _lblMatch.ForeColor = IosTheme.TextSecondary;
+            _lblMatch.BackColor = IosTheme.CardBg;
+            _lblGroupHint.ForeColor = IosTheme.TextTertiary;
+            _lblGroupHint.BackColor = IosTheme.CardBg;
+            _transfer.BackColor = IosTheme.CardBg;
+
+            // Left pane
+            _leftPane.OuterBackColor = IosTheme.CardBg;
+            _leftPane.CardBackColor = IosTheme.CardInsetBg;
+            _leftPane.BorderColor = IosTheme.CardBorder;
+            _leftHeaderFlow.BackColor = IosTheme.CardInsetBg;
+            _lblAvailTitle.ForeColor = IosTheme.TextPrimary;
+            _lblAvailTitle.BackColor = IosTheme.CardInsetBg;
+            _badgeAvailableCount.PillBackColor = IosTheme.SecondaryFill;
+            _badgeAvailableCount.PillForeColor = IosTheme.TextSecondary;
+            _lblProfile.ForeColor = IosTheme.TextSecondary;
+            _lblProfile.BackColor = IosTheme.CardInsetBg;
+            _cmbProfileFilter.ApplyTheme(IosTheme.CardInsetBg, IosTheme.InputWhiteBg);
+            _txtLeftSearch.ApplyTheme(IosTheme.CardInsetBg, IosTheme.InputWhiteBg);
+            _lstAvailable.ApplyTheme(IosTheme.CardInsetBg);
+            _lblLeftHint.ForeColor = IosTheme.TextTertiary;
+            _lblLeftHint.BackColor = IosTheme.CardInsetBg;
+
+            // Mid transfer buttons panel
+            _midPanel.BackColor = IosTheme.CardBg;
+
+            // Right pane
+            _rightPane.OuterBackColor = IosTheme.CardBg;
+            _rightPane.CardBackColor = IosTheme.CardInsetBg;
+            _rightPane.BorderColor = IosTheme.CardBorder;
+            _rightHeaderFlow.BackColor = IosTheme.CardInsetBg;
+            _lblAllowTitle.ForeColor = IosTheme.GreenText;
+            _lblAllowTitle.BackColor = IosTheme.CardInsetBg;
+            _badgeAllowedCount.PillBackColor = IosTheme.GreenSoft;
+            _badgeAllowedCount.PillForeColor = IosTheme.GreenText;
+            _txtRightSearch.ApplyTheme(IosTheme.CardInsetBg, IosTheme.InputWhiteBg);
+            _lstAllowed.ApplyTheme(IosTheme.CardInsetBg);
+            _txtCustomNode.ApplyTheme(IosTheme.CardInsetBg, IosTheme.InputWhiteBg);
+
+            // Preview banner & footer
+            _previewBanner.OuterBackColor = IosTheme.CanvasBg;
+            _footerPanel.BackColor = IosTheme.CanvasBg;
+            _footerRight.BackColor = IosTheme.CanvasBg;
+            _lblVersion.PillBackColor = IosTheme.SecondaryFill;
+            _lblVersion.PillForeColor = IosTheme.TextSecondary;
+            _lblUpdateStatus.BackColor = IosTheme.CanvasBg;
+            SetUpdateStatusStyle(_updateStatusTone);
+
+            if (Volatile.Read(ref _updating) != 0)
+            {
+                _btnOneClickUpdate.CustomBackColor = IosTheme.TextTertiary;
+            }
+
+            if (_statusProvider != null)
+            {
+                UpdateWfpStatus(_statusProvider());
+            }
+            if (_lastAppDiagnostics != null)
+            {
+                UpdateAppDetectStatusDisplay();
+            }
+            else
+            {
+                _lblAppDetectStatus.ForeColor = IosTheme.TextSecondary;
+                _lblAppDetectStatus.DotColor = IosTheme.TextTertiary;
+            }
+            if (_catalog != null || _lastSnapshot != null)
+            {
+                RecomputeActiveLeafFromSnapshot();
+            }
+            else
+            {
+                _lblClashStatus.ForeColor = IosTheme.TextSecondary;
+                _lblClashStatus.DotColor = IosTheme.TextTertiary;
+            }
+            UpdatePreview();
+            Invalidate(true);
         }
 
         private IosButton CreateTransferButton(string text, string tooltip)
@@ -19455,6 +20612,7 @@ namespace TunGuard
         {
             if (disposing)
             {
+                IosTheme.ThemeChanged -= OnThemeChanged;
                 if (_searchDebounceTimer != null)
                 {
                     _searchDebounceTimer.Stop();
@@ -19882,6 +21040,7 @@ namespace TunGuard
             draft.WfpBlockNonTunDns = _chkWfpBlockNonTunDns.Checked;
             draft.PopupOnBlock = _chkPopupOnBlock.Checked;
             draft.LogDirectory = _draftLogDirectory ?? string.Empty;
+            draft.ThemeMode = IosTheme.NormalizeThemeMode(_draftThemeMode);
             NodeGuardConfig.CopyNormalizedAppPathMap(_draftCustomAppPaths, draft.CustomAppPaths);
             if (_preservedDiscoveredPaths != null)
             {
@@ -20583,7 +21742,7 @@ namespace TunGuard
             if (manual)
             {
                 _btnCheckUpdate.Text = "检查中...";
-                _lblUpdateStatus.ForeColor = IosTheme.TextSecondary;
+                SetUpdateStatusStyle(IosStatusTone.Neutral);
                 _lblUpdateStatus.Text = "正在检查更新...";
                 _toolTip.SetToolTip(_lblUpdateStatus, "正在连接 GitHub Releases 检测最新版本");
             }
@@ -20646,7 +21805,7 @@ namespace TunGuard
                 if (manual)
                 {
                     string err = string.IsNullOrEmpty(result.ErrorMessage) ? "网络请求失败" : result.ErrorMessage;
-                    _lblUpdateStatus.ForeColor = IosTheme.OrangeText;
+                    SetUpdateStatusStyle(IosStatusTone.Warning);
                     _lblUpdateStatus.Text = "检查失败: " + err;
                     _toolTip.SetToolTip(_lblUpdateStatus, "检查更新失败:\n" + err);
                 }
@@ -20672,7 +21831,7 @@ namespace TunGuard
 
                 if (!isUpdating)
                 {
-                    _lblUpdateStatus.ForeColor = IosTheme.GreenText;
+                    SetUpdateStatusStyle(IosStatusTone.Success);
                     _lblUpdateStatus.Text = result.ExpectedSize > 0
                         ? ("发现新版本 (" + AppUpdater.FormatBytesShort(result.ExpectedSize) + ")")
                         : "发现新版本";
@@ -20684,7 +21843,7 @@ namespace TunGuard
                 if (!isUpdating)
                 {
                     _btnOneClickUpdate.Visible = false;
-                    _lblUpdateStatus.ForeColor = manual ? IosTheme.GreenText : IosTheme.TextSecondary;
+                    SetUpdateStatusStyle(manual ? IosStatusTone.Success : IosStatusTone.Neutral);
                     _lblUpdateStatus.Text = manual ? "已是最新版本" : "已是最新";
                     string latestLabel = !string.IsNullOrEmpty(result.LatestTag) ? result.LatestTag : AppUpdater.GetCurrentVersionText();
                     _toolTip.SetToolTip(_lblUpdateStatus, "当前版本 " + AppUpdater.GetCurrentVersionText() + " 已是最新（GitHub 最新: " + latestLabel + "）");
@@ -20704,7 +21863,7 @@ namespace TunGuard
         private void SetOneClickUpdateButtonCancellingMode()
         {
             _btnOneClickUpdate.Text = "取消更新";
-            _btnOneClickUpdate.CustomBackColor = Color.FromArgb(142, 142, 147);
+            _btnOneClickUpdate.CustomBackColor = IosTheme.TextTertiary;
             _btnOneClickUpdate.Enabled = true;
             _btnOneClickUpdate.Visible = true;
         }
@@ -20715,7 +21874,7 @@ namespace TunGuard
             {
                 Volatile.Write(ref _cancelUpdate, 1);
                 _btnOneClickUpdate.Enabled = false;
-                _lblUpdateStatus.ForeColor = IosTheme.TextSecondary;
+                SetUpdateStatusStyle(IosStatusTone.Neutral);
                 _lblUpdateStatus.Text = "正在取消更新...";
                 return;
             }
@@ -20772,7 +21931,7 @@ namespace TunGuard
             _btnCheckUpdate.Enabled = false;
             _btnSave.Enabled = false;
             SetOneClickUpdateButtonCancellingMode();
-            _lblUpdateStatus.ForeColor = IosTheme.Blue;
+            SetUpdateStatusStyle(IosStatusTone.Info);
             _lblUpdateStatus.Text = "正在连接 GitHub 下载 " + targetTag + "...";
             _toolTip.SetToolTip(_lblUpdateStatus, "正在下载 " + targetTag);
 
@@ -20848,14 +22007,14 @@ namespace TunGuard
 
                             if (wasCancelled)
                             {
-                                _lblUpdateStatus.ForeColor = IosTheme.TextSecondary;
+                                SetUpdateStatusStyle(IosStatusTone.Neutral);
                                 _lblUpdateStatus.Text = "已取消更新";
                                 _toolTip.SetToolTip(_lblUpdateStatus, "已取消下载更新");
                                 return;
                             }
 
                             string failMsg = !string.IsNullOrEmpty(err) ? err : "下载或校验失败";
-                            _lblUpdateStatus.ForeColor = IosTheme.RedText;
+                            SetUpdateStatusStyle(IosStatusTone.Danger);
                             _lblUpdateStatus.Text = "更新失败: " + failMsg;
                             _toolTip.SetToolTip(_lblUpdateStatus, "更新失败:\n" + failMsg);
 
@@ -20876,7 +22035,7 @@ namespace TunGuard
                         _btnOneClickUpdate.Enabled = false;
                         _btnOneClickUpdate.Text = "正在重启...";
                         _btnCancel.Enabled = false;
-                        _lblUpdateStatus.ForeColor = IosTheme.GreenText;
+                        SetUpdateStatusStyle(IosStatusTone.Success);
                         _lblUpdateStatus.Text = "校验通过，正在替换并重启...";
 
                         string swapErr = null;
@@ -20898,7 +22057,7 @@ namespace TunGuard
                         _btnCancel.Enabled = true;
                         SetOneClickUpdateButtonReady(targetTag);
                         string applyErr = !string.IsNullOrEmpty(swapErr) ? swapErr : "替换程序文件失败";
-                        _lblUpdateStatus.ForeColor = IosTheme.RedText;
+                        SetUpdateStatusStyle(IosStatusTone.Danger);
                         _lblUpdateStatus.Text = "替换失败: " + applyErr;
                         _toolTip.SetToolTip(_lblUpdateStatus, "替换程序文件失败:\n" + applyErr);
 
@@ -20943,6 +22102,10 @@ namespace TunGuard
         private readonly ToolStripMenuItem _guardAntigravityItem;
         private readonly ToolStripMenuItem _guardChatGPTItem;
         private readonly ToolStripMenuItem _guardClaudeItem;
+        private readonly ToolStripMenuItem _themeMenu;
+        private readonly ToolStripMenuItem _themeSystemItem;
+        private readonly ToolStripMenuItem _themeLightItem;
+        private readonly ToolStripMenuItem _themeDarkItem;
         private readonly ToolStripMenuItem _toggleMonitorItem;
         private readonly ToolStripMenuItem _autoStartItem;
 
@@ -21016,6 +22179,23 @@ namespace TunGuard
             _guardedAppsMenu.DropDown.Font = _menuFont;
             _guardedAppsMenu.DropDown.Padding = new Padding(4, 5, 4, 5);
 
+            _themeSystemItem = new ToolStripMenuItem("跟随系统");
+            _themeSystemItem.Click += (s, e) => OnSelectThemeModeClick(IosTheme.ThemeModeSystem);
+
+            _themeLightItem = new ToolStripMenuItem("浅色模式");
+            _themeLightItem.Click += (s, e) => OnSelectThemeModeClick(IosTheme.ThemeModeLight);
+
+            _themeDarkItem = new ToolStripMenuItem("深色模式");
+            _themeDarkItem.Click += (s, e) => OnSelectThemeModeClick(IosTheme.ThemeModeDark);
+
+            _themeMenu = new ToolStripMenuItem("外观主题");
+            _themeMenu.DropDownItems.Add(_themeSystemItem);
+            _themeMenu.DropDownItems.Add(_themeLightItem);
+            _themeMenu.DropDownItems.Add(_themeDarkItem);
+            _themeMenu.DropDown.Renderer = _menuRenderer;
+            _themeMenu.DropDown.Font = _menuFont;
+            _themeMenu.DropDown.Padding = new Padding(4, 5, 4, 5);
+
             _toggleMonitorItem = new ToolStripMenuItem("启用实时监控") { Checked = true };
             _toggleMonitorItem.Click += OnToggleMonitorClick;
 
@@ -21040,6 +22220,7 @@ namespace TunGuard
             _menu.Items.Add(_nodeSettingsItem);
             _menu.Items.Add(_logViewerItem);
             _menu.Items.Add(_guardedAppsMenu);
+            _menu.Items.Add(_themeMenu);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_toggleMonitorItem);
             _menu.Items.Add(_autoStartItem);
@@ -21067,6 +22248,10 @@ namespace TunGuard
             _monitor.NodeConfigChanged += OnNodeConfigChanged;
             _monitor.Start();
 
+            NodeGuardConfig initCfg = _monitor.CurrentNodeConfig;
+            IosTheme.SetThemeMode(initCfg != null ? initCfg.ThemeMode : IosTheme.ThemeModeSystem);
+            SyncThemeMenuUi(IosTheme.ConfiguredMode);
+
             UpdateTrayUi(_monitor.CurrentStatus);
             _trayIcon.Visible = true;
 
@@ -21076,6 +22261,7 @@ namespace TunGuard
             _pingThread.Start();
 
             SystemEvents.SessionEnding += OnSessionEnding;
+            SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
         }
 
         private static EventWaitHandle CreatePingEvent(string name)
@@ -21135,12 +22321,15 @@ namespace TunGuard
             {
                 if (!_disposed && config != null)
                 {
+                    IosTheme.SetThemeMode(config.ThemeMode);
+                    SyncThemeMenuUi(IosTheme.ConfiguredMode);
                     SyncGuardedAppsUi(config);
                     _nodeRuleItem.Text = config.GetSummaryText();
                     if (_settingsForm != null && !_settingsForm.IsDisposed)
                     {
                         _settingsForm.SyncGuardedApps(config);
                         _settingsForm.SyncLogDirectory(config.LogDirectory);
+                        _settingsForm.SyncThemeMode(config.ThemeMode);
                     }
                     if (_logViewerForm != null && !_logViewerForm.IsDisposed)
                     {
@@ -21149,6 +22338,64 @@ namespace TunGuard
                     UpdateTrayUi(_monitor.CurrentStatus);
                 }
             });
+        }
+
+        private void SyncThemeMenuUi(string themeMode)
+        {
+            string norm = IosTheme.NormalizeThemeMode(themeMode);
+            _themeSystemItem.Checked = (norm == IosTheme.ThemeModeSystem);
+            _themeLightItem.Checked = (norm == IosTheme.ThemeModeLight);
+            _themeDarkItem.Checked = (norm == IosTheme.ThemeModeDark);
+            _menu.Invalidate(true);
+            _themeMenu.DropDown.Invalidate(true);
+            _guardedAppsMenu.DropDown.Invalidate(true);
+        }
+
+        private void OnSelectThemeModeClick(string themeMode)
+        {
+            HandleThemeModeChanged(themeMode, true);
+        }
+
+        private void HandleThemeModeChanged(string themeMode, bool syncSettingsForm)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            string norm = IosTheme.NormalizeThemeMode(themeMode);
+            IosTheme.SetThemeMode(norm);
+            SyncThemeMenuUi(norm);
+
+            string err;
+            if (!_monitor.UpdateThemeMode(norm, out err) && !string.IsNullOrEmpty(err))
+            {
+                _trayIcon.ShowBalloonTip(2500, "保存外观主题失败", err, ToolTipIcon.Error);
+            }
+
+            if (syncSettingsForm && _settingsForm != null && !_settingsForm.IsDisposed)
+            {
+                _settingsForm.SyncThemeMode(norm);
+            }
+        }
+
+        private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            if (e.Category == UserPreferenceCategory.General ||
+                e.Category == UserPreferenceCategory.Color ||
+                e.Category == UserPreferenceCategory.VisualStyle)
+            {
+                PostToUi(() =>
+                {
+                    if (IosTheme.RefreshSystemTheme())
+                    {
+                        SyncThemeMenuUi(IosTheme.ConfiguredMode);
+                    }
+                });
+            }
         }
 
         private void SyncGuardedAppsUi(NodeGuardConfig config)
@@ -21589,6 +22836,7 @@ namespace TunGuard
                 () => _monitor.CurrentStatus,
                 rescan => _monitor.GetAppPathDiagnostics(rescan),
                 () => OpenLogViewerWindow(),
+                mode => HandleThemeModeChanged(mode, false),
                 ApplyUpdateAndRestart,
                 _iconSafe);
             _settingsForm = form;
@@ -21872,6 +23120,7 @@ namespace TunGuard
                 if (disposing)
                 {
                     SystemEvents.SessionEnding -= OnSessionEnding;
+                    SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
                     _pingStop.Set();
                     _monitor.Dispose();
 
