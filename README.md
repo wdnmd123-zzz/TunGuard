@@ -7,7 +7,7 @@
 
 轻量级 Windows (x64) 系统托盘守护工具，实时监控 **Clash Verge Rev** 的 **TUN 模式状态** 与可选的 **当前生效代理节点**，并结合 **Windows Filtering Platform (WFP) 内核级 Kill Switch**、毫秒级进程守护与屏幕置顶拦截提示，保护已勾选的桌面端 AI 应用（**Antigravity**、**ChatGPT 桌面端 / Codex**、**Claude 桌面端 / Claude Code**），从内核层到应用层防止断流裸连或走错节点引发账号风控。
 
-[核心亮点](#核心亮点) · [界面预览](#界面预览) · [工作原理](#工作原理与防护模式) · [受控应用与条件](#受控应用与拦截触发条件) · [核心特性](#核心特性) · [快速开始](#快速开始) · [配置参考](#节点判定规则与配置说明) · [FAQ](#常见问题faq)
+[核心亮点](#核心亮点) · [工作原理](#工作原理与防护模式) · [受控应用与条件](#受控应用与拦截触发条件) · [核心特性](#核心特性) · [快速开始](#快速开始) · [配置参考](#节点判定规则与配置说明) · [FAQ](#常见问题faq)
 
 ---
 
@@ -18,26 +18,6 @@
 - **免配置直连 Clash 内核**：自动探测并复用 Clash Verge 的 Windows Named Pipe（`\\.\pipe\verge-mihomo-*`），**无需开启外部 HTTP 控制器**即可读取实时节点链路（支持自动回退 TCP 外部控制器）。
 - **极低后台开销**：事件驱动 + HTTP/1.1 Keep-Alive 单组定向查询 + 零反射轻量 JSON 提取，单次节点巡检 `< 0.5 ms`。
 - **开箱即用 · 完整可视化管理与一键更新**：提供受控应用自动识别与自定义路径管理、全订阅节点左右穿梭框、屏幕置顶拦截提醒卡片、异步分级日志查看器，以及内置 GitHub Releases 检查更新与 SHA-256 校验一键原地升级。
-
----
-
-## 界面预览
-
-### 控制面板
-
-<p align="center">
-  <img src="docs/control-panel.png" alt="TunGuard 控制面板运行截图" width="820" />
-</p>
-
-> 控制面板集中提供受控应用自动检测与路径管理、WFP 内核策略开关、置顶弹窗与日志目录配置、按订阅筛选的节点穿梭框与保存前实时命中预览，以及底部的 GitHub 仓库入口、版本检测与一键更新。
-
-### 屏幕置顶拦截提示
-
-<p align="center">
-  <img src="docs/block-alert.png" alt="TunGuard 屏幕置顶拦截提示弹窗" width="480" />
-</p>
-
-> 当 TUN 未开启或出口节点未命中允许列表且受控软件触发拦截时，屏幕上方立即弹出置顶提醒卡片，直观展示拦截原因、当前出口链路、允许节点列表与执行动作，并支持一键打开控制面板或查看日志。
 
 ---
 
@@ -300,8 +280,6 @@ Select-String -Path .\wfp_filters.xml -Pattern "TunGuard WFP Kill Switch"
 | [`app.manifest`](app.manifest) | Windows 应用程序清单（`highestAvailable` 权限与 Per-Monitor V2 DPI 感知） |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | GitHub Actions 自动构建、版本递增与 Release 发布工作流（附带 `SHA256SUMS.txt`） |
 | [`update.md`](update.md) | WFP 内核级 Kill Switch 方案架构设计与 Windows x64 ABI 参考文档 |
-| [`docs/control-panel.png`](docs/control-panel.png) | README 展示用控制面板运行截图 |
-| [`docs/block-alert.png`](docs/block-alert.png) | README 展示用屏幕置顶拦截提示弹窗截图 |
 | [`.gitignore`](.gitignore) | 忽略编译产物（`*.exe`、`*.ico`、`*.pdb`）、本地配置（`TunGuard.config.json`）与运行日志（`logs/`、`*.log`） |
 | `TunGuard.config.json` | 本地守护配置与已发现路径缓存（运行时自动生成，不纳入版本控制） |
 | `logs/` | 按天切分的运行日志目录 `TunGuard-yyyy-MM-dd.log`（运行时自动生成，不纳入版本控制） |
